@@ -16,6 +16,7 @@
  */
 
 #include "ArenaTeamMgr.h"
+#include "BeatContext.h"
 #include "AuctionHouseMgr.h"
 #include "Bag.h"
 #include "BattlegroundMgr.h"
@@ -117,7 +118,9 @@ public:
             { "boundary",       HandleDebugBoundaryCommand,            rbac::RBAC_PERM_COMMAND_DEBUG_COSMETIC, Console::No },
             { "visibilitydata", HandleDebugVisibilityDataCommand,      rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::No },
             { "factionchange",  HandleDebugFactionChangeCommand,       rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::Yes},
-            { "zonestats",      HandleDebugZoneStatsCommand,           rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::Yes}
+            { "zonestats",      HandleDebugZoneStatsCommand,           rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::Yes},
+            { "slot",           HandleDebugSlotCommand,                rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::No },
+            { "foreignreads",   HandleDebugForeignReadsCommand,        rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::Yes}
         };
         static ChatCommandTable commandTable =
         {
@@ -850,10 +853,13 @@ public:
         else
         {
             handler->PSendSysMessage("List of units threatened by {} ({})", target->GetName(), target->GetGUID().ToString());
-            for (auto const& pair : threatenedByMe)
+            for (ObjectGuid const& ownerGuid : threatenedByMe)
             {
-                Unit* unit = pair.second->GetOwner();
-                handler->PSendSysMessage("   {}.   {}   ({}, SpawnID {})  - threat {}", ++count, unit->GetName(), unit->GetGUID().ToString(), unit->IsCreature() ? unit->ToCreature()->GetSpawnId() : 0, pair.second->GetThreat());
+                ThreatReference const* ref = target->GetThreatMgr().GetReferenceThreateningMe(ownerGuid);
+                Unit* unit = ObjectAccessor::GetUnit(*target, ownerGuid);
+                if (!unit || !ref)
+                    continue;
+                handler->PSendSysMessage("   {}.   {}   ({}, SpawnID {})  - threat {}", ++count, unit->GetName(), unit->GetGUID().ToString(), unit->IsCreature() ? unit->ToCreature()->GetSpawnId() : 0, ref->GetThreat());
             }
             handler->SendSysMessage("End of threatened-by-me list.");
         }
@@ -1001,11 +1007,21 @@ public:
         for (auto const& ref : target->GetCombatManager().GetPvPCombatRefs())
         {
             Unit* unit = ref.second->GetOther(target);
+            if (!unit)
+            {
+                handler->PSendSysMessage("[PvP] {} (gone)", ref.first.ToString());
+                continue;
+            }
             handler->PSendSysMessage("[PvP] {} (SpawnID {})", unit->GetName(), unit->IsCreature() ? unit->ToCreature()->GetSpawnId() : 0);
         }
         for (auto const& ref : target->GetCombatManager().GetPvECombatRefs())
         {
             Unit* unit = ref.second->GetOther(target);
+            if (!unit)
+            {
+                handler->PSendSysMessage("[PvE] {} (gone)", ref.first.ToString());
+                continue;
+            }
             handler->PSendSysMessage("[PvE] {} (SpawnID {})", unit->GetName(), unit->IsCreature() ? unit->ToCreature()->GetSpawnId() : 0);
         }
         return true;
@@ -1021,11 +1037,11 @@ public:
 
         handler->PSendSysMessage("Threatened by me list of {} ({})", target->GetName(), target->GetGUID().ToString());
 
-        for (auto const& pair : target->GetThreatMgr().GetThreatenedByMeList())
+        for (ObjectGuid const& ownerGuid : target->GetThreatMgr().GetThreatenedByMeList())
         {
-            ThreatReference const* ref = pair.second;
-            Creature* owner = ref->GetOwner();
-            if (owner)
+            ThreatReference const* ref = target->GetThreatMgr().GetReferenceThreateningMe(ownerGuid);
+            Unit* owner = ObjectAccessor::GetUnit(*target, ownerGuid);
+            if (ref && owner)
             {
                 std::string stateStr = "";
                 if (ref->IsOffline())
@@ -1038,7 +1054,7 @@ public:
             }
             else
             {
-                handler->PSendSysMessage("   {}.   No Owner  - threat {}", ++count, ref->GetThreat());
+                handler->PSendSysMessage("   {}.   {}  - (back-ref only)", ++count, ownerGuid.ToString());
             }
         }
 
@@ -1050,12 +1066,22 @@ public:
         for (auto const& ref : target->GetCombatManager().GetPvECombatRefs())
         {
             Unit* unit = ref.second->GetOther(target);
+            if (!unit)
+            {
+                handler->PSendSysMessage("   [PvE] {} (gone)", ref.first.ToString());
+                continue;
+            }
             handler->PSendSysMessage("   [PvE] {} ({}) Entry: {}", unit->GetName(), unit->GetGUID().ToString(),
                 unit->IsCreature() ? unit->ToCreature()->GetEntry() : 0);
         }
         for (auto const& ref : target->GetCombatManager().GetPvPCombatRefs())
         {
             Unit* unit = ref.second->GetOther(target);
+            if (!unit)
+            {
+                handler->PSendSysMessage("   [PvP] {} (gone)", ref.first.ToString());
+                continue;
+            }
             handler->PSendSysMessage("   [PvP] {} ({})", unit->GetName(), unit->GetGUID().ToString());
         }
 
@@ -1427,6 +1453,66 @@ public:
 
             handler->PSendSysMessage(LANG_MOVEFLAGS_SET, target->GetUnitMovementFlags(), target->GetExtraUnitMovementFlags());
         }
+
+        return true;
+    }
+
+    static bool HandleDebugForeignReadsCommand(ChatHandler* handler)
+    {
+        BeatContext::FlushForeignReads();
+        uint64 const count = BeatContext::foreignReadsTotal.exchange(0, std::memory_order_relaxed);
+        handler->PSendSysMessage("Foreign live-field reads since last query: {}", count);
+        return true;
+    }
+
+    // Dumps the readable slot of the selected unit (or the player) next to its live fields.
+    // After a tick with no intervening write, the word diff is 0 and both aura counts match.
+    static bool HandleDebugSlotCommand(ChatHandler* handler)
+    {
+        Unit* target = handler->getSelectedUnit();
+        if (!target)
+            target = handler->GetSession()->GetPlayer();
+
+        ObjectSlotPair const& pair = target->Slots();
+        if (!pair.IsInitialized())
+        {
+            handler->SendErrorMessage("Slot not initialized for {}", target->GetGUID().ToString());
+            return false;
+        }
+
+        ObjectSlot const& s = target->ReadSlot();
+        SlotReader r(s);
+
+        uint32 diffWords = 0;
+        uint32 firstDiff = s.valuesCount;
+        for (uint16 i = 0; i < s.valuesCount && i < target->GetValuesCount(); ++i)
+        {
+            if (s.values[i] != target->GetUInt32Value(i))
+            {
+                if (firstDiff == s.valuesCount)
+                    firstDiff = i;
+                ++diffWords;
+            }
+        }
+
+        handler->PSendSysMessage("Slot of {}: beat {} (published {}), index {}, values {}",
+            target->GetGUID().ToString(), s.beat, pair.PublishedBeat(), target->SlotIndex(), s.valuesCount);
+        handler->PSendSysMessage("  pos slot {:.2f} {:.2f} {:.2f} {:.2f} | live {:.2f} {:.2f} {:.2f} {:.2f}",
+            s.pos.GetPositionX(), s.pos.GetPositionY(), s.pos.GetPositionZ(), s.pos.GetOrientation(),
+            target->GetPositionX(), target->GetPositionY(), target->GetPositionZ(), target->GetOrientation());
+        handler->PSendSysMessage("  cell {} zone {} area {} phase {:#x}", s.cellId, s.zoneId, s.areaId, s.phaseMask);
+        handler->PSendSysMessage("  health {}/{} level {} faction {} | live {}/{} level {} faction {}",
+            r.Health(), r.MaxHealth(), r.Level(), r.Faction(),
+            target->GetHealth(), target->GetMaxHealth(), target->GetLevel(), target->GetFaction());
+        handler->PSendSysMessage("  alive {} combat {} unitState {:#x} moveFlags {:#x} victim {} owner {}",
+            r.IsAlive(), s.isInCombat, s.unitState, s.movementFlags,
+            s.victimGuid.ToString(), s.charmerOrOwnerGuid.ToString());
+        handler->PSendSysMessage("  auras slot {} live {} capacity {}",
+            s.auraCount, uint32(target->GetAppliedAuras().size()), pair.AuraCapacity());
+        if (diffWords)
+            handler->PSendSysMessage("  value words differing from live: {} (first at index {})", diffWords, firstDiff);
+        else
+            handler->PSendSysMessage("  value words differing from live: 0");
 
         return true;
     }

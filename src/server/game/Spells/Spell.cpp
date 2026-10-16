@@ -41,6 +41,7 @@
 #include "SharedDefines.h"
 #include "SpellAuraDefines.h"
 #include "SpellAuraEffects.h"
+#include "SpellHitRecord.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "SpellScript.h"
@@ -610,6 +611,7 @@ Spell::Spell(WorldObject* caster, SpellInfo const* info, TriggerCastFlags trigge
     m_caster((info->HasAttribute(SPELL_ATTR6_ORIGINATE_FROM_CONTROLLER) && caster->ToUnit() && caster->ToUnit()->GetCharmerOrOwner()) ? caster->ToUnit()->GetCharmerOrOwner() : caster)
     , m_spellValue(new SpellValue(m_spellInfo)), _spellEvent(nullptr)
 {
+    m_castSerial = NextCastSerial();
     m_customError = SPELL_CUSTOM_ERROR_NONE;
     m_skipCheck = skipCheck;
     m_selfContainer = nullptr;
@@ -2631,7 +2633,9 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
     // Get mask of effects for target
     uint8 mask = target->effectMask;
 
-    Unit* effectUnit = m_caster->GetGUID() == target->targetGUID ? unitCaster : ObjectAccessor::GetUnit(*m_caster, target->targetGUID);
+    // Land side: the record's target is the task owner. Launch side: self or reflected hit, resolved as today.
+    Unit* effectUnit = _landSide ? _landTarget
+        : (m_caster->GetGUID() == target->targetGUID ? unitCaster : ObjectAccessor::GetUnit(*m_caster, target->targetGUID));
     if (!effectUnit && !target->targetGUID.IsPlayer()) // only players may be targeted across maps
         return;
 
@@ -2745,7 +2749,14 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
         if (missInfo2 != SPELL_MISS_NONE)
         {
             if (missInfo2 != SPELL_MISS_MISS)
-                m_caster->SendSpellMiss(spellHitTarget, m_spellInfo->Id, missInfo2);
+            {
+                // the packet carries the caster's guid, so the caster sends it (feedback); a gameobject caster is
+                // not a unit task and sends inline
+                if (unitCaster)
+                    Feedback().missAfterLand = uint8(missInfo2);
+                else
+                    m_caster->SendSpellMiss(spellHitTarget, m_spellInfo->Id, missInfo2);
+            }
             m_damage = 0;
             spellHitTarget = nullptr;
 
@@ -2753,17 +2764,23 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
             if (missInfo2 == SPELL_MISS_EVADE)
                 missInfo = SPELL_MISS_EVADE;
         }
+        else
+            Feedback().hitLanded = 1;
     }
 
     // Do not take combo points on dodge and miss
-    if (missInfo != SPELL_MISS_NONE && m_needComboPoints && m_targets.GetUnitTargetGUID() == target->targetGUID)
+    if (_landSide)
     {
-        m_needComboPoints = false;
-        // Restore spell mods for a miss/dodge/parry Cold Blood
-        /// @todo: check how broad this rule should be
-        if (unitCaster && unitCaster->IsPlayer() && (missInfo == SPELL_MISS_MISS || missInfo == SPELL_MISS_DODGE || missInfo == SPELL_MISS_PARRY))
-            unitCaster->ToPlayer()->RestoreSpellMods(this, 14177);
+        // LandOrEmit applied the rule from missCondition at launch; a land-side evade on the primary target
+        // (missInfo changed from NONE) refunds the points the caster already spent.
+        if (missInfo != SPELL_MISS_NONE && target->missCondition == SPELL_MISS_NONE && m_needComboPoints && m_targets.GetUnitTargetGUID() == target->targetGUID)
+        {
+            m_needComboPoints = false;
+            Feedback().comboPointsRefund = _launchComboPoints;
+        }
     }
+    else
+        HandleComboPointsOnMiss(missInfo, target->targetGUID);
 
     // Fill base trigger info
     uint32 procAttacker = m_procAttacker;
@@ -2877,7 +2894,7 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
         // Do damage and triggers
         else if (m_damage > 0)
         {
-            caster->SetLastDamagedTargetGuid(unitTarget->GetGUID());
+            Feedback().lastDamagedTarget = 1;
 
             // Fill base damage struct (unitTarget - is real spell target)
             SpellNonMeleeDamage damageInfo(caster, unitTarget, m_spellInfo, m_spellSchoolMask);
@@ -2931,14 +2948,9 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
                     // get max possible damage, don't count overkill for heal
                     uint32 healthGain = uint32(-unitTarget->GetHealthGain(-int32(damageInfo.damage)) * healMultiplier);
 
-                    if (unitCaster && unitCaster->IsAlive())
-                    {
-                        healthGain = unitCaster->SpellHealingBonusDone(unitCaster, m_spellInfo, healthGain, HEAL, effIndex);
-                        healthGain = unitCaster->SpellHealingBonusTaken(unitCaster, m_spellInfo, healthGain, HEAL);
-
-                        HealInfo healInfo(unitCaster, unitCaster, healthGain, m_spellInfo, m_spellInfo->GetSchoolMask());
-                        unitCaster->HealBySpell(healInfo);
-                    }
+                    // the caster's healing bonus and the self-heal run on the caster at feedback
+                    if (unitCaster && healthGain)
+                        Feedback().healthLeechGain += int32(healthGain);
                 }
 
                 // Send log damage message to client
@@ -2964,7 +2976,13 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
 
                     if (caster->IsPlayer() && m_spellInfo->HasAttribute(SPELL_ATTR0_CANCELS_AUTO_ATTACK_COMBAT) == 0 &&
                             m_spellInfo->HasAttribute(SPELL_ATTR4_SUPPRESS_WEAPON_PROCS) == 0 && (m_spellInfo->DmgClass == SPELL_DAMAGE_CLASS_MELEE || m_spellInfo->DmgClass == SPELL_DAMAGE_CLASS_RANGED))
-                        caster->ToPlayer()->CastItemCombatSpell(unitTarget, m_attackType, procVictim, dmgInfo.GetHitMask());
+                    {
+                        SpellLandedRecord& fb = Feedback();
+                        fb.castItemCombatSpell = 1;
+                        fb.procVictim = procVictim;
+                        fb.hitMask = dmgInfo.GetHitMask();
+                        fb.attackType = uint8(m_attackType);
+                    }
                 }
 
                 m_damage = damageInfo.damage;
@@ -2987,13 +3005,19 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
                 // Xinef: ofc count only spells that HIT the target, little hack used to fool the system
                 if ((dmgInfo.GetHitMask() & (PROC_HIT_NORMAL | PROC_HIT_CRITICAL)) && caster->IsPlayer() && m_spellInfo->HasAttribute(SPELL_ATTR0_CANCELS_AUTO_ATTACK_COMBAT) == 0 &&
                         m_spellInfo->HasAttribute(SPELL_ATTR4_SUPPRESS_WEAPON_PROCS) == 0 && (m_spellInfo->DmgClass == SPELL_DAMAGE_CLASS_MELEE || m_spellInfo->DmgClass == SPELL_DAMAGE_CLASS_RANGED))
-                    caster->ToPlayer()->CastItemCombatSpell(unitTarget, m_attackType, procVictim | PROC_FLAG_TAKEN_DAMAGE, dmgInfo.GetHitMask());
+                {
+                    SpellLandedRecord& fb = Feedback();
+                    fb.castItemCombatSpell = 1;
+                    fb.procVictim = procVictim | PROC_FLAG_TAKEN_DAMAGE;
+                    fb.hitMask = dmgInfo.GetHitMask();
+                    fb.attackType = uint8(m_attackType);
+                }
             }
 
             // Failed Pickpocket, reveal rogue
             if (missInfo == SPELL_MISS_RESIST && m_spellInfo->HasAttribute(SPELL_ATTR0_CU_PICKPOCKET) && unitTarget->IsCreature() && unitCaster)
             {
-                unitCaster->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_TALK);
+                Feedback().revealCaster = 1;
                 unitTarget->ToCreature()->EngageWithTarget(unitCaster);
             }
         }
@@ -3036,7 +3060,11 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
         if (missInfo != SPELL_MISS_EVADE && !unitCaster->IsFriendlyTo(effectUnit) && (!m_spellInfo->IsPositive() || m_spellInfo->HasEffect(SPELL_EFFECT_DISPEL)))
         {
             if (!m_triggeredByAuraSpell.spellInfo || m_damage || (!(m_triggeredByAuraSpell.spellInfo->Effects[m_triggeredByAuraSpell.effectIndex].TriggerSpell == m_spellInfo->Id) && !(m_triggeredByAuraSpell.spellInfo->IsAuraEffectEqual(m_spellInfo))))
-                unitCaster->AtTargetAttacked(effectUnit, !(m_spellInfo->HasAttribute(SPELL_ATTR1_NO_THREAT) || m_spellInfo->HasAttribute(SPELL_ATTR3_SUPPRESS_TARGET_PROCS)));
+            {
+                SpellLandedRecord& fb = Feedback();
+                fb.atTargetAttacked = 1;
+                fb.canInitialAggro = !(m_spellInfo->HasAttribute(SPELL_ATTR1_NO_THREAT) || m_spellInfo->HasAttribute(SPELL_ATTR3_SUPPRESS_TARGET_PROCS));
+            }
 
             // Spells that don't initiate combat shouldn't affect stand state (e.g. Premeditation, Storm Giant/Felreaver Passive)
             if (m_spellInfo->HasInitialAggro() && !effectUnit->IsStandState())
@@ -3047,12 +3075,12 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
     if (missInfo != SPELL_MISS_EVADE && effectUnit != m_caster && unitCaster && unitCaster->IsFriendlyTo(effectUnit) && m_spellInfo->IsPositive() &&
         effectUnit->IsInCombat() && !m_spellInfo->HasAttribute(SPELL_ATTR1_NO_THREAT))
     {
-        unitCaster->SetInCombatWith(effectUnit);
+        Feedback().assistCombat = 1;
     }
 
     // Check for SPELL_ATTR7_CAN_CAUSE_INTERRUPT
     if (caster && m_spellInfo->HasAttribute(SPELL_ATTR7_CAN_CAUSE_INTERRUPT) && !effectUnit->IsPlayer())
-        caster->CastSpell(effectUnit, SPELL_INTERRUPT_NONPLAYER, true);
+        DoFollowUpCast(SPELL_INTERRUPT_NONPLAYER, effectUnit, false, 0, true);
 
     if (spellHitTarget)
     {
@@ -3064,7 +3092,7 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
         }
 
         if (unitCaster && unitCaster->IsCreature() && unitCaster->ToCreature()->IsAIEnabled)
-            unitCaster->ToCreature()->AI()->SpellHitTarget(spellHitTarget, m_spellInfo);
+            Feedback().aiSpellHitTarget = 1;
 
         // Needs to be called after dealing damage/healing to not remove breaking on damage auras
         DoTriggersOnSpellHit(spellHitTarget, mask);
@@ -3074,11 +3102,15 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
         if (effectUnit->IsPvP() && effectUnit != m_caster && effectUnit->GetOwnerGUID() != m_caster->GetGUID() &&
             unitCaster && unitCaster->IsPlayer() && !m_spellInfo->HasAttribute(SPELL_ATTR0_CU_NO_PVP_FLAG))
         {
-            unitCaster->ToPlayer()->UpdatePvP(true);
+            Feedback().updatePvP = 1;
         }
 
         CallScriptAfterHitHandlers();
     }
+
+    // Caster-side writes collected above. Inline hit: applied now on the live caster. Land side: appended to the
+    // caster's inbox as a SpellLandedRecord (inline when no task is running, e.g. tests and deferred hits).
+    DeliverFeedback(effectUnit, unitTarget);
 }
 
 SpellMissInfo Spell::DoSpellHitOnUnit(Unit* unit, uint32 effectMask, bool scaleAura)
@@ -3129,10 +3161,7 @@ SpellMissInfo Spell::DoSpellHitOnUnit(Unit* unit, uint32 effectMask, bool scaleA
     }
 
     if (unitCaster && unitCaster->IsPlayer())
-    {
-        unitCaster->ToPlayer()->StartTimedAchievement(ACHIEVEMENT_TIMED_TYPE_SPELL_CASTER, m_spellInfo->Id);
-        unitCaster->ToPlayer()->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_CAST_SPELL2, m_spellInfo->Id, 0, unit);
-    }
+        Feedback().casterAchievements = 1;
 
     if (m_caster != unit)
     {
@@ -3163,9 +3192,10 @@ SpellMissInfo Spell::DoSpellHitOnUnit(Unit* unit, uint32 effectMask, bool scaleA
             {
                 if (unitCaster)
                 {
-                    unitCaster->SetContestedPvP();
+                    SpellLandedRecord& fb = Feedback();
+                    fb.setContestedPvP = 1;
                     if (unitCaster->IsPlayer() && !m_spellInfo->HasAttribute(SPELL_ATTR0_CU_NO_PVP_FLAG))
-                        unitCaster->ToPlayer()->UpdatePvP(true);
+                        fb.updatePvP = 1;
                 }
             }
 
@@ -3173,7 +3203,7 @@ SpellMissInfo Spell::DoSpellHitOnUnit(Unit* unit, uint32 effectMask, bool scaleA
             if (m_originalCaster && unit->IsInCombat() && !m_spellInfo->HasAttribute(SPELL_ATTR3_SUPPRESS_TARGET_PROCS) && !m_triggeredByAuraSpell)
             {
                 if (m_originalCaster->HasUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED))
-                    m_originalCaster->GetCombatManager().InheritCombatStatesFrom(unit);
+                    Feedback().inheritCombatStates = 1;
                 unit->GetThreatMgr().ForwardThreatForAssistingMe(m_originalCaster, 0.0f, nullptr, true);
             }
         }
@@ -3318,8 +3348,15 @@ SpellMissInfo Spell::DoSpellHitOnUnit(Unit* unit, uint32 effectMask, bool scaleA
 
                 // xinef: apply relic cooldown, imo best place to add this
                 if (m_CastItem && m_CastItem->GetTemplate()->InventoryType == INVTYPE_RELIC && m_triggeredByAuraSpell)
+                {
                     if (unitCaster)
-                        unitCaster->AddSpellCooldown(SPELL_RELIC_COOLDOWN, m_CastItem->GetEntry(), duration);
+                    {
+                        SpellLandedRecord& fb = Feedback();
+                        fb.cooldownSpellId = SPELL_RELIC_COOLDOWN;
+                        fb.cooldownItemEntry = m_CastItem->GetEntry();
+                        fb.cooldownMs = duration;
+                    }
+                }
 
                 m_spellAura->SetTriggeredByAuraSpellInfo(m_triggeredByAuraSpell.spellInfo);
                 m_spellAura->_RegisterForTargets();
@@ -3353,19 +3390,21 @@ void Spell::DoTriggersOnSpellHit(Unit* unit, uint8 effMask)
     Unit* unitCaster = m_caster->ToUnit();
     // Apply additional spell effects to target
     /// @todo: move this code to scripts
+    // Casts performed by the caster because of this hit go through the feedback record (plan §7.4). Through
+    // the record they arrive one beat later than today; inline (self-hit, no task) they are immediate.
     if (m_preCastSpell)
     {
         // Avenging Wrath - also apply Immune Shield Marker
         if (m_preCastSpell == 61987)
-            m_caster->CastSpell(unit, 61988, true);
+            DoFollowUpCast(61988, unit);
 
         // Fearie Fire (Feral) - damage
         if (m_preCastSpell == 60089)
-            m_caster->CastSpell(unit, m_preCastSpell, true);
+            DoFollowUpCast(m_preCastSpell, unit);
         else if (sSpellMgr->GetSpellInfo(m_preCastSpell))
             // Blizz seems to just apply aura without bothering to cast
             if (unitCaster)
-                unitCaster->AddAura(m_preCastSpell, unit);
+                DoFollowUpCast(m_preCastSpell, unit, true);
     }
 
     // handle SPELL_AURA_ADD_TARGET_TRIGGER auras
@@ -3379,24 +3418,24 @@ void Spell::DoTriggersOnSpellHit(Unit* unit, uint8 effMask)
         {
             if (CanExecuteTriggersOnHit(effMask, i->triggeredByAura) && roll_chance_i(i->chance))
             {
-                m_caster->CastSpell(unit, i->triggeredSpell->Id, true);
-                LOG_DEBUG("spells.aura", "Spell {} triggered spell {} by SPELL_AURA_ADD_TARGET_TRIGGER aura", m_spellInfo->Id, i->triggeredSpell->Id);
-
                 // SPELL_AURA_ADD_TARGET_TRIGGER auras shouldn't trigger auras without duration
-                // set duration of current aura to the triggered spell
+                // set duration of current aura to the triggered spell: the triggered aura is infinite, so
+                // max(triggered, current) is the current aura's duration, passed as SPELLVALUE_AURA_DURATION
+                int32 auraDuration = 0;
                 if (i->triggeredSpell->GetDuration() == -1)
                 {
-                    if (Aura* triggeredAur = unit->GetAura(i->triggeredSpell->Id, m_caster->GetGUID()))
+                    // get duration from aura-only once
+                    if (!_duration)
                     {
-                        // get duration from aura-only once
-                        if (!_duration)
-                        {
-                            Aura* aur = unit->GetAura(m_spellInfo->Id, m_caster->GetGUID());
-                            _duration = aur ? aur->GetDuration() : -1;
-                        }
-                        triggeredAur->SetDuration(std::max(triggeredAur->GetDuration(), _duration));
+                        Aura* aur = unit->GetAura(m_spellInfo->Id, m_caster->GetGUID());
+                        _duration = aur ? aur->GetDuration() : -1;
                     }
+                    if (_duration > 0)
+                        auraDuration = _duration;
                 }
+
+                DoFollowUpCast(i->triggeredSpell->Id, unit, false, auraDuration);
+                LOG_DEBUG("spells.aura", "Spell {} triggered spell {} by SPELL_AURA_ADD_TARGET_TRIGGER aura", m_spellInfo->Id, i->triggeredSpell->Id);
             }
         }
     }
@@ -3950,8 +3989,8 @@ void Spell::_cast(bool skipCheck)
         // xinef: take into account SPELL_ATTR3_SUPPRESS_TARGET_PROCS
         if ((m_targets.GetTargetMask() & TARGET_FLAG_UNIT) && GetSpellInfo()->DmgClass != SPELL_DAMAGE_CLASS_NONE && !GetSpellInfo()->HasAttribute(SPELL_ATTR3_SUPPRESS_TARGET_PROCS))
             if (!playerCaster->m_Controlled.empty())
-                for (Unit::ControlSet::iterator itr = playerCaster->m_Controlled.begin(); itr != playerCaster->m_Controlled.end(); ++itr)
-                    if (Unit* pet = *itr)
+                for (ObjectGuid const& guid : playerCaster->m_Controlled)
+                    if (Unit* pet = playerCaster->GetControlled(guid))
                         if (pet->IsAlive() && pet->IsCreature())
                             pet->ToCreature()->AI()->OwnerAttacked(m_targets.GetUnitTarget());
     }
@@ -4266,7 +4305,7 @@ void Spell::handle_immediate()
     }
 
     for (std::list<TargetInfo>::iterator ihit = m_UniqueTargetInfo.begin(); ihit != m_UniqueTargetInfo.end(); ++ihit)
-        DoAllEffectOnTarget(&(*ihit));
+        LandOrEmit(*ihit);
 
     for (std::list<GOTargetInfo>::iterator ihit = m_UniqueGOTargetInfo.begin(); ihit != m_UniqueGOTargetInfo.end(); ++ihit)
         DoAllEffectOnTarget(&(*ihit));
@@ -4322,7 +4361,7 @@ uint64 Spell::handle_delayed(uint64 t_offset)
             if (single_missile || ihit->timeDelay <= t_offset)
             {
                 ihit->timeDelay = t_offset;
-                DoAllEffectOnTarget(&(*ihit));
+                LandOrEmit(*ihit);
             }
             else if (next_time == 0 || ihit->timeDelay < next_time)
                 next_time = ihit->timeDelay;

@@ -16,6 +16,9 @@
  */
 
 #include "AccountMgr.h"
+#include "ObjectAccessor.h"
+#include "Unit.h"
+#include "UnitRecordLog.h"
 #include "BattlegroundAV.h"
 #include "CellImpl.h"
 #include "CreatureAISelector.h"
@@ -118,8 +121,46 @@ std::string const& GameObject::GetAIName() const
     return sObjectMgr->GetGameObjectTemplate(GetEntry())->AIName;
 }
 
+void GameObject::PrepareRemovalForeign()
+{
+    ObjectGuid const ownerGUID = GetOwnerGUID();
+    if (!ownerGUID)
+        return;
+
+    Unit* owner = ObjectAccessor::GetUnit(*this, ownerGUID);
+    if (!owner)
+    {
+        SetOwnerGUID(ObjectGuid::Empty);
+        return;
+    }
+
+    GameObjectUnlinkRecord record;
+    record.goGuid = GetGUID();
+    record.spellId = m_spellId;
+    if (owner->IsForeignToTask())
+        sRecordLogs->Append(GetGUID(), owner, RecordKind::GameObjectUnlink, record);
+    else
+        owner->ApplyGameObjectUnlink(record);
+    SetOwnerGUID(ObjectGuid::Empty);
+}
+
+void GameObject::PrepareRemovalOwn()
+{
+    if (GetTransport() && !ToTransport())
+    {
+        GetTransport()->RemovePassenger(this);
+        SetTransport(nullptr);
+        m_movementInfo.transport.Reset();
+        m_movementInfo.RemoveMovementFlag(MOVEMENTFLAG_ONTRANSPORT);
+    }
+    WorldObject::PrepareRemovalOwn();
+}
+
 void GameObject::CleanupsBeforeDelete(bool /*finalCleanup*/)
 {
+    if (_removing)
+        return;
+
     if (GetTransport() && !ToTransport())
     {
         GetTransport()->RemovePassenger(this);

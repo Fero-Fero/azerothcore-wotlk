@@ -16,6 +16,7 @@
  */
 
 #include "MapUpdater.h"
+#include "BeatContext.h"
 #include "DatabaseEnv.h"
 #include "LFGMgr.h"
 #include "Log.h"
@@ -99,7 +100,7 @@ void MapUpdater::activate(std::size_t num_threads)
     _workerThreads.reserve(num_threads);
     for (std::size_t i = 0; i < num_threads; ++i)
     {
-        _workerThreads.push_back(std::thread(&MapUpdater::WorkerThread, this));
+        _workerThreads.push_back(std::thread(&MapUpdater::WorkerThread, this, uint8(i + 1)));
     }
 }
 
@@ -169,8 +170,10 @@ void MapUpdater::update_finished()
     }
 }
 
-void MapUpdater::WorkerThread()
+void MapUpdater::WorkerThread(uint8 coreIndex)
 {
+    BeatContext::core = coreIndex;
+
     LoginDatabase.WarnAboutSyncQueries(true);
     CharacterDatabase.WarnAboutSyncQueries(true);
     WorldDatabase.WarnAboutSyncQueries(true);

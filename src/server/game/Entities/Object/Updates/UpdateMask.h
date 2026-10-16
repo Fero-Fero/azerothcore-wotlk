@@ -79,6 +79,20 @@ public:
             memset(_bits, 0, sizeof(uint8) * _blockCount * CLIENT_UPDATE_MASK_BITS);
     }
 
+    // Packs the mask into GetBlockCount() words, one bit per field, same layout as AppendToPacket.
+    void CopyTo(ClientUpdateMaskType* words) const
+    {
+        for (uint32 i = 0; i < _blockCount; ++i)
+        {
+            ClientUpdateMaskType maskPart = 0;
+            for (uint32 j = 0; j < CLIENT_UPDATE_MASK_BITS; ++j)
+                if (_bits[CLIENT_UPDATE_MASK_BITS * i + j])
+                    maskPart |= ClientUpdateMaskType(1) << j;
+
+            words[i] = maskPart;
+        }
+    }
+
     UpdateMask& operator=(UpdateMask const& right)
     {
         if (this == &right)

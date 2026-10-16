@@ -22,6 +22,7 @@
 #include "DetourAlloc.h"
 #include "DetourExtended.h"
 #include "DetourNavMesh.h"
+#include "SharedNavMesh.h"
 #include <memory>
 
 //  memory management
@@ -68,7 +69,9 @@ namespace MMAP
 
         static std::shared_ptr<dtNavMesh> LoadNavMesh(uint32 mapId);
         static bool LoadTile(dtNavMesh* navMesh, uint32 mapId, int32 x, int32 y);
-        static ManagedNavMeshQuery CreateNavMeshQuery(dtNavMesh* navMesh);
+        // Server-side overload: installs the tile under the holder's write side.
+        static bool LoadTile(SharedNavMesh& navMesh, uint32 mapId, int32 x, int32 y);
+        static ManagedNavMeshQuery CreateNavMeshQuery(dtNavMesh const* navMesh);
 
     private:
         static uint32 packTileID(int32 x, int32 y);

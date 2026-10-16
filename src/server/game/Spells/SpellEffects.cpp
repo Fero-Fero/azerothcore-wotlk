@@ -4235,8 +4235,9 @@ void Spell::EffectSanctuary(SpellEffIndex /*effIndex*/)
     else
     {
         // in dungeons (or for nonplayers), reset this unit on all enemies' threat lists
-        for (auto const& pair : unitTarget->GetThreatMgr().GetThreatenedByMeList())
-            pair.second->ScaleThreat(0.0f);
+        for (ObjectGuid const& ownerGuid : unitTarget->GetThreatMgr().GetThreatenedByMeList())
+            if (ThreatReference* ref = unitTarget->GetThreatMgr().GetReferenceThreateningMe(ownerGuid))
+                ref->ScaleThreat(0.0f);
     }
 
     UnitList targets;
@@ -5042,9 +5043,10 @@ void Spell::EffectForceDeselect(SpellEffIndex /*effIndex*/)
     if (m_spellInfo->Id == 58836)
     {
         std::vector<Unit*> images;
-        for (Unit::ControlSet::const_iterator itr = unitCaster->m_Controlled.begin(); itr != unitCaster->m_Controlled.end(); ++itr)
-            if ((*itr)->GetEntry() == 31216 /*NPC_MIRROR_IMAGE*/)
-                images.push_back(*itr);
+        for (ObjectGuid const& guid : unitCaster->m_Controlled)
+            if (Unit* controlled = unitCaster->GetControlled(guid))
+                if (controlled->GetEntry() == 31216 /*NPC_MIRROR_IMAGE*/)
+                    images.push_back(controlled);
 
         if (images.empty())
             return;

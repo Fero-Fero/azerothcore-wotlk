@@ -1332,6 +1332,27 @@ MapUpdateInterval = 10
 MapUpdate.Threads = 1
 
 #
+#    MapUpdate.PhaseTiming
+#        Description: Record per-phase durations inside Map::Update and log a
+#                     summary for slow maps. 0 leaves Map::Update unchanged.
+#        Default:     0 - (Off)
+#                     1 - (On, measurement only)
+
+MapUpdate.PhaseTiming = 0
+
+#
+#    MapUpdate.PhaseThreads
+#        Description: Cores that run unit tasks. 1 runs the beat loop on the
+#                     world thread alone and starts no worker thread. Set it
+#                     to the core count minus 1; the world thread is one of
+#                     them. On a 14-core machine that is 13. Tasks come from
+#                     every map in one process-wide pool.
+#        Default:     1
+#                     2..128 - (pool size, including the world thread)
+
+MapUpdate.PhaseThreads = 1
+
+#
 #    MoveMaps.Enable
 #        Description: Enable/Disable pathfinding using mmaps - recommended.
 #        Default:     0 - (Disabled)

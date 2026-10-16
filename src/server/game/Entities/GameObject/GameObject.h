@@ -127,6 +127,8 @@ public:
     void AddToWorld() override;
     void RemoveFromWorld() override;
     void CleanupsBeforeDelete(bool finalCleanup = true) override;
+    void PrepareRemovalForeign() override;
+    void PrepareRemovalOwn() override;
 
     uint32 GetDynamicFlags() const override { return GetUInt32Value(GAMEOBJECT_DYNAMIC); }
     void ReplaceAllDynamicFlags(uint32 flag) override { SetUInt32Value(GAMEOBJECT_DYNAMIC, flag); }

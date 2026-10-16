@@ -220,7 +220,10 @@ struct boss_flame_leviathan : public BossAI
         return std::ranges::any_of(me->GetCombatManager().GetPvECombatRefs(),
             [this](CombatReference* ref)
             {
-                Player* player = ref->GetOther(me)->GetCharmerOrOwnerPlayerOrPlayerItself();
+                Unit* other = ref->GetOther(me);
+                if (!other)
+                    return false;
+                Player* player = other->GetCharmerOrOwnerPlayerOrPlayerItself();
                 return player && player->IsAlive();
             },
             [](auto const& entry) { return entry.second; });

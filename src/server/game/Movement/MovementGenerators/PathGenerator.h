@@ -24,6 +24,7 @@
 #include "MapDefines.h"
 #include "MoveSplineInitArgs.h"
 #include "SharedDefines.h"
+#include "SharedNavMesh.h"
 #include <G3D/Vector3.h>
 
 class Unit;
@@ -145,7 +146,7 @@ class PathGenerator
         G3D::Vector3 _actualEndPosition;    // {x, y, z} of the closest possible point to given destination
 
         WorldObject const* const _source;       // the object that is moving
-        dtNavMesh const* _navMesh;              // the nav mesh
+        SharedNavMesh const* _navMesh;          // the nav mesh holder; the raw mesh is only read inside a NavMeshQueryScope
         dtNavMeshQuery const* _navMeshQuery;    // the nav mesh query used to find the path
 
         dtQueryFilterExt _filter;  // use single filter for all movements, update it when needed
@@ -161,10 +162,11 @@ class PathGenerator
 
         dtPolyRef GetPathPolyByPosition(dtPolyRef const* polyPath, uint32 polyPathSize, float const* Point, float* Distance = nullptr) const;
         dtPolyRef GetPolyByLocation(float const* Point, float* Distance) const;
-        [[nodiscard]] bool HaveTile(G3D::Vector3 const& p) const;
+        // The private helpers below take the raw mesh of the scope opened by the public caller.
+        [[nodiscard]] bool HaveTile(dtNavMesh const* navMesh, G3D::Vector3 const& p) const;
 
-        void BuildPolyPath(G3D::Vector3 const& startPos, G3D::Vector3 const& endPos);
-        void BuildPointPath(float const* startPoint, float const* endPoint);
+        void BuildPolyPath(dtNavMesh const* navMesh, G3D::Vector3 const& startPos, G3D::Vector3 const& endPos);
+        void BuildPointPath(dtNavMesh const* navMesh, float const* startPoint, float const* endPoint);
         void BuildShortcut();
 
         [[nodiscard]] NavTerrain GetNavTerrain(float x, float y, float z) const;
@@ -175,7 +177,7 @@ class PathGenerator
         uint32 FixupCorridor(dtPolyRef* path, uint32 npath, uint32 maxPath, dtPolyRef const* visited, uint32 nvisited);
         bool GetSteerTarget(float const* startPos, float const* endPos, float minTargetDist, dtPolyRef const* path, uint32 pathSize, float* steerPos,
                             unsigned char& steerPosFlag, dtPolyRef& steerPosRef);
-        dtStatus FindSmoothPath(float const* startPos, float const* endPos,
+        dtStatus FindSmoothPath(dtNavMesh const* navMesh, float const* startPos, float const* endPos,
                               dtPolyRef const* polyPath, uint32 polyPathSize,
                               float* smoothPath, int* smoothPathSize, uint32 smoothPathMaxSize);
 

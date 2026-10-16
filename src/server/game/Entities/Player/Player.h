@@ -1880,8 +1880,9 @@ public:
     {
         Unit::SetPvP(state);
         if (!m_Controlled.empty())
-            for (auto& itr : m_Controlled)
-                itr->SetPvP(state);
+            for (ObjectGuid const& guid : m_Controlled)
+                if (Unit* controlled = GetControlled(guid))
+                    controlled->SetPvP(state);
     }
     void UpdatePvP(bool state, bool _override = false);
     void UpdateZone(uint32 newZone, uint32 newArea, bool force = false);
@@ -2698,6 +2699,8 @@ public:
 protected:
     uint32 GetSpellQueueWindow() const;
     void ProcessSpellQueue();
+    // Nothing beyond the Unit part yet. Step 10 adds the viewer-side fields here.
+    void FillSlot(ObjectSlot& slot) override;
 
 public:
     std::deque<PendingSpellCastRequest> SpellQueue;

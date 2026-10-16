@@ -49,6 +49,7 @@
 #include "Tokenize.h"
 #include "Totem.h"
 #include "Transport.h"
+#include "UnitRecordLog.h"
 #include "UpdateData.h"
 #include "UpdateFieldFlags.h"
 #include "UpdateMask.h"
@@ -56,6 +57,8 @@
 #include "Vehicle.h"
 #include "World.h"
 #include "WorldPacket.h"
+#include <algorithm>
+#include <bit>
 
 /// @todo: this import is not necessary for compilation and marked as unused by the IDE
 //  however, for some reasons removing it would cause a damn linking issue
@@ -123,6 +126,8 @@ void Object::_InitValues()
     _changesMask.SetCount(m_valuesCount);
 
     m_objectUpdated = false;
+
+    _OnValuesInitialized();
 }
 
 void Object::_Create(ObjectGuid::LowType guidlow, uint32 entry, HighGuid guidhigh)
@@ -294,27 +299,39 @@ void Object::DestroyForPlayer(Player* target, bool onDeath) const
     target->SendDirectMessage(&data);
 }
 
+// Debug-only: a live-field read of an object that is not the running task's owner. The count is the size of
+// the step 13 foreign-access audit. Release builds pay nothing here.
+#ifdef ACORE_DEBUG
+#define COUNT_FOREIGN_READ() BeatContext::CountForeignRead(this)
+#else
+#define COUNT_FOREIGN_READ() ((void)0)
+#endif
+
 [[nodiscard]] int32 Object::GetInt32Value(uint16 index) const
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, false));
+    COUNT_FOREIGN_READ();
     return m_int32Values[index];
 }
 
 [[nodiscard]] uint32 Object::GetUInt32Value(uint16 index) const
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, false));
+    COUNT_FOREIGN_READ();
     return m_uint32Values[index];
 }
 
 [[nodiscard]] uint64 Object::GetUInt64Value(uint16 index) const
 {
     ASSERT(index + 1 < m_valuesCount || PrintIndexError(index, false));
+    COUNT_FOREIGN_READ();
     return *((uint64*) &(m_uint32Values[index]));
 }
 
 [[nodiscard]] float Object::GetFloatValue(uint16 index) const
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, false));
+    COUNT_FOREIGN_READ();
     return m_floatValues[index];
 }
 
@@ -322,6 +339,7 @@ void Object::DestroyForPlayer(Player* target, bool onDeath) const
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, false));
     ASSERT(offset < 4);
+    COUNT_FOREIGN_READ();
     return *(((uint8*) &m_uint32Values[index]) + offset);
 }
 
@@ -329,12 +347,14 @@ void Object::DestroyForPlayer(Player* target, bool onDeath) const
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, false));
     ASSERT(offset < 2);
+    COUNT_FOREIGN_READ();
     return *(((uint16*) &m_uint32Values[index]) + offset);
 }
 
 [[nodiscard]] ObjectGuid Object::GetGuidValue(uint16 index) const
 {
     ASSERT(index + 1 < m_valuesCount || PrintIndexError(index, false));
+    COUNT_FOREIGN_READ();
     return *((ObjectGuid*) &(m_uint32Values[index]));
 }
 
@@ -884,6 +904,7 @@ void Object::ToggleFlag(uint16 index, uint32 flag)
         return false;
     }
 
+    COUNT_FOREIGN_READ();
     return (m_uint32Values[index] & flag) != 0;
 }
 
@@ -1164,6 +1185,9 @@ void WorldObject::AddToMapVisibilityOverrideContainers()
 
 void WorldObject::CleanupsBeforeDelete(bool /*finalCleanup*/)
 {
+    if (_removing)
+        return;
+
     if (IsInWorld())
         RemoveFromWorld();
 
@@ -1220,9 +1244,112 @@ void WorldObject::ProcessPositionDataChanged(PositionFullTerrainStatus const& da
     }
 }
 
+void WorldObject::_OnValuesInitialized()
+{
+    _slots.Init(m_valuesCount, IsUnit());
+}
+
+void WorldObject::PublishSlot()
+{
+    if (!_slots.IsInitialized())
+        return;
+
+    ObjectSlot& s = _slots.WriteSlot();
+    s.beat = BeatContext::beat.load(std::memory_order_relaxed);
+    std::memcpy(s.values, m_uint32Values, m_valuesCount * sizeof(uint32));
+    _changesMask.CopyTo(s.changesMask);
+    s.pos = GetPosition();
+    s.phaseMask = GetPhaseMask();
+    s.zoneId = _zoneId;
+    s.areaId = _areaId;
+    s.cellId = Acore::ComputeCellCoord(s.pos.GetPositionX(), s.pos.GetPositionY()).GetId();
+    FillSlot(s);
+    _slots.Commit(s.beat);
+}
+
+void WorldObject::OnFirstRecordOfBeat(uint8 core)
+{
+    _writtenBy.fetch_or(1ull << core, std::memory_order_release);
+
+    // Wake: a target that is not due gets a task next beat so the record is applied. Players are scanned
+    // from the map's player list every beat; everything else joins the updatable list (no-op if already in).
+    if (!IsPlayer() && !_removing && IsInWorld())
+        if (Map* map = FindMap())
+            map->AddObjectToPendingUpdateList(this);
+}
+
+void WorldObject::ApplyInbox()
+{
+    uint64 mask = _writtenBy.exchange(0, std::memory_order_acquire);
+    if (!mask)
+        return;
+
+    thread_local std::vector<RecordHeader const*> collected;   // capacity kept across beats
+    collected.clear();
+
+    // Records were written in the previous beat.
+    uint32 const beat = BeatContext::beat.load(std::memory_order_relaxed) - 1;
+    uint32 const idx = SlotIndex();
+    if (idx == ObjectSlotPair::NO_SLOT_INDEX)
+        return;
+
+    for (; mask; mask &= mask - 1)
+    {
+        UnitRecordLog const& log = sRecordLogs->ReadLog(uint8(std::countr_zero(mask)));
+        TargetHead const h = log.Head(idx);
+        if (h.beat != beat)
+            continue;
+        for (uint32 off = h.offset; off != RecordHeader::NO_RECORD; off = log.At(off)->nextInTarget)
+        {
+            RecordHeader const* hdr = log.At(off);
+            // The slot index may have been reused inside the beat: only this object's records belong to it.
+            if (hdr->target == GetGUID())
+                collected.push_back(hdr);
+        }
+    }
+
+    if (collected.empty())
+        return;
+
+    std::sort(collected.begin(), collected.end(), [](RecordHeader const* a, RecordHeader const* b)
+    {
+        return a->source != b->source ? a->source < b->source : a->sequence < b->sequence;
+    });
+
+    ApplyRecords(collected);
+}
+
+void WorldObject::ApplyRecords(std::vector<RecordHeader const*> const& records)
+{
+    for (RecordHeader const* hdr : records)
+        LOG_DEBUG("maps.records", "{} dropped record {} from {}: no applier on this object type",
+            GetGUID().ToString(), RecordKindName(hdr->kind), hdr->source.ToString());
+}
+
+void WorldObject::PrepareRemovalOwn()
+{
+    // Stay in the world until the seal unlinks us. Only kill events that write this.
+    m_Events.KillAllEvents(false);
+}
+
+void WorldObject::PrepareRemoval()
+{
+    if (_removing)
+        return;
+
+    PrepareRemovalForeign();
+    // Mark first so the own half skips RemoveFromWorld (the object stays addressable this beat).
+    _removing = true;
+    PrepareRemovalOwn();
+    // Final slot: viewers' next scan sees the object gone (dead, no auras). Never republished.
+    PublishSlot();
+}
+
 void WorldObject::AddToWorld()
 {
     Object::AddToWorld();
+    if (_slots.SlotIndex() == ObjectSlotPair::NO_SLOT_INDEX)
+        _slots.SetSlotIndex(sSlotIndexAllocator->Allocate());
     GetMap()->GetZoneAndAreaId(GetPhaseMask(), _zoneId, _areaId, GetPositionX(), GetPositionY(), GetPositionZ());
     GetMap()->AddObjectToPendingUpdateList(this);
 
@@ -1240,6 +1367,10 @@ void WorldObject::RemoveFromWorld()
     DestroyForVisiblePlayers();
 
     GetObjectVisibilityContainer().CleanVisibilityReferences();
+
+    // Step 12 moves the release to seal phase S2 so a record addressed this beat is not misdelivered.
+    sSlotIndexAllocator->Release(_slots.SlotIndex());
+    _slots.SetSlotIndex(ObjectSlotPair::NO_SLOT_INDEX);
 
     Object::RemoveFromWorld();
 }

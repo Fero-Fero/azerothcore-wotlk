@@ -97,6 +97,8 @@ struct npc_pet_hunter_snake_trap : public ScriptedAI
                 auto addTargetIfValid = [this, &targets, summoner](CombatReference* ref) mutable
                 {
                     Unit* enemy = ref->GetOther(summoner);
+                    if (!enemy)
+                        return;
                     if (!enemy->HasBreakableByDamageCrowdControlAura(me) && me->CanCreatureAttack(enemy) && me->IsWithinDistInMap(enemy, me->GetAttackDistance(enemy)))
                         targets.push_back(enemy);
                 };

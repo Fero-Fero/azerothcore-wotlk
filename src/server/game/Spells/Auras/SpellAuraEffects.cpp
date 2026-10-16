@@ -2981,8 +2981,9 @@ void AuraEffect::HandleFeignDeath(AuraApplication const* aurApp, uint8 mode, boo
             }
         }
 
-        for (auto& pair : target->GetThreatMgr().GetThreatenedByMeList())
-            pair.second->ScaleThreat(0.0f);
+        for (ObjectGuid const& ownerGuid : target->GetThreatMgr().GetThreatenedByMeList())
+            if (ThreatReference* ref = target->GetThreatMgr().GetReferenceThreateningMe(ownerGuid))
+                ref->ScaleThreat(0.0f);
 
         if (target->GetInstanceScript() && target->GetInstanceScript()->IsEncounterInProgress())
         {

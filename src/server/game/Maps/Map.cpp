@@ -45,6 +45,7 @@
 #include "VMapMgr2.h"
 #include "Weather.h"
 #include "WeatherMgr.h"
+#include <optional>
 
 #define MAP_INVALID_ZONE        0xFFFFFFFF
 
@@ -435,15 +436,30 @@ void Map::UpdatePlayerZoneStats(uint32 oldZone, uint32 newZone)
 
 void Map::Update(const uint32 t_diff, const uint32 s_diff, bool  /*thread*/)
 {
+    std::optional<MapPhaseClock> phases;
+    if (sWorld->getBoolConfig(CONFIG_MAPUPDATE_PHASE_TIMING))
+        phases.emplace(&_phaseTiming, *this);
+    auto nextPhase = [&](MapUpdatePhase p) { if (phases) phases->Next(p); };
+
+    // Records written to this map's objects in the previous beat land before anything runs this beat.
+    ApplyInboxes();
+
     if (t_diff)
+    {
+        nextPhase(MapUpdatePhase::DynamicTree);
         _mapCollisionData.GetDynamicTree().update(t_diff);
+    }
 
     // Update world sessions and players
+    nextPhase(MapUpdatePhase::Sessions);
     for (m_mapRefIter = m_mapRefMgr.begin(); m_mapRefIter != m_mapRefMgr.end(); ++m_mapRefIter)
     {
         Player* player = m_mapRefIter->GetSource();
         if (player && player->IsInWorld())
         {
+            // Map-side packets and the player's update run as the player's task (step 12 keeps them together).
+            TaskScope task(player, player);
+
             // Update session
             WorldSession* session = player->GetSession();
             MapSessionFilter updater(session);
@@ -451,15 +467,21 @@ void Map::Update(const uint32 t_diff, const uint32 s_diff, bool  /*thread*/)
 
             // update players at tick
             if (!t_diff)
+            {
                 player->Update(s_diff);
+                player->PublishSlot();
+            }
         }
     }
 
+    nextPhase(MapUpdatePhase::Respawn);
     Events.Update(t_diff);
 
     if (!t_diff)
     {
         HandleDelayedVisibility();
+        if (phases)
+            phases->Abandon();
         return;
     }
 
@@ -479,6 +501,7 @@ void Map::Update(const uint32 t_diff, const uint32 s_diff, bool  /*thread*/)
     resetMarkedCells();
 
     // Update players
+    nextPhase(MapUpdatePhase::Players);
     for (m_mapRefIter = m_mapRefMgr.begin(); m_mapRefIter != m_mapRefMgr.end(); ++m_mapRefIter)
     {
         Player* player = m_mapRefIter->GetSource();
@@ -486,7 +509,11 @@ void Map::Update(const uint32 t_diff, const uint32 s_diff, bool  /*thread*/)
         if (!player || !player->IsInWorld())
             continue;
 
-        player->Update(s_diff);
+        {
+            TaskScope task(player, player);
+            player->Update(s_diff);
+            player->PublishSlot();
+        }
 
         if (_updatableObjectListRecheckTimer.Passed())
         {
@@ -503,11 +530,14 @@ void Map::Update(const uint32 t_diff, const uint32 s_diff, bool  /*thread*/)
         }
     }
 
+    nextPhase(MapUpdatePhase::NonPlayers);
     UpdateNonPlayerObjects(t_diff);
 
+    nextPhase(MapUpdatePhase::ObjectUpdates);
     SendObjectUpdates();
 
     ///- Process necessary scripts
+    nextPhase(MapUpdatePhase::Scripts);
     if (!m_scriptSchedule.empty())
     {
         i_scriptLock = true;
@@ -515,12 +545,15 @@ void Map::Update(const uint32 t_diff, const uint32 s_diff, bool  /*thread*/)
         i_scriptLock = false;
     }
 
+    nextPhase(MapUpdatePhase::Movement);
     MoveAllCreaturesInMoveList();
     MoveAllGameObjectsInMoveList();
     MoveAllDynamicObjectsInMoveList();
 
+    nextPhase(MapUpdatePhase::Visibility);
     HandleDelayedVisibility();
 
+    nextPhase(MapUpdatePhase::Tail);
     UpdatePlayersRedirectKickEvent(t_diff);
 
     UpdateWeather(t_diff);
@@ -535,6 +568,39 @@ void Map::Update(const uint32 t_diff, const uint32 s_diff, bool  /*thread*/)
     METRIC_VALUE("map_gameobjects", uint64(GetObjectsStore().Size<GameObject>()),
         METRIC_TAG("map_id", std::to_string(GetId())),
         METRIC_TAG("map_instanceid", std::to_string(GetInstanceId())));
+
+    BeatContext::FlushForeignReads();
+}
+
+void Map::ApplyInboxes()
+{
+    // Collect first: an applier may wake, add or remove list members (a CombatEnd can despawn through AI).
+    thread_local std::vector<WorldObject*> withInbox;
+    withInbox.clear();
+
+    for (MapReference const& ref : m_mapRefMgr)
+        if (Player* player = ref.GetSource())
+            if (player->HasInbox())
+                withInbox.push_back(player);
+
+    for (WorldObject* obj : _updatableObjectList)
+        if (obj->HasInbox())
+            withInbox.push_back(obj);
+
+    for (WorldObject* obj : _pendingAddUpdatableObjectList)
+        if (obj->HasInbox())
+            withInbox.push_back(obj);
+
+    for (WorldObject* obj : withInbox)
+    {
+        // Records whose target is gone are dropped. Nothing in this list has been freed: frees happen at the
+        // end of the tick, after every map updated.
+        if (!obj->IsInWorld() || obj->IsRemoving())
+            continue;
+
+        TaskScope task(obj, obj);
+        obj->ApplyInbox();
+    }
 }
 
 void Map::UpdateNonPlayerObjects(uint32 const diff)
@@ -554,7 +620,11 @@ void Map::UpdateNonPlayerObjects(uint32 const diff)
                 continue;
             }
 
-            obj->Update(diff);
+            {
+                TaskScope task(obj, obj);
+                obj->Update(diff);
+                obj->PublishSlot();
+            }
 
             if (!obj->IsUpdateNeeded())
             {
@@ -575,7 +645,9 @@ void Map::UpdateNonPlayerObjects(uint32 const diff)
             if (!obj->IsInWorld())
                 continue;
 
+            TaskScope task(obj, obj);
             obj->Update(diff);
+            obj->PublishSlot();
         }
     }
 }
@@ -1824,7 +1896,8 @@ void Map::AddObjectToRemoveList(WorldObject* obj)
 {
     ASSERT(obj->GetMapId() == GetId() && obj->GetInstanceId() == GetInstanceId());
 
-    obj->CleanupsBeforeDelete(false);                            // remove or simplify at least cross referenced links
+    // Own half of the cleanup now, foreign half as records; the removal itself waits for the tick's end.
+    obj->PrepareRemoval();
 
     i_objectsToRemove.insert(obj);
     //LOG_DEBUG("maps", "Object ({}) added to removing list.", obj->GetGUID().ToString());
@@ -1859,8 +1932,9 @@ void Map::RemoveAllObjectsInRemoveList()
                     RemoveFromMap(obj->ToGameObject(), true);
                 break;
             case TYPEID_UNIT:
-                // in case triggered sequence some spell can continue casting after prev CleanupsBeforeDelete call
-                // make sure that like sources auras/etc removed before destructor start
+                // The unit prepared its own removal when it was listed; what is left is the final own-side pass
+                // (a spell triggered after the first cleanup) and the grid unlink in RemoveFromMap.
+                ASSERT(obj->IsRemoving());
                 obj->ToCreature()->CleanupsBeforeDelete();
                 RemoveFromMap(obj->ToCreature(), true);
                 break;

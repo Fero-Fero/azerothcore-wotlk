@@ -744,12 +744,10 @@ void InstanceScript::DoCastSpellOnPlayer(Player* player, uint32 spell, bool incl
     if (!includeControlled)
         return;
 
-    for (auto itr2 = player->m_Controlled.begin(); itr2 != player->m_Controlled.end(); ++itr2)
-    {
-        if (Unit* controlled = *itr2)
+    for (ObjectGuid const& guid : player->m_Controlled)
+        if (Unit* controlled = player->GetControlled(guid))
             if (controlled->IsInWorld() && controlled->IsCreature())
                 controlled->CastSpell(player, spell, true);
-    }
 }
 
 bool InstanceScript::CheckAchievementCriteriaMeet(uint32 criteria_id, Player const* /*source*/, Unit const* /*target*/ /*= nullptr*/, uint32 /*miscvalue1*/ /*= 0*/)

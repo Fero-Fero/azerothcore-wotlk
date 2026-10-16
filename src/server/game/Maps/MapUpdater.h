@@ -44,7 +44,8 @@ public:
     void update_finished();
 
 private:
-    void WorkerThread();
+    // coreIndex is 1-based: core 0 is the world thread (BeatContext::core).
+    void WorkerThread(uint8 coreIndex);
     ProducerConsumerQueue<UpdateRequest*> _queue;
     std::atomic<int> pending_requests;  // Use std::atomic for pending_requests to avoid lock contention
     std::atomic<bool> _cancelationToken;  // Atomic flag for cancellation to avoid race conditions

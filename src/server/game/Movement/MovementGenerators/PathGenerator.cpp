@@ -133,7 +133,7 @@ PathGenerator::PathGenerator(WorldObject const* owner) :
 
     //if (sDisableMgr->IsPathfindingEnabled(_sourceUnit->FindMap()))
     {
-        _navMesh = _source->GetMap()->GetMapCollisionData().GetMMapData().GetNavMesh();
+        _navMesh = _source->GetMap()->GetMapCollisionData().GetMMapData().GetSharedNavMesh();
         _navMeshQuery = _source->GetMap()->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
     }
 
@@ -168,10 +168,19 @@ bool PathGenerator::CalculatePath(float x, float y, float z, float destX, float 
     _forceDestination = forceDest;
 
     // make sure navMesh works - we can run on map w/o mmap
-    // check if the start and end point have a .mmtile loaded (can we pass via not loaded tile on the way?)
     Unit const* _sourceUnit = _source->ToUnit();
-    if (!_navMesh || !_navMeshQuery || (_sourceUnit && _sourceUnit->HasUnitState(UNIT_STATE_IGNORE_PATHFINDING)) ||
-        !HaveTile(start) || !HaveTile(dest))
+    if (!_navMesh || !_navMeshQuery || (_sourceUnit && _sourceUnit->HasUnitState(UNIT_STATE_IGNORE_PATHFINDING)))
+    {
+        BuildShortcut();
+        _type = PathType(PATHFIND_NORMAL | PATHFIND_NOT_USING_PATH);
+        return true;
+    }
+
+    // every read of the shared mesh below happens inside this scope
+    NavMeshQueryScope scope(*_navMesh);
+
+    // check if the start and end point have a .mmtile loaded (can we pass via not loaded tile on the way?)
+    if (!HaveTile(scope.ptr, start) || !HaveTile(scope.ptr, dest))
     {
         BuildShortcut();
         _type = PathType(PATHFIND_NORMAL | PATHFIND_NOT_USING_PATH);
@@ -180,7 +189,7 @@ bool PathGenerator::CalculatePath(float x, float y, float z, float destX, float 
 
     UpdateFilter();
 
-    BuildPolyPath(start, dest);
+    BuildPolyPath(scope.ptr, start, dest);
     return true;
 }
 
@@ -254,7 +263,7 @@ dtPolyRef PathGenerator::GetPolyByLocation(float const* point, float* distance) 
     return INVALID_POLYREF;
 }
 
-void PathGenerator::BuildPolyPath(G3D::Vector3 const& startPos, G3D::Vector3 const& endPos)
+void PathGenerator::BuildPolyPath(dtNavMesh const* navMesh, G3D::Vector3 const& startPos, G3D::Vector3 const& endPos)
 {
     // *** getting start/end poly logic ***
 
@@ -369,7 +378,7 @@ void PathGenerator::BuildPolyPath(G3D::Vector3 const& startPos, G3D::Vector3 con
         else
             _type = PATHFIND_NORMAL;
 
-        BuildPointPath(startPoint, endPoint);
+        BuildPointPath(navMesh, startPoint, endPoint);
         return;
     }
 
@@ -609,10 +618,10 @@ void PathGenerator::BuildPolyPath(G3D::Vector3 const& startPos, G3D::Vector3 con
     AddFarFromPolyFlags(startFarFromPoly, endFarFromPoly);
 
     // generate the point-path out of our up-to-date poly-path
-    BuildPointPath(startPoint, endPoint);
+    BuildPointPath(navMesh, startPoint, endPoint);
 }
 
-void PathGenerator::BuildPointPath(float const* startPoint, float const* endPoint)
+void PathGenerator::BuildPointPath(dtNavMesh const* navMesh, float const* startPoint, float const* endPoint)
 {
     float pathPoints[MAX_POINT_PATH_LENGTH * VERTEX_SIZE];
     uint32 pointCount = 0;
@@ -641,6 +650,7 @@ void PathGenerator::BuildPointPath(float const* startPoint, float const* endPoin
     else
     {
         dtResult = FindSmoothPath(
+            navMesh,            // shared mesh of the open query scope
             startPoint,         // start position
             endPoint,           // end position
             _pathPolyRefs,     // current path
@@ -814,12 +824,12 @@ NavTerrain PathGenerator::GetNavTerrain(float x, float y, float z) const
     }
 }
 
-bool PathGenerator::HaveTile(G3D::Vector3 const& p) const
+bool PathGenerator::HaveTile(dtNavMesh const* navMesh, G3D::Vector3 const& p) const
 {
     int tx = -1, ty = -1;
     float point[VERTEX_SIZE] = { p.y, p.z, p.x };
 
-    _navMesh->calcTileLoc(point, &tx, &ty);
+    navMesh->calcTileLoc(point, &tx, &ty);
 
     /// Workaround
     /// For some reason, often the tx and ty variables wont get a valid value
@@ -827,7 +837,7 @@ bool PathGenerator::HaveTile(G3D::Vector3 const& p) const
     if (tx < 0 || ty < 0)
         return false;
 
-    return (_navMesh->getTileAt(tx, ty, 0) != nullptr);
+    return (navMesh->getTileAt(tx, ty, 0) != nullptr);
 }
 
 uint32 PathGenerator::FixupCorridor(dtPolyRef* path, uint32 npath, uint32 maxPath, dtPolyRef const* visited, uint32 nvisited)
@@ -913,7 +923,7 @@ bool PathGenerator::GetSteerTarget(float const* startPos, float const* endPos,
     return true;
 }
 
-dtStatus PathGenerator::FindSmoothPath(float const* startPos, float const* endPos,
+dtStatus PathGenerator::FindSmoothPath(dtNavMesh const* navMesh, float const* startPos, float const* endPos,
     dtPolyRef const* polyPath, uint32 polyPathSize,
     float* smoothPath, int* smoothPathSize, uint32 maxSmoothPathSize)
 {
@@ -1036,7 +1046,7 @@ dtStatus PathGenerator::FindSmoothPath(float const* startPos, float const* endPo
 
             // Handle the connection.
             float connectionStartPos[VERTEX_SIZE], connectionEndPos[VERTEX_SIZE];
-            if (dtStatusSucceed(_navMesh->getOffMeshConnectionPolyEndPoints(prevRef, polyRef, connectionStartPos, connectionEndPos)))
+            if (dtStatusSucceed(navMesh->getOffMeshConnectionPolyEndPoints(prevRef, polyRef, connectionStartPos, connectionEndPos)))
             {
                 if (nsmoothPath < maxSmoothPathSize)
                 {

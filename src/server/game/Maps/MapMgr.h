@@ -69,7 +69,7 @@ public:
         m->GetZoneAndAreaId(phaseMask, zoneid, areaid, x, y, z);
     }
 
-    void Initialize(void);
+    void Initialize(void); // also inits sRecordLogs (one log per core on this step)
     void Update(uint32);
 
     void SetMapUpdateInterval(uint32 t)

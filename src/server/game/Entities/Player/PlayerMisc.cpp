@@ -394,8 +394,9 @@ void Player::UpdateFFAPvPFlag(time_t currTime)
         RemoveByteFlag(UNIT_FIELD_BYTES_2, 1, UNIT_BYTE2_FLAG_FFA_PVP);
         sScriptMgr->OnPlayerFfaPvpStateUpdate(this, false);
     }
-    for (ControlSet::iterator itr = m_Controlled.begin(); itr != m_Controlled.end(); ++itr)
-        (*itr)->RemoveByteFlag(UNIT_FIELD_BYTES_2, 1, UNIT_BYTE2_FLAG_FFA_PVP);
+    for (ObjectGuid const& guid : m_Controlled)
+        if (Unit* controlled = GetControlled(guid))
+            controlled->RemoveByteFlag(UNIT_FIELD_BYTES_2, 1, UNIT_BYTE2_FLAG_FFA_PVP);
 
     // xinef: iterate attackers
     AttackerSet toRemove;

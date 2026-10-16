@@ -22,6 +22,7 @@
 #include "MapTree.h"
 #include "MMapMgr.h"
 #include "IVMapMgr.h"
+#include "SharedNavMesh.h"
 
 class Map;
 
@@ -59,12 +60,15 @@ class MMapData
     friend class MapCollisionData;
 
 public:
-    dtNavMesh const* GetNavMesh() const { return _navMesh.get(); }
+    // Null when no mmap exists for this map. Read the mesh through a NavMeshQueryScope only.
+    SharedNavMesh* GetSharedNavMesh() { return _navMesh.get(); }
+    SharedNavMesh const* GetSharedNavMesh() const { return _navMesh.get(); }
     dtNavMeshQuery const* GetNavMeshQuery();
 
 protected:
-    // _navMesh is a shared_ptr as it will point to a parent maps nav mesh (if exists) to save on memory
-    std::shared_ptr<dtNavMesh> _navMesh;
+    // _navMesh is a shared_ptr as it will point to a parent maps nav mesh (if exists) to save on memory;
+    // every instance of one map id shares the one SharedNavMesh and its guard
+    std::shared_ptr<SharedNavMesh> _navMesh;
     // navMeshQuery is not thread safe and needs its own instance per map
     MMAP::ManagedNavMeshQuery _navMeshQuery;
 };
@@ -87,7 +91,7 @@ public:
     MMapData const& GetMMapData() const { return _mmapData; }
 
     std::shared_ptr<VMAP::StaticMapTree> const GetStaticTreeSharedPtr() const { return _staticVMapData._staticTree; }
-    std::shared_ptr<dtNavMesh> const GetMMapNavMeshSharedPtr() const { return _mmapData._navMesh; }
+    std::shared_ptr<SharedNavMesh> const GetMMapNavMeshSharedPtr() const { return _mmapData._navMesh; }
 
 private:
     Map const& _map;

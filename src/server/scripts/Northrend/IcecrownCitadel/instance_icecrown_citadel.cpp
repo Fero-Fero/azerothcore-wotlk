@@ -1624,9 +1624,12 @@ public:
                         instance->DoForAllPlayers([&](Player* player)
                         {
                             player->UpdateAreaDependentAuras(player->GetAreaId());
-                            for (Unit::ControlSet::const_iterator itr = player->m_Controlled.begin(); itr != player->m_Controlled.end(); ++itr)
+                            for (ObjectGuid const& guid : player->m_Controlled)
                             {
-                                Unit::AuraMap& am = (*itr)->GetOwnedAuras();
+                                Unit* controlled = player->GetControlled(guid);
+                                if (!controlled)
+                                    continue;
+                                Unit::AuraMap& am = controlled->GetOwnedAuras();
                                 for (Unit::AuraMap::iterator itra = am.begin(); itra != am.end();)
                                     switch (itra->second->GetId())
                                     {
@@ -1644,7 +1647,7 @@ public:
                                         case 73826:
                                         case 73827:
                                         case 73828:
-                                            (*itr)->RemoveOwnedAura(itra);
+                                            controlled->RemoveOwnedAura(itra);
                                             break;
                                         default:
                                             ++itra;

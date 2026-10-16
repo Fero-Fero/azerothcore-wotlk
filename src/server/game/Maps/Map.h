@@ -30,6 +30,7 @@
 #include "Timer.h"
 #include "MapCollisionData.h"
 #include "MapGridManager.h"
+#include "MapPhaseTiming.h"
 #include "MapRefMgr.h"
 #include "ObjectDefines.h"
 #include "ObjectGuid.h"
@@ -333,6 +334,7 @@ public:
 
     typedef MapRefMgr PlayerList;
     [[nodiscard]] PlayerList const& GetPlayers() const { return m_mapRefMgr; }
+    [[nodiscard]] std::size_t GetUpdatableObjectCount() const { return _updatableObjectList.size(); }
 
     //per-map script storage
     void ScriptsStart(std::map<uint32, std::multimap<uint32, ScriptInfo> > const& scripts, uint32 id, Object* source, Object* target);
@@ -646,6 +648,9 @@ private:
     void DeleteFromWorld(T*);
 
     void UpdateNonPlayerObjects(uint32 const diff);
+    // Applies last beat's records to every listed object with a non-zero writtenBy mask, before any Update.
+    // Step 12 replaces this scan with the wake rule.
+    void ApplyInboxes();
 
     void _AddObjectToUpdateList(WorldObject* obj);
     void _RemoveObjectFromUpdateList(WorldObject* obj);
@@ -712,6 +717,8 @@ private:
 
     TimeTrackerSmall _redirectKickTimer;
     TimeTrackerSmall _lastAnnounceRedirectKickTimer;
+
+    MapPhaseTiming _phaseTiming;
 };
 
 enum InstanceResetMethod

@@ -16,7 +16,9 @@
  */
 
 #include "Unit.h"
+#include "UnitRecordLog.h"
 #include "AbstractFollower.h"
+#include "BeatContext.h"
 #include "AreaDefines.h"
 #include "ArenaSpectator.h"
 #include "Battlefield.h"
@@ -61,6 +63,7 @@
 #include "SpellAuraDefines.h"
 #include "SpellAuraEffects.h"
 #include "SpellAuras.h"
+#include "SpellHitRecord.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "TemporarySummon.h"
@@ -505,6 +508,42 @@ Unit::~Unit()
         LOG_INFO("misc", "Unit::~Unit (A1)");
 
     HandleSafeUnitPointersOnDelete(this);
+}
+
+void Unit::FillSlot(ObjectSlot& s)
+{
+    s.movementFlags = m_movementInfo.flags;
+    s.movementFlags2 = m_movementInfo.flags2;
+    s.unitState = m_state;
+    s.deathState = uint8(m_deathState);
+    s.isInCombat = IsInCombat() ? 1 : 0;
+    s.lastSanctuaryTime = m_lastSanctuaryTime;
+    s.victimGuid = m_attacking ? m_attacking->GetGUID() : ObjectGuid::Empty;
+    s.charmerOrOwnerGuid = GetCharmerOrOwnerGUID();
+
+    _slots.EnsureAuraCapacity(uint32(m_appliedAuras.size()));
+    uint32 n = 0;
+    for (auto const& [spellId, app] : m_appliedAuras)
+    {
+        Aura const* aura = app->GetBase();
+        SlotAura& sa = s.auras[n++];
+        sa.spellId = spellId;
+        sa.casterGuid = aura->GetCasterGUID();
+        sa.effectMask = app->GetEffectMask();
+        sa.stackAmount = aura->GetStackAmount();
+        sa.charges = aura->GetCharges();
+        sa.flags = (app->IsPositive() ? SLOT_AURA_POSITIVE : 0)
+            | (aura->IsPassive() ? SLOT_AURA_PASSIVE : 0)
+            | (aura->GetCasterGUID() == GetGUID() ? SLOT_AURA_SELF_CAST : 0);
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        {
+            AuraEffect const* eff = (sa.effectMask & (1 << i)) ? aura->GetEffect(i) : nullptr;
+            sa.amount[i] = eff ? eff->GetAmount() : 0;
+        }
+        sa.duration = aura->GetDuration();
+        sa.maxDuration = aura->GetMaxDuration();
+    }
+    s.auraCount = n;
 }
 
 void Unit::Update(uint32 p_time)
@@ -1009,10 +1048,11 @@ uint32 Unit::DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage
     // Signal to pets that their owner was attacked - except when DOT.
     if (attacker != victim && damagetype != DOT)
     {
-        for (Unit* controlled : victim->m_Controlled)
-            if (Creature* cControlled = controlled->ToCreature())
-                if (CreatureAI* controlledAI = cControlled->AI())
-                    controlledAI->OwnerAttackedBy(attacker);
+        for (ObjectGuid const& guid : victim->m_Controlled)
+            if (Unit* controlled = victim->GetControlled(guid))
+                if (Creature* cControlled = controlled->ToCreature())
+                    if (CreatureAI* controlledAI = cControlled->AI())
+                        controlledAI->OwnerAttackedBy(attacker);
     }
 
     //Dont deal damage to unit if .cheat god is enable.
@@ -2790,10 +2830,11 @@ void Unit::AttackerStateUpdate(Unit* victim, WeaponAttackType attType /*= BASE_A
     // Spells such as auto-shot and others handled in WorldSession::HandleCastSpellOpcode
     if (IsPlayer())
     {
-        for (Unit* controlled : m_Controlled)
-            if (Creature* cControlled = controlled->ToCreature())
-                if (CreatureAI* controlledAI = cControlled->AI())
-                    controlledAI->OwnerAttacked(victim);
+        for (ObjectGuid const& guid : m_Controlled)
+            if (Unit* controlled = GetControlled(guid))
+                if (Creature* cControlled = controlled->ToCreature())
+                    if (CreatureAI* controlledAI = cControlled->AI())
+                        controlledAI->OwnerAttacked(victim);
     }
 
     if (!extra && _lastExtraAttackSpell)
@@ -4945,6 +4986,18 @@ void Unit::RemoveAppliedAuras(uint32 spellId, std::function<bool(AuraApplication
 
 void Unit::RemoveAurasDueToSpell(uint32 spellId, ObjectGuid casterGUID, uint8 reqEffMask, AuraRemoveMode removeMode)
 {
+    if (IsForeignToTask())
+    {
+        AuraRemoveRecord record;
+        record.casterGuid = casterGUID;
+        record.spellId = spellId;
+        record.reqEffMask = reqEffMask;
+        record.removeMode = uint8(removeMode);
+        ObjectGuid const source = BeatContext::owner ? BeatContext::owner->GetGUID() : GetGUID();
+        sRecordLogs->Append(source, this, RecordKind::AuraRemove, record);
+        return;
+    }
+
     for (AuraApplicationMap::iterator iter = m_appliedAuras.lower_bound(spellId); iter != m_appliedAuras.upper_bound(spellId);)
     {
         Aura const* aura = iter->second->GetBase();
@@ -7180,11 +7233,12 @@ bool Unit::Attack(Unit* victim, bool meleeAttack)
     Creature* controlledCreatureWithSameVictim = nullptr;
     if (creature && !m_Controlled.empty())
     {
-        for (ControlSet::iterator itr = m_Controlled.begin(); itr != m_Controlled.end(); ++itr)
+        for (ObjectGuid const& guid : m_Controlled)
         {
-            if ((*itr)->ToCreature() && (*itr)->GetVictim() == victim)
+            Unit* controlled = GetControlled(guid);
+            if (controlled && controlled->ToCreature() && controlled->GetVictim() == victim)
             {
-                controlledCreatureWithSameVictim = (*itr)->ToCreature();
+                controlledCreatureWithSameVictim = controlled->ToCreature();
                 break;
             }
         }
@@ -7299,8 +7353,9 @@ void Unit::CombatStopWithPets(bool includingCast)
 {
     CombatStop(includingCast);
 
-    for (ControlSet::const_iterator itr = m_Controlled.begin(); itr != m_Controlled.end(); ++itr)
-        (*itr)->CombatStop(includingCast);
+    for (ObjectGuid const& guid : m_Controlled)
+        if (Unit* controlled = GetControlled(guid))
+            controlled->CombatStop(includingCast);
 }
 
 void Unit::EngageWithTarget(Unit* who)
@@ -7319,9 +7374,10 @@ bool Unit::isAttackingPlayer() const
         return true;
 
     if (!m_Controlled.empty())
-        for (ControlSet::const_iterator itr = m_Controlled.begin(); itr != m_Controlled.end(); ++itr)
-            if ((*itr)->isAttackingPlayer())
-                return true;
+        for (ObjectGuid const& guid : m_Controlled)
+            if (Unit* controlled = GetControlled(guid))
+                if (controlled->isAttackingPlayer())
+                    return true;
 
     for (uint8 i = 0; i < MAX_SUMMON_SLOT; ++i)
         if (m_SummonSlot[i])
@@ -7337,12 +7393,13 @@ void Unit::UpdatePetCombatState()
     ASSERT(!IsPet()); // player pets do not use UNIT_FLAG_PET_IN_COMBAT for this purpose
 
     bool state = false;
-    for (Unit* minion : m_Controlled)
-        if (minion->IsInCombat())
-        {
-            state = true;
-            break;
-        }
+    for (ObjectGuid const& guid : m_Controlled)
+        if (Unit* minion = GetControlled(guid))
+            if (minion->IsInCombat())
+            {
+                state = true;
+                break;
+            }
 
     if (state)
         SetUnitFlag(UNIT_FLAG_PET_IN_COMBAT);
@@ -7583,7 +7640,7 @@ void Unit::SetMinion(Minion* minion, bool apply)
 
         minion->SetOwnerGUID(GetGUID());
 
-        m_Controlled.insert(minion);
+        m_Controlled.insert(minion->GetGUID());
 
         if (IsPlayer())
         {
@@ -7653,7 +7710,7 @@ void Unit::SetMinion(Minion* minion, bool apply)
             return;
         }
 
-        m_Controlled.erase(minion);
+        m_Controlled.erase(minion->GetGUID());
 
         if (minion->m_Properties && minion->m_Properties->Type == SUMMON_TYPE_MINIPET)
         {
@@ -7698,31 +7755,34 @@ void Unit::SetMinion(Minion* minion, bool apply)
             if (RemoveGuidValue(UNIT_FIELD_SUMMON, minion->GetGUID()))
             {
                 // Check if there is another minion
-                for (ControlSet::iterator itr = m_Controlled.begin(); itr != m_Controlled.end(); ++itr)
+                for (ObjectGuid const& guid : m_Controlled)
                 {
+                    Unit* other = GetControlled(guid);
+                    if (!other)
+                        continue;
                     // do not use this check, creature do not have charm guid
-                    //if (GetCharmGUID() == (*itr)->GetGUID())
-                    if (GetGUID() == (*itr)->GetCharmerGUID())
+                    //if (GetCharmGUID() == other->GetGUID())
+                    if (GetGUID() == other->GetCharmerGUID())
                         continue;
 
-                    //ASSERT((*itr)->GetOwnerGUID() == GetGUID());
-                    if ((*itr)->GetOwnerGUID() != GetGUID())
+                    //ASSERT(other->GetOwnerGUID() == GetGUID());
+                    if (other->GetOwnerGUID() != GetGUID())
                     {
                         OutDebugInfo();
-                        (*itr)->OutDebugInfo();
+                        other->OutDebugInfo();
                         ABORT();
                     }
-                    ASSERT((*itr)->IsCreature());
+                    ASSERT(other->IsCreature());
 
-                    if (!(*itr)->HasUnitTypeMask(UNIT_MASK_CONTROLLABLE_GUARDIAN))
+                    if (!other->HasUnitTypeMask(UNIT_MASK_CONTROLLABLE_GUARDIAN))
                         continue;
 
-                    if (AddGuidValue(UNIT_FIELD_SUMMON, (*itr)->GetGUID()))
+                    if (AddGuidValue(UNIT_FIELD_SUMMON, other->GetGUID()))
                     {
                         // show another pet bar if there is no charm bar
                         if (IsPlayer() && !GetCharmGUID())
                         {
-                            if ((*itr)->IsPet())
+                            if (other->IsPet())
                                 ToPlayer()->PetSpellInitialize();
                             else
                                 ToPlayer()->CharmSpellInitialize();
@@ -7737,11 +7797,10 @@ void Unit::SetMinion(Minion* minion, bool apply)
 
 void Unit::GetAllMinionsByEntry(std::list<Creature*>& Minions, uint32 entry)
 {
-    for (Unit::ControlSet::iterator itr = m_Controlled.begin(); itr != m_Controlled.end();)
+    for (ObjectGuid const& guid : m_Controlled)
     {
-        Unit* unit = *itr;
-        ++itr;
-        if (unit->GetEntry() == entry && unit->IsCreature()
+        Unit* unit = GetControlled(guid);
+        if (unit && unit->GetEntry() == entry && unit->IsCreature()
                 && unit->ToCreature()->IsSummon()) // minion, actually
             Minions.push_back(unit->ToCreature());
     }
@@ -7749,11 +7808,11 @@ void Unit::GetAllMinionsByEntry(std::list<Creature*>& Minions, uint32 entry)
 
 void Unit::RemoveAllMinionsByEntry(uint32 entry)
 {
-    for (Unit::ControlSet::iterator itr = m_Controlled.begin(); itr != m_Controlled.end();)
+    GuidSet snapshot = m_Controlled;
+    for (ObjectGuid const& guid : snapshot)
     {
-        Unit* unit = *itr;
-        ++itr;
-        if (unit->GetEntry() == entry && unit->IsCreature()
+        Unit* unit = GetControlled(guid);
+        if (unit && unit->GetEntry() == entry && unit->IsCreature()
                 && unit->ToCreature()->IsSummon()) // minion, actually
             unit->ToTempSummon()->UnSummon();
         // i think this is safe because i have never heard that a despawned minion will trigger a same minion
@@ -7793,7 +7852,7 @@ void Unit::SetCharm(Unit* charm, bool apply)
             charm->SendMovementFlagUpdate();
         }
 
-        m_Controlled.insert(charm);
+        m_Controlled.insert(charm->GetGUID());
     }
     else
     {
@@ -7837,7 +7896,7 @@ void Unit::SetCharm(Unit* charm, bool apply)
             charm->SendMovementFlagUpdate(true); // send packet to self, to update movement state on player.
         }
 
-        m_Controlled.erase(charm);
+        m_Controlled.erase(charm->GetGUID());
     }
 }
 
@@ -7981,14 +8040,19 @@ void Unit::RemoveAllControlled(bool onDeath /*= false*/)
     if (IsPlayer())
         ToPlayer()->StopCastingCharm();
 
-    for (auto it = m_Controlled.begin(); it != m_Controlled.end();)
+    GuidSet snapshot = m_Controlled;
+    for (ObjectGuid const& guid : snapshot)
     {
-        Unit* target = *it;
-        ++it;
+        Unit* target = GetControlled(guid);
+        if (!target)
+        {
+            m_Controlled.erase(guid);
+            continue;
+        }
 
         if (target->GetCharmerGUID() == GetGUID())
         {
-            m_Controlled.erase(target);
+            m_Controlled.erase(guid);
             target->RemoveCharmAuras();
         }
         else if (target->GetOwnerGUID() == GetGUID() && target->IsSummon())
@@ -8005,7 +8069,7 @@ void Unit::RemoveAllControlled(bool onDeath /*= false*/)
         else
         {
             LOG_ERROR("entities.unit", "Unit {} is trying to release unit {} which is neither charmed nor owned by it", GetEntry(), target->GetEntry());
-            m_Controlled.erase(target);
+            m_Controlled.erase(guid);
         }
     }
 }
@@ -10389,8 +10453,9 @@ void Unit::SetImmuneToPC(bool apply, bool keepCombat)
         {
             std::vector<CombatReference*> toEnd;
             for (auto const& pair : m_combatManager.GetPvECombatRefs())
-                if (pair.second->GetOther(this)->HasUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED))
-                    toEnd.push_back(pair.second);
+                if (Unit* other = pair.second->GetOther())
+                    if (other->HasUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED))
+                        toEnd.push_back(pair.second);
             for (auto const& pair : m_combatManager.GetPvPCombatRefs())
                 toEnd.push_back(pair.second);
             for (CombatReference* ref : toEnd)
@@ -10410,8 +10475,9 @@ void Unit::SetImmuneToNPC(bool apply, bool keepCombat)
         {
             std::vector<CombatReference*> toEnd;
             for (auto const& pair : m_combatManager.GetPvECombatRefs())
-                if (!pair.second->GetOther(this)->HasUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED))
-                    toEnd.push_back(pair.second);
+                if (Unit* other = pair.second->GetOther())
+                    if (!other->HasUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED))
+                        toEnd.push_back(pair.second);
             for (CombatReference* ref : toEnd)
                 ref->EndCombat();
         }
@@ -11277,13 +11343,14 @@ Unit* Creature::SelectVictim()
                 if (owner->IsInCombat())
                     target = owner->getAttackerForHelper();
                 if (!target)
-                    for (ControlSet::const_iterator itr = owner->m_Controlled.begin(); itr != owner->m_Controlled.end(); ++itr)
-                        if ((*itr)->IsInCombat())
-                        {
-                            target = (*itr)->getAttackerForHelper();
-                            if (target)
-                                break;
-                        }
+                    for (ObjectGuid const& guid : owner->m_Controlled)
+                        if (Unit* controlled = owner->GetControlled(guid))
+                            if (controlled->IsInCombat())
+                            {
+                                target = controlled->getAttackerForHelper();
+                                if (target)
+                                    break;
+                            }
             }
     }
     else
@@ -12174,6 +12241,13 @@ void Unit::RemoveFromWorld()
 
     if (IsInWorld())
     {
+        if (_removing)
+        {
+            // Own half already ran on the task. Visibility unlink is step 10; the seal only unlinks.
+            WorldObject::RemoveFromWorld();
+            return;
+        }
+
         m_duringRemoveFromWorld = true;
         if (IsAIEnabled)
             GetAI()->OnDespawn();
@@ -12204,7 +12278,7 @@ void Unit::RemoveFromWorld()
 
         if (Unit* owner = GetOwner())
         {
-            if (owner->m_Controlled.find(this) != owner->m_Controlled.end())
+            if (owner->m_Controlled.find(GetGUID()) != owner->m_Controlled.end())
             {
                 if (HasUnitTypeMask(UNIT_MASK_MINION | UNIT_MASK_GUARDIAN))
                     owner->SetMinion((Minion*)this, false);
@@ -12226,7 +12300,7 @@ void Unit::CleanupBeforeRemoveFromMap(bool finalCleanup)
     // This needs to be before RemoveFromWorld to make GetCaster() return a valid pointer on aura removal
     InterruptNonMeleeSpells(true);
 
-    if (IsInWorld()) // not in world and not being removed atm
+    if (IsInWorld() && !_removing) // prepared removals stay addressable until the seal
         RemoveFromWorld();
 
     // Abort pending events here: left to ~EventProcessor they run after m_spellMods is already
@@ -12251,6 +12325,10 @@ void Unit::CleanupBeforeRemoveFromMap(bool finalCleanup)
 
 void Unit::CleanupsBeforeDelete(bool finalCleanup)
 {
+    // Prepared: own half already ran. RemoveFromGrid is Map::RemoveFromMap.
+    if (_removing)
+        return;
+
     if (GetTransport())
     {
         GetTransport()->RemovePassenger(this);
@@ -12260,6 +12338,253 @@ void Unit::CleanupsBeforeDelete(bool finalCleanup)
     }
 
     CleanupBeforeRemoveFromMap(finalCleanup);
+}
+
+Unit* Unit::GetControlled(ObjectGuid const& guid) const
+{
+    return ObjectAccessor::GetUnit(*this, guid);
+}
+
+void Unit::ApplyRecords(std::vector<RecordHeader const*> const& records)
+{
+    if (!IsInWorld())
+        return;
+
+    // Two-pass health (one ModifyHealth per beat for SpellHit / MeleeHit / PeriodicLanded) needs the victim-side
+    // DealDamage split of step 07 slice 5 and step 08; until then every record applies its own damage in order.
+    for (RecordHeader const* hdr : records)
+        ApplyRecord(*hdr, reinterpret_cast<uint8 const*>(hdr) + RECORD_HEADER_SIZE);
+}
+
+void Unit::ApplyRecord(RecordHeader const& header, uint8 const* payload)
+{
+    switch (header.kind)
+    {
+        case RecordKind::SpellHit:
+            ApplySpellHit(RecordPayload<SpellHitRecord>(payload));
+            break;
+        case RecordKind::DeferredSpellHit:
+            // No coordinator on this step: a deferred hit that reaches an inbox lands like any other.
+            ApplySpellHit(RecordPayload<DeferredSpellHitRecord>(payload).hit);
+            break;
+        case RecordKind::SpellLanded:
+            ApplySpellLanded(RecordPayload<SpellLandedRecord>(payload));
+            break;
+        case RecordKind::ThreatBackRef:
+            GetThreatMgr().ApplyThreatBackRef(RecordPayload<ThreatBackRefRecord>(payload).victimGuid);
+            break;
+        case RecordKind::Threat:
+        {
+            ThreatRecord const& rec = RecordPayload<ThreatRecord>(payload);
+            GetThreatMgr().ApplyThreat(rec.attackerGuid, rec.amount, rec.spellId, rec.ignoreModifiers, rec.ignoreRedirects);
+            break;
+        }
+        case RecordKind::ThreatRemove:
+            GetThreatMgr().ApplyThreatRemove(RecordPayload<ThreatRemoveRecord>(payload).deadGuid);
+            break;
+        case RecordKind::CombatRef:
+        {
+            CombatRefRecord const& rec = RecordPayload<CombatRefRecord>(payload);
+            GetCombatManager().ApplyCombatRef(rec.otherGuid, rec.isPvP != 0, rec.suppressed != 0);
+            break;
+        }
+        case RecordKind::CombatEnd:
+        {
+            CombatEndRecord const& rec = RecordPayload<CombatEndRecord>(payload);
+            GetCombatManager().ApplyCombatEnd(rec.otherGuid, rec.isPvP != 0);
+            break;
+        }
+        case RecordKind::AuraRemove:
+        {
+            AuraRemoveRecord const& rec = RecordPayload<AuraRemoveRecord>(payload);
+            RemoveAurasDueToSpell(rec.spellId, rec.casterGuid, rec.reqEffMask, AuraRemoveMode(rec.removeMode));
+            break;
+        }
+        case RecordKind::Knockback:
+        {
+            KnockbackRecord const& rec = RecordPayload<KnockbackRecord>(payload);
+            KnockbackFrom(rec.x, rec.y, rec.speedXY, rec.speedZ);
+            break;
+        }
+        case RecordKind::MinionUnlink:
+            ApplyMinionUnlink(RecordPayload<MinionUnlinkRecord>(payload));
+            break;
+        case RecordKind::GameObjectUnlink:
+            ApplyGameObjectUnlink(RecordPayload<GameObjectUnlinkRecord>(payload));
+            break;
+        case RecordKind::Wake:
+            break;
+        default:
+            LOG_DEBUG("maps.records", "{} dropped record {} from {}: no applier on this step",
+                GetGUID().ToString(), RecordKindName(header.kind), header.source.ToString());
+            break;
+    }
+}
+
+void Unit::ApplyMinionUnlink(MinionUnlinkRecord const& rec)
+{
+    m_Controlled.erase(rec.minionGuid);
+
+    if (rec.flags & MINION_UNLINK_MINIPET)
+        if (GetCritterGUID() == rec.minionGuid)
+            SetCritterGUID(ObjectGuid::Empty);
+
+    if (rec.flags & MINION_UNLINK_GUARDIAN_PET)
+        if (GetPetGUID() == rec.minionGuid)
+            SetPetGUID(ObjectGuid::Empty);
+
+    if (IsPlayer())
+    {
+        if (SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(rec.createdBySpell))
+            if (spellInfo->IsCooldownStartedOnEvent())
+                ToPlayer()->SendCooldownEvent(spellInfo);
+
+        if (m_Controlled.empty())
+            ToPlayer()->SendRemoveControlBar();
+    }
+
+    if (RemoveGuidValue(UNIT_FIELD_SUMMON, rec.minionGuid))
+    {
+        for (ObjectGuid const& guid : m_Controlled)
+        {
+            Unit* minion = GetControlled(guid);
+            if (!minion)
+                continue;
+            if (GetGUID() == minion->GetCharmerGUID())
+                continue;
+            if (!minion->HasUnitTypeMask(UNIT_MASK_CONTROLLABLE_GUARDIAN))
+                continue;
+            if (AddGuidValue(UNIT_FIELD_SUMMON, minion->GetGUID()))
+            {
+                if (IsPlayer() && !GetCharmGUID())
+                {
+                    if (minion->IsPet())
+                        ToPlayer()->PetSpellInitialize();
+                    else
+                        ToPlayer()->CharmSpellInitialize();
+                }
+            }
+            break;
+        }
+    }
+
+    if (rec.flags & MINION_UNLINK_TOTEM && rec.totemSpell)
+        if (SpellInfo const* spInfo = sSpellMgr->GetSpellInfo(rec.totemSpell))
+            for (int i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                if (spInfo->Effects[i].Effect == SPELL_EFFECT_SUMMON)
+                    RemoveAllMinionsByEntry(spInfo->Effects[i].MiscValue);
+}
+
+void Unit::ApplyGameObjectUnlink(GameObjectUnlinkRecord const& rec)
+{
+    for (uint8 i = 0; i < MAX_GAMEOBJECT_SLOT; ++i)
+        if (m_ObjectSlot[i] == rec.goGuid)
+        {
+            m_ObjectSlot[i].Clear();
+            break;
+        }
+
+    if (rec.spellId)
+    {
+        RemoveAurasDueToSpell(rec.spellId);
+        if (IsPlayer())
+            if (SpellInfo const* createBySpell = sSpellMgr->GetSpellInfo(rec.spellId))
+                if (createBySpell->IsCooldownStartedOnEvent())
+                    ToPlayer()->SendCooldownEvent(createBySpell);
+    }
+
+    m_gameObj.remove(rec.goGuid);
+}
+
+void Unit::PrepareRemovalForeign()
+{
+    ObjectGuid const deadGuid = GetGUID();
+
+    auto emitThreatRemove = [this, deadGuid](Unit* target)
+    {
+        if (!target)
+            return;
+        if (target->IsForeignToTask())
+        {
+            ThreatRemoveRecord record;
+            record.deadGuid = deadGuid;
+            sRecordLogs->Append(deadGuid, target, RecordKind::ThreatRemove, record);
+        }
+        else
+            target->GetThreatMgr().ApplyThreatRemove(deadGuid);
+    };
+
+    GuidSet const threatenedByMe = GetThreatMgr().GetThreatenedByMeList();
+    for (ObjectGuid const& ownerGuid : threatenedByMe)
+        emitThreatRemove(ObjectAccessor::GetUnit(*this, ownerGuid));
+
+    std::vector<ObjectGuid> victims;
+    for (ThreatReference const* ref : GetThreatMgr().GetUnsortedThreatList())
+        victims.push_back(ref->GetVictimGUID());
+    for (ObjectGuid const& victimGuid : victims)
+        emitThreatRemove(ObjectAccessor::GetUnit(*this, victimGuid));
+
+    auto emitCombatEnd = [this, deadGuid](ObjectGuid const& otherGuid, bool isPvP)
+    {
+        Unit* other = ObjectAccessor::GetUnit(*this, otherGuid);
+        if (!other)
+            return;
+        if (other->IsForeignToTask())
+        {
+            CombatEndRecord record;
+            record.otherGuid = deadGuid;
+            record.isPvP = isPvP;
+            sRecordLogs->Append(deadGuid, other, RecordKind::CombatEnd, record);
+        }
+        else
+            other->GetCombatManager().ApplyCombatEnd(deadGuid, isPvP);
+    };
+    std::vector<ObjectGuid> pvePartners;
+    for (auto const& pair : GetCombatManager().GetPvECombatRefs())
+        pvePartners.push_back(pair.first);
+    std::vector<ObjectGuid> pvpPartners;
+    for (auto const& pair : GetCombatManager().GetPvPCombatRefs())
+        pvpPartners.push_back(pair.first);
+    for (ObjectGuid const& guid : pvePartners)
+        emitCombatEnd(guid, false);
+    for (ObjectGuid const& guid : pvpPartners)
+        emitCombatEnd(guid, true);
+
+    if (HasUnitTypeMask(UNIT_MASK_MINION | UNIT_MASK_GUARDIAN | UNIT_MASK_TOTEM))
+        if (Unit* owner = GetOwner())
+        {
+            MinionUnlinkRecord record;
+            record.minionGuid = deadGuid;
+            record.createdBySpell = GetUInt32Value(UNIT_CREATED_BY_SPELL);
+            record.totemSpell = IsTotem() ? ToTotem()->GetSpell() : 0;
+            record.flags = 0;
+            if (Minion* minion = dynamic_cast<Minion*>(this))
+            {
+                if (minion->IsGuardianPet())
+                    record.flags |= MINION_UNLINK_GUARDIAN_PET;
+                if (minion->m_Properties && minion->m_Properties->Type == SUMMON_TYPE_MINIPET)
+                    record.flags |= MINION_UNLINK_MINIPET;
+            }
+            if (IsTotem())
+                record.flags |= MINION_UNLINK_TOTEM;
+            if (owner->IsForeignToTask())
+                sRecordLogs->Append(deadGuid, owner, RecordKind::MinionUnlink, record);
+            else
+                owner->ApplyMinionUnlink(record);
+        }
+}
+
+void Unit::PrepareRemovalOwn()
+{
+    if (GetTransport())
+    {
+        GetTransport()->RemovePassenger(this);
+        SetTransport(nullptr);
+        m_movementInfo.transport.Reset();
+        m_movementInfo.RemoveMovementFlag(MOVEMENTFLAG_ONTRANSPORT);
+    }
+
+    CleanupBeforeRemoveFromMap(false);
 }
 
 void Unit::UpdateCharmAI()
@@ -14737,12 +15062,10 @@ void Unit::GetPartyMembers(std::list<Unit*>& TagUnitMap)
                 if (Target->IsAlive())
                     TagUnitMap.push_back(Target);
 
-                for (Unit::ControlSet::iterator iterator = Target->m_Controlled.begin(); iterator != Target->m_Controlled.end(); ++iterator)
-                {
-                    if (Unit* pet = *iterator)
+                for (ObjectGuid const& guid : Target->m_Controlled)
+                    if (Unit* pet = Target->GetControlled(guid))
                         if (pet->IsGuardian() && pet->IsAlive())
                             TagUnitMap.push_back(pet);
-                }
             }
         }
     }
@@ -14751,12 +15074,10 @@ void Unit::GetPartyMembers(std::list<Unit*>& TagUnitMap)
         if (owner->IsAlive())
             TagUnitMap.push_back(owner);
 
-        for (Unit::ControlSet::iterator itr = owner->m_Controlled.begin(); itr != owner->m_Controlled.end(); ++itr)
-        {
-            if (Unit* pet = *itr)
+        for (ObjectGuid const& guid : owner->m_Controlled)
+            if (Unit* pet = owner->GetControlled(guid))
                 if (pet->IsGuardian() && pet->IsAlive())
                     TagUnitMap.push_back(pet);
-        }
     }
 }
 
@@ -14968,15 +15289,11 @@ void Unit::SetPhaseMask(uint32 newPhaseMask, bool update)
         return;
     }
 
-    for (ControlSet::const_iterator itr = m_Controlled.begin(); itr != m_Controlled.end(); )
-    {
-        Unit* controlled = *itr;
-        ++itr;
-        if (controlled->IsCreature())
-        {
-            controlled->SetPhaseMask(newPhaseMask, true);
-        }
-    }
+    GuidSet snapshot = m_Controlled;
+    for (ObjectGuid const& guid : snapshot)
+        if (Unit* controlled = GetControlled(guid))
+            if (controlled->IsCreature())
+                controlled->SetPhaseMask(newPhaseMask, true);
 
     for (uint8 i = 0; i < MAX_SUMMON_SLOT; ++i)
     {
@@ -15010,6 +15327,18 @@ void Unit::UpdateObjectVisibility(bool forced, bool /*fromUpdate*/)
 
 void Unit::KnockbackFrom(float x, float y, float speedXY, float speedZ)
 {
+    if (IsForeignToTask())
+    {
+        KnockbackRecord record;
+        record.x = x;
+        record.y = y;
+        record.speedXY = speedXY;
+        record.speedZ = speedZ;
+        ObjectGuid const source = BeatContext::owner ? BeatContext::owner->GetGUID() : GetGUID();
+        sRecordLogs->Append(source, this, RecordKind::Knockback, record);
+        return;
+    }
+
     Player* player = ToPlayer();
     if (!player)
     {
@@ -15749,7 +16078,8 @@ void Unit::StopAttackFaction(uint32 faction_id)
     // (formation MemberEvaded -> CombatStop) and free other refs in the list.
     std::vector<ObjectGuid> guidsToEnd;
     for (auto const& pair : m_combatManager.GetPvECombatRefs())
-        if (pair.second->GetOther(this)->GetFactionTemplateEntry()->faction == faction_id)
+        if (Unit* other = pair.second->GetOther())
+            if (other->GetFactionTemplateEntry()->faction == faction_id)
             guidsToEnd.push_back(pair.first);
     for (ObjectGuid const& guid : guidsToEnd)
     {
@@ -15759,8 +16089,9 @@ void Unit::StopAttackFaction(uint32 faction_id)
             it->second->EndCombat();
     }
 
-    for (ControlSet::const_iterator itr = m_Controlled.begin(); itr != m_Controlled.end(); ++itr)
-        (*itr)->StopAttackFaction(faction_id);
+    for (ObjectGuid const& guid : m_Controlled)
+        if (Unit* controlled = GetControlled(guid))
+            controlled->StopAttackFaction(faction_id);
 }
 
 void Unit::StopAttackingInvalidTarget()
@@ -15777,13 +16108,10 @@ void Unit::StopAttackingInvalidTarget()
                 attacker->ToPlayer()->SendAttackSwingCancelAttack();
             }
 
-            for (Unit* controlled : attacker->m_Controlled)
-            {
-                if (controlled->GetVictim() == this && !controlled->IsValidAttackTarget(this))
-                {
-                    controlled->AttackStop();
-                }
-            }
+            for (ObjectGuid const& guid : attacker->m_Controlled)
+                if (Unit* controlled = attacker->GetControlled(guid))
+                    if (controlled->GetVictim() == this && !controlled->IsValidAttackTarget(this))
+                        controlled->AttackStop();
 
             itr = attackers.begin();
         }
@@ -15810,8 +16138,8 @@ void Unit::OutDebugInfo() const
     LOG_INFO("server.loading", " ");
 
     LOG_INFO("entities.unit", "Controlled List: ");
-    for (ControlSet::const_iterator itr = m_Controlled.begin(); itr != m_Controlled.end(); ++itr)
-        LOG_INFO("entities.unit", "{}, ", (*itr)->GetGUID().ToString());
+    for (ObjectGuid const& guid : m_Controlled)
+        LOG_INFO("entities.unit", "{}, ", guid.ToString());
     LOG_INFO("server.loading", " ");
 
     LOG_INFO("entities.unit", "Aura List: ");

@@ -35,18 +35,15 @@ enum EvadeState : uint8
 /********************************************************************************************************************************************************\
  *                                                           DEV DOCUMENTATION: COMBAT SYSTEM                                                           *
  *                                            (future devs: please keep this up-to-date if you change the system)                                       *
- * CombatManager maintains a list of dynamically allocated CombatReference entries. Each entry represents a combat state between two distinct units.    *
+ * CombatManager maintains a list of CombatReference half-objects, one per combat partner, keyed by that partner's guid.                                *
  * A unit is "in combat" iff it has one or more non-suppressed CombatReference entries in its CombatManager. No exceptions.                             *
  *                                                                                                                                                      *
- * A CombatReference object carries the following implicit guarantees by existing:                                                                      *
- *  - Both CombatReference.first and CombatReference.second are valid Units, distinct, not nullptr and currently in the world.                          *
- *  - If the CombatReference was retrieved from the CombatManager of Unit* A, then exactly one of .first and .second is equal to A.                     *
- *    - Note: Use CombatReference::GetOther to quickly get the other unit for a given reference.                                                        *
- *  - Both .first and .second are currently in combat (IsInCombat will always be true) if either of the following hold:                                 *
- *    - IsSuppressedFor returns false for the respective unit                                                                                           *
+ * Each half is owned by one manager. Writes to the other unit are records (beat plan, step 06): SetInCombatWith inserts                                *
+ * this side and appends CombatRef; EndCombat erases this side and appends CombatEnd. When the other unit is not foreign                                *
+ * (same task, or no task running) both halves are written inline. GetOther() resolves the partner through ObjectAccessor.                              *
  *                                                                                                                                                      *
  * To end combat between two units, find their CombatReference and call EndCombat.                                                                      *
- *  - Keep in mind that this modifies the CombatRefs maps on both ends, which may cause iterators to be invalidated.                                    *
+ *  - This modifies the CombatRefs map on this side immediately, and the other side one beat later when the partner is foreign.                         *
  *                                                                                                                                                      *
  * To put two units in combat with each other, call SetInCombatWith. Note that this is not guaranteed to succeed.                                       *
  *  - The return value of SetInCombatWith is the new combat state between the units (identical to calling IsInCombatWith at that time).                 *
@@ -58,29 +55,34 @@ enum EvadeState : uint8
 
 struct AC_GAME_API CombatReference
 {
-    Unit* const first;
-    Unit* const second;
+    Unit* const owner;
+    ObjectGuid const otherGuid;
     bool const _isPvP;
-    Unit* GetOther(Unit const* me) const { return (first == me) ? second : first; }
+
+    // Resolves the partner through its guid (cached per beat). nullptr once they left the world.
+    Unit* GetOther() const;
+    // Same as today's GetOther(me): the unit that is not `me`.
+    Unit* GetOther(Unit const* me) const;
 
     void EndCombat();
 
-    // suppressed combat refs do not generate a combat state for one side of the relation
+    // suppressed combat refs do not generate a combat state for this half
     // (used by: vanish, feign death and launched out of combat but not yet landed spell missiles)
     void SuppressFor(Unit* who);
-    bool IsSuppressedFor(Unit const* who) const { return (who == first) ? _suppressFirst : _suppressSecond; }
+    bool IsSuppressedFor(Unit const* who) const { return who == owner && _suppressed; }
 
     CombatReference(CombatReference const&) = delete;
     CombatReference& operator=(CombatReference const&) = delete;
 
 protected:
-    CombatReference(Unit* a, Unit* b, bool pvp = false) : first(a), second(b), _isPvP(pvp) { }
+    CombatReference(Unit* owner, ObjectGuid other, bool pvp = false);
 
     void Refresh();
-    void Suppress(Unit* who) { (who == first ? _suppressFirst : _suppressSecond) = true; }
+    void Suppress() { _suppressed = true; }
 
-    bool _suppressFirst = false;
-    bool _suppressSecond = false;
+    bool _suppressed = false;
+    mutable Unit* _otherCache = nullptr;
+    mutable uint32 _otherCacheBeat = ~0u;
 
     friend class CombatManager;
 };
@@ -90,7 +92,7 @@ struct AC_GAME_API PvPCombatReference : public CombatReference
     static const uint32 PVP_COMBAT_TIMEOUT = 5 * IN_MILLISECONDS;
 
 private:
-    PvPCombatReference(Unit* first, Unit* second) : CombatReference(first, second, true) { }
+    PvPCombatReference(Unit* owner, ObjectGuid other) : CombatReference(owner, other, true) { }
 
     bool Update(uint32 tdiff);
     void RefreshTimer();
@@ -146,11 +148,16 @@ public:
     void EndAllPvPCombat();
     void EndAllCombat() { EndAllPvECombat(); EndAllPvPCombat(); }
 
+    ///== RECORD APPLIERS (run on the owner's task, from Unit::ApplyRecord) ==
+    void ApplyCombatRef(ObjectGuid const& otherGuid, bool isPvP, bool suppressed);
+    void ApplyCombatEnd(ObjectGuid const& otherGuid, bool isPvP);
+
     CombatManager(CombatManager const&) = delete;
     CombatManager& operator=(CombatManager const&) = delete;
 
 private:
     static void NotifyAICombat(Unit* me, Unit* other);
+    void PutOwnHalf(ObjectGuid const& guid, bool pvp, bool suppressed);
     void PutReference(ObjectGuid const& guid, CombatReference* ref);
     void PurgeReference(ObjectGuid const& guid, bool pvp);
     bool UpdateOwnerCombatState() const;

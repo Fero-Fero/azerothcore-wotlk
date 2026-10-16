@@ -45,12 +45,16 @@ class SpellInfo;
  *                                            (future devs: please keep this up-to-date if you change the system)                                       *
  * The threat system works based on dynamically allocated threat list entries.                                                                          *
  *                                                                                                                                                      *
- * Each such entry is a ThreatReference object, which is always stored in exactly three places:                                                         *
- *  - The threatened unit's (from now: reference "owner") sorted and unsorted threat lists                                                              *
- *  - The threatening unit's (from now: reference "victim") threatened-by-me list                                                                       *
- * A ThreatReference object carries the following implicit guarantees:                                                                                  *
- *  - Both owner and victim are valid units, which are currently in the world. Neither can be nullptr.                                                  *
- *  - There is an active combat reference between owner and victim.                                                                                     *
+ * Each such entry is a ThreatReference object, owned by the threatened unit (from now: reference "owner") and stored in its sorted and unsorted       *
+ * threat lists. The threatening unit (from now: reference "victim") keeps only the owner's guid in its threatened-by-me set and resolves the           *
+ * reference through the owner when it needs it (GetReferenceThreateningMe).                                                                            *
+ * A ThreatReference object carries the following guarantees:                                                                                           *
+ *  - The owner is a valid creature in the world. The victim is held by guid: GetVictim() resolves it and returns nullptr once it left the world.       *
+ *  - There is (or will be, one beat later) an active combat reference between owner and victim.                                                        *
+ *                                                                                                                                                      *
+ * Writes across the two units are records (beat plan, step 06): the owner tells the victim about a new or removed reference with ThreatBackRef /      *
+ * ThreatRemove, a victim leaving the world tells its owners with ThreatRemove, and AddThreat called against a foreign owner becomes a Threat record    *
+ * the owner applies on its next task. Everything a unit does to its own lists stays inline.                                                           *
  *                                                                                                                                                      *
  * Note that (threat => combat) is a strong guarantee provided in conjunction with CombatManager. Thus:                                                 *
  *  - Adding threat will also create a combat reference between the units if one doesn't exist yet (even if the owner can't have a threat list!)        *
@@ -138,7 +142,10 @@ public:
     bool IsThreateningTo(ObjectGuid const& who, bool includeOffline = false) const;
     // is there a threat list entry on who's threat list for this.owner?
     bool IsThreateningTo(Unit const* who, bool includeOffline = false) const;
-    auto const& GetThreatenedByMeList() const { return _threatenedByMe; }
+    // guids of the units whose threat list holds this.owner
+    GuidSet const& GetThreatenedByMeList() const { return _threatenedByMe; }
+    // the reference ownerGuid's threat list holds for this.owner, resolved through the owner; nullptr if gone
+    ThreatReference* GetReferenceThreateningMe(ObjectGuid const& ownerGuid) const;
 
     // Notify the ThreatManager that its owner may now be suppressed on others' threat lists
     void EvaluateSuppressed(bool canExpire = false);
@@ -158,6 +165,7 @@ public:
     void ResetAllThreat();
     // Removes specified target from the threat list
     void ClearThreat(Unit* target);
+    void ClearThreat(ObjectGuid const& target);
     void ClearThreat(ThreatReference* ref);
     // Removes all targets from the threat list (will cause evade in UpdateVictim if called)
     void ClearAllThreat();
@@ -192,16 +200,28 @@ public:
     bool HasRedirects() const { return !_redirectRegistry.empty(); }
     void ResetAllRedirects() { _redirectRegistry.clear(); UpdateRedirectInfo(); }
 
+    ///== RECORD APPLIERS (run on the owner's task, from Unit::ApplyRecord) ==
+    // ThreatBackRef: ownerGuid's threat list now holds this.owner
+    void ApplyThreatBackRef(ObjectGuid const& ownerGuid);
+    // ThreatRemove: drop guid from this.owner's threat list and from its threatened-by-me set
+    void ApplyThreatRemove(ObjectGuid const& guid);
+    // Threat: AddThreat against this.owner from a foreign task
+    void ApplyThreat(ObjectGuid const& attackerGuid, float amount, uint32 spellId, bool ignoreModifiers, bool ignoreRedirects);
+
 private:
     Unit* const _owner;
     bool _ownerCanHaveThreatList;
+
+    // Victim-side link of a reference: inline when the victim is this task's, a record otherwise.
+    void LinkThreatenedByMe(Unit* victim);
+    void UnlinkThreatenedByMe(ObjectGuid const& victimGuid);
 
     static const CompareThreatLessThan CompareThreat;
     static bool CompareReferencesLT(ThreatReference const* a, ThreatReference const* b, float aWeight);
     static float CalculateModifiedThreat(float threat, Unit const* victim, SpellInfo const* spell);
 
     void SendClearAllThreatToClients() const;
-    void SendRemoveToClients(Unit const* victim) const;
+    void SendRemoveToClients(ObjectGuid const& victimGuid) const;
     void SendThreatListToClients(bool newHighest) const;
 
     ///== MY THREAT LIST ==
@@ -223,9 +243,9 @@ private:
     ThreatReference const* _fixateRef;
 
     ///== OTHERS' THREAT LISTS ==
-    void PutThreatenedByMeRef(ObjectGuid const& guid, ThreatReference* ref);
+    void PutThreatenedByMeRef(ObjectGuid const& guid);
     void PurgeThreatenedByMeRef(ObjectGuid const& guid);
-    std::unordered_map<ObjectGuid, ThreatReference*> _threatenedByMe;
+    GuidSet _threatenedByMe;   // owners whose threat list holds this.owner (guid-keyed, filled by records)
     std::array<float, MAX_SPELL_SCHOOL> _singleSchoolModifiers;
     mutable std::unordered_map<std::underlying_type<SpellSchoolMask>::type, float> _multiSchoolModifiers;
 
@@ -270,7 +290,10 @@ public:
     enum OnlineState { ONLINE_STATE_ONLINE = 2, ONLINE_STATE_SUPPRESSED = 1, ONLINE_STATE_OFFLINE = 0 };
 
     Creature* GetOwner() const { return _owner; }
-    Unit* GetVictim() const { return _victim; }
+    // Resolves the victim through its guid (cached per beat). nullptr once the victim left the world: the
+    // owner drops the reference when the victim's ThreatRemove record lands, one beat later at most.
+    Unit* GetVictim() const;
+    ObjectGuid const& GetVictimGUID() const { return _victimGuid; }
     float GetThreat() const { return std::max<float>(_baseAmount + static_cast<float>(_tempModifier), 0.0f); }
     OnlineState GetOnlineState() const { return _online; }
     bool IsOnline() const { return (_online >= ONLINE_STATE_ONLINE); }
@@ -291,12 +314,7 @@ public:
 protected:
     static bool FlagsAllowFighting(Unit const* a, Unit const* b);
 
-    explicit ThreatReference(ThreatManager* mgr, Unit* victim) :
-        _owner(reinterpret_cast<Creature*>(mgr->_owner)), _mgr(*mgr), _victim(victim),
-        _baseAmount(0.0f), _tempModifier(0), _taunted(TAUNT_STATE_NONE)
-    {
-        _online = ONLINE_STATE_OFFLINE;
-    }
+    explicit ThreatReference(ThreatManager* mgr, Unit* victim);
 
     virtual ~ThreatReference() = default;
 
@@ -309,7 +327,10 @@ protected:
     ThreatManager& _mgr;
     void HeapNotifyIncreased();
     void HeapNotifyDecreased();
-    Unit* const _victim;
+    ObjectGuid const _victimGuid;
+    // Handle cache: valid for the beat it was resolved in (nothing is freed inside a beat).
+    mutable Unit* _victimCache;
+    mutable uint32 _victimCacheBeat;
     OnlineState _online;
     float _baseAmount;
     int32 _tempModifier;

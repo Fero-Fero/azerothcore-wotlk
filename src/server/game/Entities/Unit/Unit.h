@@ -50,6 +50,9 @@ static constexpr uint32 infinityCooldownDelayCheck = 0x4D3F6400; // MONTH*IN_MIL
 struct CharmInfo;
 struct FactionTemplateEntry;
 struct SpellValue;
+struct SpellHitRecord;
+struct SpellLandedRecord;
+struct FollowUpCast;
 
 class AuraApplication;
 class Aura;
@@ -667,7 +670,7 @@ class Unit : public WorldObject
 {
 public:
     typedef std::unordered_set<Unit*> AttackerSet;
-    typedef std::set<Unit*> ControlSet;
+    typedef GuidSet ControlSet;
 
     typedef boost::container::flat_multimap<uint32,  Aura*> AuraMap;
     typedef std::pair<AuraMap::const_iterator, AuraMap::const_iterator> AuraMapBounds;
@@ -701,6 +704,19 @@ public:
 
     void CleanupBeforeRemoveFromMap(bool finalCleanup);
     void CleanupsBeforeDelete(bool finalCleanup = true) override;                        // used in ~Creature/~Player (or before mass creature delete to remove cross-references to already deleted units)
+
+    void ApplyRecords(std::vector<RecordHeader const*> const& records) override;
+    void ApplyRecord(RecordHeader const& header, uint8 const* payload);
+    void ApplyMinionUnlink(MinionUnlinkRecord const& rec);
+    void ApplyGameObjectUnlink(GameObjectUnlinkRecord const& rec);
+    // Step 07 (SpellLand.cpp): land step of a spell hit on this unit, and the caster-side feedback of a hit
+    // this unit launched.
+    // launchSpell: the caster's live Spell when the hit is landed synchronously (slice 1); its scripts are borrowed.
+    void ApplySpellHit(SpellHitRecord const& hit, Spell* launchSpell = nullptr);
+    void ApplySpellLanded(SpellLandedRecord const& landed);
+    void CastFollowUp(FollowUpCast const& follow);
+
+    [[nodiscard]] Unit* GetControlled(ObjectGuid const& guid) const;
 
     [[nodiscard]] virtual bool isBeingLoaded() const { return false;}
     [[nodiscard]] bool IsDuringRemoveFromWorld() const {return m_duringRemoveFromWorld;}
@@ -2125,6 +2141,9 @@ protected:
     explicit Unit();
 
     void BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target) override;
+    void FillSlot(ObjectSlot& slot) override;
+    void PrepareRemovalForeign() override;
+    void PrepareRemovalOwn() override;
 
     void _UpdateSpells(uint32 time);
     void _DeleteRemovedAuras();

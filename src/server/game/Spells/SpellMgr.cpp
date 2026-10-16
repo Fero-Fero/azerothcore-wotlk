@@ -3050,6 +3050,62 @@ void SpellMgr::LoadSpellInfoStore()
     LOG_INFO("server.loading", " ");
 }
 
+void SpellMgr::LoadDeferredHitSpells()
+{
+    uint32 oldMSTime = getMSTime();
+
+    mDeferredHitSpells.clear();
+
+    // Static list (plan §11). Grows only from the slice 4 build output, one row per spell with the reason.
+    static uint32 const deferredHitSpells[] =
+    {
+        45927,  // Summon Friend - far target (cross-map player), today's farMask path
+    };
+    for (uint32 spellId : deferredHitSpells)
+        mDeferredHitSpells.insert(spellId);
+
+    // Every spell with an effect that writes both the caster and a target that is not the caster.
+    for (uint32 spellId = 0; spellId < GetSpellInfoStoreSize(); ++spellId)
+    {
+        SpellInfo const* spellInfo = mSpellInfoMap[spellId];
+        if (!spellInfo)
+            continue;
+
+        for (SpellEffectInfo const& effect : spellInfo->GetEffects())
+        {
+            if (!effect.IsEffect())
+                continue;
+
+            bool deferred = false;
+            switch (effect.Effect)
+            {
+                case SPELL_EFFECT_DUEL:
+                case SPELL_EFFECT_SUMMON_PLAYER:
+                case SPELL_EFFECT_SUMMON_RAF_FRIEND:
+                case SPELL_EFFECT_SEND_TAXI:
+                case SPELL_EFFECT_BIND:
+                    deferred = true;
+                    break;
+                case SPELL_EFFECT_TELEPORT_UNITS:
+                    // only when the target can be another unit; a self-teleport lands inline anyway
+                    deferred = effect.TargetA.GetTarget() != TARGET_UNIT_CASTER && effect.TargetB.GetTarget() != TARGET_UNIT_CASTER;
+                    break;
+                default:
+                    break;
+            }
+
+            if (deferred)
+            {
+                mDeferredHitSpells.insert(spellId);
+                break;
+            }
+        }
+    }
+
+    LOG_INFO("server.loading", ">> Loaded {} deferred spell hits in {} ms", uint32(mDeferredHitSpells.size()), GetMSTimeDiffToNow(oldMSTime));
+    LOG_INFO("server.loading", " ");
+}
+
 void SpellMgr::LoadSpellCooldownOverrides()
 {
     uint32 oldMSTime = getMSTime();

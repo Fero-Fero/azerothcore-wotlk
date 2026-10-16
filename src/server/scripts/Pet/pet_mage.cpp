@@ -21,6 +21,8 @@
  */
 
 #include "CombatAI.h"
+#include "ObjectAccessor.h"
+#include "ThreatManager.h"
 #include "CreatureScript.h"
 #include "Pet.h"
 #include "Player.h"
@@ -108,10 +110,12 @@ struct npc_pet_mage_mirror_image : CasterAI
 
         // Xinef: Inherit Master's Threat List (not yet implemented)
         //owner->CastSpell((Unit*)nullptr, SPELL_MAGE_MASTERS_THREAT_LIST, true);
-        for (auto const& pair : owner->GetThreatMgr().GetThreatenedByMeList())
+        for (ObjectGuid const& ownerGuid : owner->GetThreatMgr().GetThreatenedByMeList())
         {
-            if (Unit* unit = pair.second->GetOwner())
-                unit->GetThreatMgr().AddThreat(me, pair.second->GetThreat());
+            ThreatReference const* ref = owner->GetThreatMgr().GetReferenceThreateningMe(ownerGuid);
+            Unit* unit = ObjectAccessor::GetUnit(*owner, ownerGuid);
+            if (ref && unit)
+                unit->GetThreatMgr().AddThreat(me, ref->GetThreat());
         }
 
         _ebonGargoyleGUID.Clear();

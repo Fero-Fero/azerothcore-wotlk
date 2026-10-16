@@ -20,7 +20,12 @@
 
 #include "BoundingIntervalHierarchy.h"
 #include "Define.h"
+#include <shared_mutex>
 #include <unordered_map>
+
+// Read-side guard for shared geometry (vmap tree). Every reader goes through this
+// macro so a later step can turn it into a debug-only assert with a one-line change.
+#define GEOMETRY_READ_GUARD(m) std::shared_lock<std::shared_mutex> _geometryGuard(m)
 
 namespace VMAP
 {
@@ -45,6 +50,22 @@ namespace VMAP
         int32 rootId = -1;
     };
 
+    // Plain-value copy of a location query, filled under the tree's read lock.
+    // Holds no pointer into the tree, so it stays valid after the lock is released.
+    struct LocationQueryResult
+    {
+        bool hit = false;
+        float groundZ = -G3D::inf();
+        bool hasLiquid = false;
+        uint32 liquidType = 0;
+        float liquidLevel = 0.0f;
+        uint32 wmoId = 0;
+        int32 adtId = 0;
+        int32 rootId = -1;
+        uint32 mogpFlags = 0;
+        uint32 modelInstanceId = 0;
+    };
+
     class StaticMapTree
     {
         typedef std::unordered_map<uint32, bool> loadedTileMap;
@@ -62,8 +83,14 @@ namespace VMAP
         loadedTileMap iLoadedTiles;
         std::string iBasePath;
 
+        // Guards iTree / iTreeValues / iLoadedTiles against tile loads from a sibling
+        // instance map. Readers take it shared, tile loads and unloads take it exclusive.
+        // Lock order: MapGridManager::_gridLock -> this. Nothing takes _gridLock while holding this.
+        mutable std::shared_mutex _mutex;
+
     private:
         bool GetIntersectionTime(G3D::Ray const& pRay, float& pMaxDist, bool StopAtFirstHit, ModelIgnoreFlags ignoreFlags) const;
+        bool GetLocationInfoUnlocked(G3D::Vector3 const& pos, LocationInfo& info) const;
         //bool containsLoadedMapTile(unsigned int pTileIdent) const { return(iLoadedMapTiles.containsKey(pTileIdent)); }
     public:
         static std::string getTileFileName(uint32 mapID, uint32 tileX, uint32 tileY);
@@ -78,6 +105,9 @@ namespace VMAP
         bool GetObjectHitPos(G3D::Vector3 const& pos1, G3D::Vector3 const& pos2, G3D::Vector3& pResultHitPos, float pModifyDist) const;
         [[nodiscard]] float getHeight(G3D::Vector3 const& pPos, float maxSearchDist) const;
         bool GetLocationInfo(G3D::Vector3 const& pos, LocationInfo& info) const;
+        // Same query as GetLocationInfo but the answer is copied out under the read lock;
+        // use this when liquid or area data of the hit model is needed after return.
+        [[nodiscard]] LocationQueryResult QueryLocation(G3D::Vector3 const& pos) const;
 
         bool InitMap(std::string const& fname);
         void UnloadMap();

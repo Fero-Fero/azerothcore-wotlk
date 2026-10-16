@@ -1493,10 +1493,10 @@ void Player::UpdateFFAPvPState(bool reset /*= true*/)
         {
             sScriptMgr->OnPlayerFfaPvpStateUpdate(this, true);
             SetByteFlag(UNIT_FIELD_BYTES_2, 1, UNIT_BYTE2_FLAG_FFA_PVP);
-            for (ControlSet::iterator itr = m_Controlled.begin();
-                 itr != m_Controlled.end(); ++itr)
-                (*itr)->SetByteValue(UNIT_FIELD_BYTES_2, 1,
-                                     UNIT_BYTE2_FLAG_FFA_PVP);
+            for (ObjectGuid const& guid : m_Controlled)
+                if (Unit* controlled = GetControlled(guid))
+                    controlled->SetByteValue(UNIT_FIELD_BYTES_2, 1,
+                                             UNIT_BYTE2_FLAG_FFA_PVP);
         }
 
         if (pvpInfo.IsInFFAPvPArea)
@@ -1515,10 +1515,10 @@ void Player::UpdateFFAPvPState(bool reset /*= true*/)
                 RemoveByteFlag(UNIT_FIELD_BYTES_2, 1, UNIT_BYTE2_FLAG_FFA_PVP);
                 sScriptMgr->OnPlayerFfaPvpStateUpdate(this, false);
             }
-            for (ControlSet::iterator itr = m_Controlled.begin();
-                 itr != m_Controlled.end(); ++itr)
-                (*itr)->RemoveByteFlag(UNIT_FIELD_BYTES_2, 1,
-                                       UNIT_BYTE2_FLAG_FFA_PVP);
+            for (ObjectGuid const& guid : m_Controlled)
+                if (Unit* controlled = GetControlled(guid))
+                    controlled->RemoveByteFlag(UNIT_FIELD_BYTES_2, 1,
+                                               UNIT_BYTE2_FLAG_FFA_PVP);
 
             // xinef: iterate attackers
             AttackerSet        toRemove;
@@ -1909,11 +1909,9 @@ void Player::UpdateAreaDependentAuras(uint32 newArea)
 
     // Xinef: check controlled auras
     if (!m_Controlled.empty())
-        for (ControlSet::iterator itr = m_Controlled.begin();
-             itr != m_Controlled.end();)
+        for (ObjectGuid const& guid : m_Controlled)
         {
-            Unit* controlled = *itr;
-            ++itr;
+            Unit* controlled = GetControlled(guid);
             if (controlled && !controlled->IsPet())
             {
                 Unit::AuraMap& tAuras = controlled->GetOwnedAuras();

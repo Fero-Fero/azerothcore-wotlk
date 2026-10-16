@@ -5,7 +5,7 @@
 void MapGridManager::CreateGrid(uint16 const x, uint16 const y)
 {
     std::lock_guard<std::mutex> guard(_gridLock);
-    if (IsGridCreated(x, y))
+    if (IsGridCreatedUnlocked(x, y))
         return;
 
     // If we are an instance, ensure parent map has already created the grid before proceeding.
@@ -21,6 +21,7 @@ void MapGridManager::CreateGrid(uint16 const x, uint16 const y)
     grid->link(_map);
 
     // Terrain is loading during create (should/can we move this to LoadGrid?)
+    // This takes the shared vmap tree and navmesh write locks while _gridLock is held.
     GridTerrainLoader loader(*grid, _map);
     loader.LoadTerrain();
 
@@ -32,17 +33,23 @@ void MapGridManager::CreateGrid(uint16 const x, uint16 const y)
 // Loads objects, terrain already loaded in CreateGrid
 bool MapGridManager::LoadGrid(uint16 const x, uint16 const y)
 {
-    MapGridType* grid = GetGrid(x, y);
-    if (!grid || grid->IsObjectDataLoaded())
-        return false;
+    MapGridType* grid = nullptr;
+    {
+        // Hold the lock only to read the slot and flip the flag; spawning below can
+        // re-enter LoadGrid for another grid, and the flag makes a re-entry on this one a no-op.
+        std::lock_guard<std::mutex> guard(_gridLock);
+        grid = GetGridUnlocked(x, y);
+        if (!grid || grid->IsObjectDataLoaded())
+            return false;
 
-    // Must mark as loaded first, as GridObjectLoader spawning objects can attempt to recursively load the grid
-    grid->SetObjectDataLoaded();
+        // Must mark as loaded first, as GridObjectLoader spawning objects can attempt to recursively load the grid
+        grid->SetObjectDataLoaded();
+        ++_loadedGridsCount;
+    }
 
     GridObjectLoader loader(*grid, _map);
     loader.LoadAllCellsInGrid();
 
-    ++_loadedGridsCount;
     return true;
 }
 
@@ -66,10 +73,11 @@ void MapGridManager::UnloadGrid(uint16 const x, uint16 const y)
         grid->VisitAllCells(visitor);
     }
 
+    std::lock_guard<std::mutex> guard(_gridLock);
     _mapGrid[x][y] = nullptr;
 }
 
-bool MapGridManager::IsGridCreated(uint16 const x, uint16 const y) const
+bool MapGridManager::IsGridCreatedUnlocked(uint16 const x, uint16 const y) const
 {
     if (!MapGridManager::IsValidGridCoordinates(x, y))
         return false;
@@ -77,7 +85,7 @@ bool MapGridManager::IsGridCreated(uint16 const x, uint16 const y) const
     return _mapGrid[x][y].get();
 }
 
-bool MapGridManager::IsGridLoaded(uint16 const x, uint16 const y) const
+bool MapGridManager::IsGridLoadedUnlocked(uint16 const x, uint16 const y) const
 {
     if (!MapGridManager::IsValidGridCoordinates(x, y))
         return false;
@@ -85,7 +93,7 @@ bool MapGridManager::IsGridLoaded(uint16 const x, uint16 const y) const
     return _mapGrid[x][y].get() && _mapGrid[x][y]->IsObjectDataLoaded();
 }
 
-MapGridType* MapGridManager::GetGrid(uint16 const x, uint16 const y)
+MapGridType* MapGridManager::GetGridUnlocked(uint16 const x, uint16 const y) const
 {
     if (!MapGridManager::IsValidGridCoordinates(x, y))
         return nullptr;
@@ -93,13 +101,33 @@ MapGridType* MapGridManager::GetGrid(uint16 const x, uint16 const y)
     return _mapGrid[x][y].get();
 }
 
+bool MapGridManager::IsGridCreated(uint16 const x, uint16 const y) const
+{
+    std::lock_guard<std::mutex> guard(_gridLock);
+    return IsGridCreatedUnlocked(x, y);
+}
+
+bool MapGridManager::IsGridLoaded(uint16 const x, uint16 const y) const
+{
+    std::lock_guard<std::mutex> guard(_gridLock);
+    return IsGridLoadedUnlocked(x, y);
+}
+
+MapGridType* MapGridManager::GetGrid(uint16 const x, uint16 const y) const
+{
+    std::lock_guard<std::mutex> guard(_gridLock);
+    return GetGridUnlocked(x, y);
+}
+
 uint32 MapGridManager::GetCreatedGridsCount()
 {
+    std::lock_guard<std::mutex> guard(_gridLock);
     return _createdGridsCount;
 }
 
 uint32 MapGridManager::GetLoadedGridsCount()
 {
+    std::lock_guard<std::mutex> guard(_gridLock);
     return _loadedGridsCount;
 }
 
@@ -128,10 +156,12 @@ uint32 MapGridManager::GetCreatedCellsInMapCount()
 
 bool MapGridManager::IsGridsFullyCreated() const
 {
+    std::lock_guard<std::mutex> guard(_gridLock);
     return _createdGridsCount == (MAX_NUMBER_OF_GRIDS * MAX_NUMBER_OF_GRIDS);
 }
 
 bool MapGridManager::IsGridsFullyLoaded() const
 {
+    std::lock_guard<std::mutex> guard(_gridLock);
     return _loadedGridsCount == (MAX_NUMBER_OF_GRIDS * MAX_NUMBER_OF_GRIDS);
 }

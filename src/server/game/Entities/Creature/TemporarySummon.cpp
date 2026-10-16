@@ -403,13 +403,14 @@ void Minion::setDeathState(DeathState s, bool despawn)
     if (s == DeathState::JustDied && IsGuardianPet())
         if (Unit* owner = GetOwner())
             if (owner->IsPlayer() && owner->GetMinionGUID() == GetGUID())
-                for (Unit::ControlSet::const_iterator itr = owner->m_Controlled.begin(); itr != owner->m_Controlled.end(); ++itr)
-                    if ((*itr)->IsAlive() && (*itr)->GetEntry() == GetEntry())
-                    {
-                        owner->SetMinionGUID((*itr)->GetGUID());
-                        owner->SetPetGUID((*itr)->GetGUID());
-                        owner->ToPlayer()->CharmSpellInitialize();
-                    }
+                for (ObjectGuid const& guid : owner->m_Controlled)
+                    if (Unit* controlled = owner->GetControlled(guid))
+                        if (controlled->IsAlive() && controlled->GetEntry() == GetEntry())
+                        {
+                            owner->SetMinionGUID(controlled->GetGUID());
+                            owner->SetPetGUID(controlled->GetGUID());
+                            owner->ToPlayer()->CharmSpellInitialize();
+                        }
 }
 
 std::string Minion::GetDebugInfo() const

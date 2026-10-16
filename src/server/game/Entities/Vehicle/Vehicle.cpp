@@ -16,6 +16,7 @@
  */
 
 #include "Vehicle.h"
+#include "ObjectAccessor.h"
 #include "AreaDefines.h"
 #include "BattlefieldWG.h"
 #include "Log.h"
@@ -468,8 +469,9 @@ bool Vehicle::AddPassenger(Unit* unit, int8 seatId)
         init.Launch();
 
         // Put the vehicle in combat with anything that was threatening the passenger; the threat itself stays on the passenger
-        for (auto const& [guid, threatRef] : unit->GetThreatMgr().GetThreatenedByMeList())
-            threatRef->GetOwner()->GetThreatMgr().AddThreat(_me, 0.0f, nullptr, true, true);
+        for (ObjectGuid const& ownerGuid : unit->GetThreatMgr().GetThreatenedByMeList())
+            if (Unit* owner = ObjectAccessor::GetUnit(*unit, ownerGuid))
+                owner->GetThreatMgr().AddThreat(_me, 0.0f, nullptr, true, true);
 
         if (_me->IsCreature())
         {

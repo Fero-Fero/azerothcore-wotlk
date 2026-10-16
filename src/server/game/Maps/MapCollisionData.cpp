@@ -45,7 +45,8 @@ MapCollisionData::MapCollisionData(Map const& map, Map const* parentMap) :
         if (newTree->InitMap(mapFileName))
             _staticVMapData._staticTree = newTree;
 
-        _mmapData._navMesh = MMAP::MMapMgr::LoadNavMesh(map.GetId());
+        if (std::shared_ptr<dtNavMesh> navMesh = MMAP::MMapMgr::LoadNavMesh(map.GetId()))
+            _mmapData._navMesh = std::make_shared<SharedNavMesh>(std::move(navMesh));
     }
 }
 
@@ -65,7 +66,7 @@ int MapCollisionData::LoadMMapTile(uint32 tileX, uint32 tileY)
     if (!DisableMgr::IsPathfindingEnabled(&_map) || !_mmapData._navMesh)
         return MMAP::MMAP_LOAD_RESULT_IGNORED;
 
-    return MMAP::MMapMgr::LoadTile(_mmapData._navMesh.get(), _map.GetId(), tileX, tileY);
+    return MMAP::MMapMgr::LoadTile(*_mmapData._navMesh, _map.GetId(), tileX, tileY);
 }
 
 bool StaticVMapCollisionData::isInLineOfSight(float x1, float y1, float z1, float x2, float y2, float z2, VMAP::ModelIgnoreFlags ignoreFlags) const
@@ -137,22 +138,22 @@ bool StaticVMapCollisionData::GetAreaAndLiquidData(float x, float y, float z, Op
 {
     if (_staticTree)
     {
-        VMAP::LocationInfo info;
         G3D::Vector3 const pos = VMAP::VMapMgr2::convertPositionToInternalRep(x, y, z);
-        if (_staticTree->GetLocationInfo(pos, info))
+        // Copied out under the tree's read lock; no pointer into the tree survives the call
+        VMAP::LocationQueryResult const info = _staticTree->QueryLocation(pos);
+        if (info.hit)
         {
-            data.floorZ = info.ground_Z;
+            data.floorZ = info.groundZ;
             if (!DisableMgr::IsVMAPDisabledFor(_mapId, VMAP::VMAP_DISABLE_LIQUIDSTATUS))
             {
-                uint32 liquidType = info.hitModel->GetLiquidType(); // entry from LiquidType.dbc
-                float liquidLevel;
-                if (!reqLiquidType || (GetLiquidFlags(liquidType) & *reqLiquidType))
-                    if (info.hitInstance->GetLiquidLevel(pos, info, liquidLevel))
-                        data.liquidInfo.emplace(liquidType, liquidLevel);
+                // info.liquidType is an entry from LiquidType.dbc
+                if (!reqLiquidType || (GetLiquidFlags(info.liquidType) & *reqLiquidType))
+                    if (info.hasLiquid)
+                        data.liquidInfo.emplace(info.liquidType, info.liquidLevel);
             }
 
             if (!DisableMgr::IsVMAPDisabledFor(_mapId, VMAP::VMAP_DISABLE_AREAFLAG))
-                data.areaInfo.emplace(info.hitModel->GetWmoID(), info.hitInstance->adtId, info.rootId, info.hitModel->GetMogpFlags(), info.hitInstance->ID);
+                data.areaInfo.emplace(info.wmoId, info.adtId, info.rootId, info.mogpFlags, info.modelInstanceId);
             return true;
         }
     }
@@ -177,7 +178,10 @@ bool DynamicVMapCollisionData::GetObjectHitPos(uint32 phasemask, float x1, float
 dtNavMeshQuery const* MMapData::GetNavMeshQuery()
 {
     if (_navMesh && !_navMeshQuery)
-        _navMeshQuery = MMAP::MMapMgr::CreateNavMeshQuery(_navMesh.get());
+    {
+        NavMeshQueryScope scope(*_navMesh);
+        _navMeshQuery = MMAP::MMapMgr::CreateNavMeshQuery(scope.ptr);
+    }
 
     return _navMeshQuery.get();
 }

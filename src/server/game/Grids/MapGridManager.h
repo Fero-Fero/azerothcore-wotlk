@@ -37,7 +37,7 @@ public:
     void UnloadGrid(uint16 const x, uint16 const y);
     bool IsGridCreated(uint16 const x, uint16 const y) const;
     bool IsGridLoaded(uint16 const x, uint16 const y) const;
-    MapGridType* GetGrid(uint16 const x, uint16 const y);
+    MapGridType* GetGrid(uint16 const x, uint16 const y) const;
 
     static bool IsValidGridCoordinates(uint16 const x, uint16 const y) { return (x < MAX_NUMBER_OF_GRIDS && y < MAX_NUMBER_OF_GRIDS); }
 
@@ -50,12 +50,20 @@ public:
     bool IsGridsFullyLoaded() const;
 
 private:
+    // Callers hold _gridLock
+    MapGridType* GetGridUnlocked(uint16 const x, uint16 const y) const;
+    bool IsGridCreatedUnlocked(uint16 const x, uint16 const y) const;
+    bool IsGridLoadedUnlocked(uint16 const x, uint16 const y) const;
+
     Map* _map;
 
     uint32 _createdGridsCount;
     uint32 _loadedGridsCount;
 
-    std::mutex _gridLock;
+    // Guards the grid slots and the counters. Not recursive: never call a locking
+    // public method while holding it. Lock order: this -> StaticMapTree::_mutex -> SharedNavMesh
+    // (both taken inside LoadTerrain); nothing takes this lock while holding either of those.
+    mutable std::mutex _gridLock;
     std::unique_ptr<MapGridType> _mapGrid[MAX_NUMBER_OF_GRIDS][MAX_NUMBER_OF_GRIDS];
 };
 

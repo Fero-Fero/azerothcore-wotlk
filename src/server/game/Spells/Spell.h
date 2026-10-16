@@ -25,6 +25,7 @@
 #include "SharedDefines.h"
 #include "SpellInfo.h"
 #include "Unit.h"
+#include <memory>
 
 class Unit;
 class Player;
@@ -37,6 +38,9 @@ class SpellScript;
 class SpellEvent;
 class ByteBuffer;
 class BasicEvent;
+class UnitView;
+struct SpellHitRecord;
+struct SpellLandedRecord;
 
 namespace Acore
 {
@@ -221,6 +225,8 @@ private:
 
 struct SpellValue
 {
+    // Plain value: embedded by value in SpellHitRecord (step 07), so it needs a default state.
+    SpellValue() : EffectBasePoints{}, MaxAffectedTargets(0), RadiusMod(1.0f), AuraStackAmount(1), AuraDuration(0), ForcedCritResult(false), MiscVal{} { }
     explicit  SpellValue(SpellInfo const* proto);
     int32     EffectBasePoints[MAX_SPELL_EFFECTS];
     uint32    MaxAffectedTargets;
@@ -300,7 +306,24 @@ class Spell
     friend class SpellScript;
 public:
     Spell(WorldObject* caster, SpellInfo const* info, TriggerCastFlags triggerFlags, ObjectGuid originalCasterGUID = ObjectGuid::Empty, bool skipCheck = false);
+    // Land-side spell (step 07): rebuilt on the target's task from a SpellHitRecord. Holds exactly one TargetInfo.
+    // casterHandle is the record's caster resolved through ObjectAccessor; feedback receives the caster-side writes.
+    Spell(SpellHitRecord const& hit, Unit* target, WorldObject* casterHandle, SpellLandedRecord* feedback);
     ~Spell();
+
+    // Land step: DoAllEffectOnTarget on the single target, then delivers the feedback to the caster.
+    void Land();
+    // Slice 1 bridge: the hit runs synchronously inside the launch spell, so hit hooks run on the launch spell's
+    // script instances (state set in cast hooks and across chain targets is kept) and procs see its applied
+    // spell mods. Returned after Land(). Slice 3 replaces this with record fields.
+    void BorrowScripts(Spell& from);
+    void ReturnScripts(Spell& to);
+    [[nodiscard]] bool IsLandSide() const { return _landSide; }
+    [[nodiscard]] uint32 GetCastSerial() const { return m_castSerial; }
+    // Every write to the caster that the land step wants goes through this record (plan §7.2).
+    SpellLandedRecord& Feedback();
+    // Every read of a caster field on the land step (plan §9). On this slice it wraps the live caster.
+    [[nodiscard]] UnitView CasterView() const;
 
     void EffectNULL(SpellEffIndex effIndex);
     void EffectUnused(SpellEffIndex effIndex);
@@ -609,7 +632,9 @@ public:
 
     // xinef: moved to public
     void LoadScripts();
-    std::list<TargetInfo>* GetUniqueTargetInfo() { return &m_UniqueTargetInfo; }
+    // On a land-side spell with a live launch spell (slice 1) this is the launch spell's full list, so hit-hook
+    // scripts that read or edit other targets' entries keep working while landing is synchronous.
+    std::list<TargetInfo>* GetUniqueTargetInfo() { return _launchSpell ? &_launchSpell->m_UniqueTargetInfo : &m_UniqueTargetInfo; }
 
     [[nodiscard]] uint32 GetTriggeredByAuraTickNumber() const { return m_triggeredByAuraSpell.tickNumber; }
     [[nodiscard]] SpellInfo const* GetTriggeredByAuraSpellInfo() const { return m_triggeredByAuraSpell.spellInfo; }
@@ -740,6 +765,17 @@ public:
     void DoAllEffectOnTarget(TargetInfo* target);
     SpellMissInfo DoSpellHitOnUnit(Unit* unit, uint32 effectMask, bool scaleAura);
     void DoTriggersOnSpellHit(Unit* unit, uint8 effMask);
+    // Step 07: self-hits and reflected hits run DoAllEffectOnTarget inline; every other unit target becomes a
+    // SpellHitRecord landed on the target (plan §6). Deferred and far hits run inline with both units live.
+    void LandOrEmit(TargetInfo& target);
+    void BuildHitRecord(TargetInfo const& target, SpellHitRecord& out) const;
+    void HandleComboPointsOnMiss(SpellMissInfo missInfo, ObjectGuid const& targetGuid);
+    // effectUnit: the TargetInfo's unit; hitUnit: the unit the effects ran on (the caster for a reflected hit).
+    void DeliverFeedback(Unit* effectUnit, Unit* hitUnit);
+    // A cast the caster performs because of this hit. Feedback when the list has room, inline otherwise.
+    // byEffectCaster: performed by the original caster when there is one (today's `caster` local), else by m_caster.
+    void DoFollowUpCast(uint32 spellId, Unit* target, bool addAura = false, int32 auraDuration = 0, bool byEffectCaster = false);
+    static uint32 NextCastSerial();
     void DoAllEffectOnTarget(GOTargetInfo* target);
     void DoAllEffectOnTarget(ItemTargetInfo* target);
     bool UpdateChanneledTargetList();
@@ -811,6 +847,15 @@ public:
     bool _spellTargetsSelected;
 
     ByteBuffer* m_effectExecuteData[MAX_SPELL_EFFECTS];
+
+    // Step 07
+    uint32 m_castSerial = 0;                            // per-process serial, pairs SpellHitRecord with SpellLandedRecord
+    bool _landSide = false;                             // built from a SpellHitRecord on the target's task
+    Unit* _landTarget = nullptr;                        // the task owner that is landing the hit
+    SpellLandedRecord* _landFeedback = nullptr;         // caller-owned on the land side
+    std::unique_ptr<SpellLandedRecord> _ownFeedback;    // inline path (self-hit at launch): applied at the end of the hit
+    Spell* _launchSpell = nullptr;                      // slice 1 only: the launch spell whose scripts are borrowed
+    uint8 _launchComboPoints = 0;                       // SpellHitRecord::comboPoints, for the land-side refund
 };
 
 namespace Acore

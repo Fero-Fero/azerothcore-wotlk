@@ -1189,16 +1189,10 @@ class spell_hun_volley_trigger : public SpellScript
             return;
         }
 
-        for (Unit::ControlSet::iterator itr = caster->m_Controlled.begin(); itr != caster->m_Controlled.end(); ++itr)
-        {
-            if (Unit* pet = *itr)
-            {
+        for (ObjectGuid const& guid : caster->m_Controlled)
+            if (Unit* pet = caster->GetControlled(guid))
                 if (pet->IsAlive() && pet->IsCreature())
-                {
                     pet->ToCreature()->AI()->OwnerAttacked(_target->ToUnit());
-                }
-            }
-        }
     }
 
     void Register() override

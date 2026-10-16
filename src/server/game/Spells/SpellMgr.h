@@ -27,6 +27,7 @@
 
 #include <vector>
 #include <bitset>
+#include <unordered_set>
 
 class SpellInfo;
 class Player;
@@ -810,6 +811,11 @@ public:
     void LoadSpellSpecificAndAuraState();
     void LoadSpellJumpDistances();
 
+    // Step 07 (plan §11): spells whose hit on a foreign unit runs with both units live instead of landing on
+    // the target's task. A static list plus every spell with a caster-and-target effect on another unit.
+    void LoadDeferredHitSpells();
+    [[nodiscard]] bool IsDeferredHit(uint32 spellId) const { return mDeferredHitSpells.find(spellId) != mDeferredHitSpells.end(); }
+
 private:
     SpellDifficultySearcherMap mSpellDifficultySearcherMap;
     SpellChainMap              mSpellChains;
@@ -842,6 +848,7 @@ private:
     SpellInfoMap               mSpellInfoMap;
     SpellCooldownOverrideMap   mSpellCooldownOverrideMap;
     TalentAdditionalSet        mTalentSpellAdditionalSet;
+    std::unordered_set<uint32> mDeferredHitSpells;
 };
 
 #define sSpellMgr SpellMgr::instance()

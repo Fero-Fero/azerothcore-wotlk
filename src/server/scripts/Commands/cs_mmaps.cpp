@@ -63,7 +63,7 @@ public:
     static bool HandleMmapPathCommand(ChatHandler* handler, Optional<std::string> param)
     {
         Map* map = handler->GetSession()->GetPlayer()->GetMap();
-        if (!map->GetMapCollisionData().GetMMapData().GetNavMesh())
+        if (!map->GetMapCollisionData().GetMMapData().GetSharedNavMesh())
         {
             handler->PSendSysMessage("NavMesh not loaded for current map.");
             return true;
@@ -177,13 +177,17 @@ public:
         Map* map = handler->GetSession()->GetPlayer()->GetMap();
 
         // calculate navmesh tile location
-        dtNavMesh const* navmesh = map->GetMapCollisionData().GetMMapData().GetNavMesh();
+        SharedNavMesh const* sharedNavMesh = map->GetMapCollisionData().GetMMapData().GetSharedNavMesh();
         dtNavMeshQuery const* navmeshquery = map->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
-        if (!navmesh || !navmeshquery)
+        if (!sharedNavMesh || !navmeshquery)
         {
             handler->PSendSysMessage("NavMesh not loaded for current map.");
             return true;
         }
+
+        // the mesh is only read inside this scope; nothing below outlives it
+        NavMeshQueryScope scope(*sharedNavMesh);
+        dtNavMesh const* navmesh = scope.ptr;
 
         float const* min = navmesh->getParams()->orig;
         float x, y, z;
@@ -229,13 +233,16 @@ public:
     static bool HandleMmapLoadedTilesCommand(ChatHandler* handler)
     {
         Map* map = handler->GetSession()->GetPlayer()->GetMap();
-        dtNavMesh const* navmesh = map->GetMapCollisionData().GetMMapData().GetNavMesh();
+        SharedNavMesh const* sharedNavMesh = map->GetMapCollisionData().GetMMapData().GetSharedNavMesh();
         dtNavMeshQuery const* navmeshquery = map->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
-        if (!navmesh || !navmeshquery)
+        if (!sharedNavMesh || !navmeshquery)
         {
             handler->PSendSysMessage("NavMesh not loaded for current map.");
             return true;
         }
+
+        NavMeshQueryScope scope(*sharedNavMesh);
+        dtNavMesh const* navmesh = scope.ptr;
 
         handler->PSendSysMessage("mmap loadedtiles:");
 
@@ -260,12 +267,15 @@ public:
         //MMAP::MMapMgr* manager = MMAP::MMapFactory::createOrGetMMapMgr();
         //handler->PSendSysMessage(" {} maps loaded with {} tiles overall", manager->getLoadedMapsCount(), manager->getLoadedTilesCount());
 
-        dtNavMesh const* navmesh = map->GetMapCollisionData().GetMMapData().GetNavMesh();
-        if (!navmesh)
+        SharedNavMesh const* sharedNavMesh = map->GetMapCollisionData().GetMMapData().GetSharedNavMesh();
+        if (!sharedNavMesh)
         {
             handler->PSendSysMessage("NavMesh not loaded for current map.");
             return true;
         }
+
+        NavMeshQueryScope scope(*sharedNavMesh);
+        dtNavMesh const* navmesh = scope.ptr;
 
         uint32 tileCount = 0;
         uint32 nodeCount = 0;

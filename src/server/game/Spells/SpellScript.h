@@ -297,6 +297,9 @@ public:
 public:
     bool _Validate(SpellInfo const* entry) override;
     bool _Load(Spell* spell);
+    // Step 07 slice 1: the land-side Spell borrows the launch-side scripts for the duration of one hit so script
+    // state set in cast hooks (and across chain targets) is preserved. Does not re-run Load().
+    void _Rebind(Spell* spell) { m_spell = spell; }
     void _InitHit();
     bool _IsEffectPrevented(SpellEffIndex effIndex) { return m_hitPreventEffectMask & (1 << effIndex); }
     bool _IsDefaultEffectPrevented(SpellEffIndex effIndex) { return m_hitPreventDefaultEffectMask & (1 << effIndex); }

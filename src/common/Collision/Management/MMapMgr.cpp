@@ -121,7 +121,12 @@ namespace MMAP
         return false;
     }
 
-    ManagedNavMeshQuery MMapMgr::CreateNavMeshQuery(dtNavMesh* navMesh)
+    bool MMapMgr::LoadTile(SharedNavMesh& navMesh, uint32 mapId, int32 x, int32 y)
+    {
+        return navMesh.Write([&](dtNavMesh* mesh) { return LoadTile(mesh, mapId, x, y); });
+    }
+
+    ManagedNavMeshQuery MMapMgr::CreateNavMeshQuery(dtNavMesh const* navMesh)
     {
         // allocate mesh query
         dtNavMeshQuery* query = dtAllocNavMeshQuery();

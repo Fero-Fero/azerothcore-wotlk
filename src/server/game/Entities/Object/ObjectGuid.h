@@ -20,6 +20,7 @@
 
 #include "ByteBuffer.h"
 #include "Define.h"
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <list>
@@ -286,15 +287,16 @@ class ObjectGuidGeneratorBase
 public:
     ObjectGuidGeneratorBase(ObjectGuid::LowType start = 1) : _nextGuid(start) { }
 
-    virtual void Set(ObjectGuid::LowType val) { _nextGuid = val; }
+    virtual void Set(ObjectGuid::LowType val) { _nextGuid.store(val, std::memory_order_relaxed); }
     virtual ObjectGuid::LowType Generate(uint16 realmId = DEFAULT_NON_CROSSREALM_REALM_ID) = 0;
-    [[nodiscard]] ObjectGuid::LowType GetNextAfterMaxUsed() const { return _nextGuid; }
+    [[nodiscard]] ObjectGuid::LowType GetNextAfterMaxUsed() const { return _nextGuid.load(std::memory_order_relaxed); }
     virtual ~ObjectGuidGeneratorBase() = default;
 
 protected:
     static void HandleCounterOverflow(HighGuid high);
     static bool GetClusterGuid(HighGuid high, uint16 realmId, ObjectGuid::LowType& clusterGuid);
-    ObjectGuid::LowType _nextGuid;
+    // Own cache line: item creates and map summons increment this from unit tasks.
+    alignas(64) std::atomic<ObjectGuid::LowType> _nextGuid;
 };
 
 template<HighGuid high>
@@ -309,10 +311,11 @@ public:
         if (GetClusterGuid(high, realmId, clusterGuid))
             return clusterGuid;
 
-        if (_nextGuid >= ObjectGuid::GetMaxCounter(high) - 1)
+        ObjectGuid::LowType v = _nextGuid.fetch_add(1, std::memory_order_relaxed);
+        if (v >= ObjectGuid::GetMaxCounter(high) - 1)
             HandleCounterOverflow(high);
 
-        return _nextGuid++;
+        return v;
     }
 };
 

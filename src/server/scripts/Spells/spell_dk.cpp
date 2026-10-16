@@ -700,12 +700,13 @@ class spell_dk_dancing_rune_weapon : public AuraScript
         Unit* player = eventInfo.GetActor();
         Unit* target = eventInfo.GetActionTarget();
         Unit* dancingRuneWeapon = nullptr;
-        for (Unit::ControlSet::const_iterator itr = player->m_Controlled.begin(); itr != player->m_Controlled.end(); ++itr)
-            if (int32((*itr)->GetEntry()) == GetSpellInfo()->Effects[EFFECT_0].MiscValue)
-            {
-                dancingRuneWeapon = *itr;
-                break;
-            }
+        for (ObjectGuid const& guid : player->m_Controlled)
+            if (Unit* controlled = player->GetControlled(guid))
+                if (int32(controlled->GetEntry()) == GetSpellInfo()->Effects[EFFECT_0].MiscValue)
+                {
+                    dancingRuneWeapon = controlled;
+                    break;
+                }
 
         if (!dancingRuneWeapon)
             return;
@@ -1592,8 +1593,9 @@ class spell_dk_death_pact : public SpellScript
     {
         // Check if we have valid targets, otherwise skip spell casting here
         if (Player* player = GetCaster()->ToPlayer())
-            for (Unit::ControlSet::const_iterator itr = player->m_Controlled.begin(); itr != player->m_Controlled.end(); ++itr)
-                if (Creature* undeadPet = (*itr)->ToCreature())
+            for (ObjectGuid const& guid : player->m_Controlled)
+                if (Unit* controlled = player->GetControlled(guid))
+                    if (Creature* undeadPet = controlled->ToCreature())
                     if (undeadPet->IsAlive() &&
                             undeadPet->GetOwnerGUID() == player->GetGUID() &&
                             undeadPet->GetCreatureType() == CREATURE_TYPE_UNDEAD &&

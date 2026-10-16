@@ -106,16 +106,17 @@ void WorldSession::HandlePetAction(WorldPacket& recvData)
     {
         //If a pet is dismissed, m_Controlled will change
         std::vector<Unit*> controlled;
-        for (Unit::ControlSet::iterator itr = GetPlayer()->m_Controlled.begin(); itr != GetPlayer()->m_Controlled.end(); ++itr)
+        for (ObjectGuid const& guid : GetPlayer()->m_Controlled)
         {
+            Unit* controlledUnit = GetPlayer()->GetControlled(guid);
+            if (!controlledUnit)
+                continue;
             // xinef: allow to dissmis dead pets
-            if ((*itr)->GetEntry() == pet->GetEntry() && ((*itr)->IsAlive() || (flag == ACT_COMMAND && spellId == COMMAND_ABANDON)))
-                controlled.push_back(*itr);
+            if (controlledUnit->GetEntry() == pet->GetEntry() && (controlledUnit->IsAlive() || (flag == ACT_COMMAND && spellId == COMMAND_ABANDON)))
+                controlled.push_back(controlledUnit);
             // xinef: mirror image blizzard
-            else if ((*itr)->GetEntry() == NPC_MIRROR_IMAGE && flag == ACT_COMMAND && spellId == COMMAND_FOLLOW)
-            {
-                (*itr)->InterruptNonMeleeSpells(false);
-            }
+            else if (controlledUnit->GetEntry() == NPC_MIRROR_IMAGE && flag == ACT_COMMAND && spellId == COMMAND_FOLLOW)
+                controlledUnit->InterruptNonMeleeSpells(false);
         }
 
         for (Unit* pet : controlled)
@@ -738,16 +739,17 @@ void WorldSession::HandlePetSetAction(WorldPacket& recvData)
         }
     }
 
-    Unit::ControlSet petsSet;
+    std::vector<Unit*> petsSet;
     if (checkPet->GetEntry() != petguid.GetEntry())
-        petsSet.insert(checkPet);
+        petsSet.push_back(checkPet);
     else
-        petsSet = _player->m_Controlled;
+        for (ObjectGuid const& guid : _player->m_Controlled)
+            if (Unit* controlled = _player->GetControlled(guid))
+                petsSet.push_back(controlled);
 
     // Xinef: loop all pets with same entry (fixes partial state change for feral spirits)
-    for (Unit::ControlSet::const_iterator itr = petsSet.begin(); itr != petsSet.end(); ++itr)
+    for (Unit* pet : petsSet)
     {
-        Unit* pet = *itr;
         if (checkPet->GetEntry() == petguid.GetEntry() && pet->GetEntry() != petguid.GetEntry())
             continue;
 
@@ -802,13 +804,10 @@ void WorldSession::HandlePetSetAction(WorldPacket& recvData)
                         }
                         else
                         {
-                            for (auto iterator = GetPlayer()->m_Controlled.begin(); iterator != GetPlayer()->m_Controlled.end(); ++iterator)
-                            {
-                                if ((*iterator)->GetEntry() == pet->GetEntry())
-                                {
-                                    (*iterator)->GetCharmInfo()->ToggleCreatureAutocast(spellInfo, true);
-                                }
-                            }
+                            for (ObjectGuid const& guid : GetPlayer()->m_Controlled)
+                                if (Unit* controlled = GetPlayer()->GetControlled(guid))
+                                    if (controlled->GetEntry() == pet->GetEntry())
+                                        controlled->GetCharmInfo()->ToggleCreatureAutocast(spellInfo, true);
                         }
                     }
                     //sign for no/turn off autocast
@@ -820,13 +819,10 @@ void WorldSession::HandlePetSetAction(WorldPacket& recvData)
                         }
                         else
                         {
-                            for (auto iterator = GetPlayer()->m_Controlled.begin(); iterator != GetPlayer()->m_Controlled.end(); ++iterator)
-                            {
-                                if ((*iterator)->GetEntry() == pet->GetEntry())
-                                {
-                                    (*iterator)->GetCharmInfo()->ToggleCreatureAutocast(spellInfo, false);
-                                }
-                            }
+                            for (ObjectGuid const& guid : GetPlayer()->m_Controlled)
+                                if (Unit* controlled = GetPlayer()->GetControlled(guid))
+                                    if (controlled->GetEntry() == pet->GetEntry())
+                                        controlled->GetCharmInfo()->ToggleCreatureAutocast(spellInfo, false);
                         }
                     }
                 }
@@ -975,11 +971,13 @@ void WorldSession::HandlePetSpellAutocastOpcode(WorldPackets::Pet::PetSpellAutoc
         return;
     }
 
-    Unit::ControlSet petsSet;
+    std::vector<Unit*> petsSet;
     if (checkPet->GetEntry() != packet.PetGUID.GetEntry())
-        petsSet.insert(checkPet);
+        petsSet.push_back(checkPet);
     else
-        petsSet = _player->m_Controlled;
+        for (ObjectGuid const& guid : _player->m_Controlled)
+            if (Unit* controlled = _player->GetControlled(guid))
+                petsSet.push_back(controlled);
 
     // Xinef: loop all pets with same entry (fixes partial state change for feral spirits)
     for (Unit* pet : petsSet)

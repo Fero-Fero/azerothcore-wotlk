@@ -1292,11 +1292,12 @@ class spell_item_summon_or_dismiss : public SpellScript
 
     void HandleSummon(SpellEffIndex effIndex)
     {
-        for (Unit::ControlSet::iterator itr = GetCaster()->m_Controlled.begin(); itr != GetCaster()->m_Controlled.end(); ++itr)
+        for (ObjectGuid const& guid : GetCaster()->m_Controlled)
         {
-            if (GetSpellInfo()->Effects[effIndex].MiscValue >= 0 && (*itr)->GetEntry() == uint32(GetSpellInfo()->Effects[effIndex].MiscValue))
+            Unit* controlled = GetCaster()->GetControlled(guid);
+            if (controlled && GetSpellInfo()->Effects[effIndex].MiscValue >= 0 && controlled->GetEntry() == uint32(GetSpellInfo()->Effects[effIndex].MiscValue))
             {
-                (*itr)->ToTempSummon()->UnSummon();
+                controlled->ToTempSummon()->UnSummon();
                 PreventHitDefaultEffect(effIndex);
                 return;
             }

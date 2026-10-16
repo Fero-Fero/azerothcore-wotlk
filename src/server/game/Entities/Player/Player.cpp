@@ -426,6 +426,11 @@ Player::Player(WorldSession* session): Unit(), m_mover(this), _cinematicMgr(*thi
     _mapChangeOrderCounter = 0;
 }
 
+void Player::FillSlot(ObjectSlot& slot)
+{
+    Unit::FillSlot(slot);
+}
+
 Player::~Player()
 {
     sScriptMgr->OnDestructPlayer(this);

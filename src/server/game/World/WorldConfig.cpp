@@ -573,6 +573,9 @@ void WorldConfig::BuildConfigCache()
     SetConfigValue<bool>(CONFIG_SHOW_MUTE_IN_WORLD, "ShowMuteInWorld", false);
     SetConfigValue<bool>(CONFIG_SHOW_BAN_IN_WORLD, "ShowBanInWorld", false);
     SetConfigValue<uint32>(CONFIG_NUMTHREADS, "MapUpdate.Threads", 1);
+    SetConfigValue<bool>(CONFIG_MAPUPDATE_PHASE_TIMING, "MapUpdate.PhaseTiming", false, ConfigValueCache::Reloadable::Yes);
+    SetConfigValue<uint32>(CONFIG_MAPUPDATE_PHASE_THREADS, "MapUpdate.PhaseThreads", 1,
+        ConfigValueCache::Reloadable::No, [](uint32 const& v) { return v >= 1 && v <= 128; }, "1..128");
     SetConfigValue<uint32>(CONFIG_MAX_RESULTS_LOOKUP_COMMANDS, "Command.LookupMaxResults", 0);
 
     // Warden

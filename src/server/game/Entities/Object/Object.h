@@ -19,6 +19,7 @@
 #define _OBJECT_H
 
 #include "AreaDefines.h"
+#include "BeatContext.h"
 #include "Common.h"
 #include "DataMap.h"
 #include "EventProcessor.h"
@@ -29,9 +30,11 @@
 #include "ModelIgnoreFlags.h"
 #include "ObjectDefines.h"
 #include "ObjectGuid.h"
+#include "ObjectSlot.h"
 #include "Optional.h"
 #include "Position.h"
 #include "SpellDefines.h"
+#include "UnitRecords.h"
 #include "UnitDefines.h"
 #include "UpdateData.h"
 #include "UpdateMask.h"
@@ -229,6 +232,7 @@ public:
     [[nodiscard]] DynamicObject const* ToDynObject() const { if (IsDynamicObject()) return reinterpret_cast<DynamicObject const*>(this); else return nullptr; }
 
     [[nodiscard]] inline bool IsItem() const { return GetTypeId() == TYPEID_ITEM; }
+    [[nodiscard]] virtual bool IsWorldObject() const { return false; }
 
     virtual void Heartbeat() {}
 
@@ -246,6 +250,8 @@ protected:
     Object();
 
     void _InitValues();
+    // Runs at the end of _InitValues, when m_valuesCount is final. WorldObject sizes its slots here.
+    virtual void _OnValuesInitialized() { }
     void _Create(ObjectGuid::LowType guidlow, uint32 entry, HighGuid guidhigh);
     void _Create(ObjectGuid guid);
     [[nodiscard]] std::string _ConcatFields(uint16 startIndex, uint16 size) const;
@@ -486,6 +492,41 @@ public:
     ~WorldObject() override;
 
     virtual void Update(uint32 diff);
+
+    [[nodiscard]] bool IsWorldObject() const override { return true; }
+
+    // Ungrouped objects are their own root. Step 12 points a passenger or a charmed unit at the group root.
+    [[nodiscard]] WorldObject* TaskRoot() { return _taskRoot ? _taskRoot : this; }
+    [[nodiscard]] WorldObject const* TaskRoot() const { return _taskRoot ? _taskRoot : this; }
+
+    // Copies the readable state into the write slot and advances the stamp. Called once after each Update.
+    void PublishSlot();
+    [[nodiscard]] ObjectSlot const& ReadSlot() const { return _slots.ReadSlot(); }
+    [[nodiscard]] ObjectSlotPair const& Slots() const { return _slots; }
+    [[nodiscard]] uint32 SlotIndex() const { return _slots.SlotIndex(); }
+
+    // Record inbox. Records written to this object in the previous beat are collected from every core's log
+    // named in _writtenBy, sorted by (source, sequence) and handed to ApplyRecords before this object's Update.
+    void ApplyInbox();
+    [[nodiscard]] bool HasInbox() const { return _writtenBy.load(std::memory_order_relaxed) != 0; }
+    // Called by UnitRecordLog::Append for the first record of a (core, target, beat). Sets the mask bit and
+    // wakes the target so its inbox is scanned next beat.
+    void OnFirstRecordOfBeat(uint8 core);
+    // True when IsForeign(this): the running task is not this object's and must write it through a record.
+    [[nodiscard]] bool IsForeignToTask() const { return BeatContext::IsForeign(this); }
+
+    // A removal requested on this object's own task: runs the own half of the cleanup inline, emits the foreign
+    // half as records, marks the object removing and publishes its final slot. The seal then only unlinks.
+    void PrepareRemoval();
+    [[nodiscard]] bool IsRemoving() const { return _removing; }
+
+protected:
+    // Foreign half of a task-originated removal: records to every unit this object would have written.
+    virtual void PrepareRemovalForeign() { }
+    // Own half: everything in today's CleanupsBeforeDelete that writes this. Must not RemoveFromWorld.
+    virtual void PrepareRemovalOwn();
+
+public:
 
     void _Create(ObjectGuid::LowType guidlow, HighGuid guidhigh, uint32 phaseMask);
 
@@ -818,6 +859,17 @@ protected:
     void SetLocationMapId(uint32 _mapId) { m_mapId = _mapId; }
     void SetLocationInstanceId(uint32 _instanceId) { m_InstanceId = _instanceId; }
 
+    void _OnValuesInitialized() override;
+    // Unit and Player add their parts of the slot. The WorldObject part is filled by PublishSlot.
+    virtual void FillSlot(ObjectSlot& /*slot*/) { }
+    ObjectSlotPair _slots;
+
+    // Applies the sorted records of one beat. The base drops them: only Unit has record kinds on this step.
+    virtual void ApplyRecords(std::vector<RecordHeader const*> const& records);
+
+    // Set by PrepareRemoval. Never cleared: the object is a dead handle until the seal frees it.
+    bool _removing{false};
+
     [[nodiscard]] virtual bool IsNeverVisible() const { return !IsInWorld(); }
     virtual bool IsAlwaysVisibleFor(WorldObject const* /*seer*/) const { return false; }
     [[nodiscard]] virtual bool IsInvisibleDueToDespawn() const { return false; }
@@ -851,6 +903,17 @@ private:
     GuidUnorderedSet _allowedLooters;
 
     ObjectVisibilityContainer _objectVisibilityContainer;
+
+    // Written only at the seal (step 12). nullptr means this object is its own task root.
+    WorldObject* _taskRoot{nullptr};
+    // Grid the S1a router tagged this object for. -1 unless it is in that grid's pending list.
+    int32 _pendingInGrid{-1};
+
+    // Bit per core that appended a record to this object in the current beat. Written only by
+    // OnFirstRecordOfBeat (fetch_or) and ApplyInbox (exchange to 0).
+    std::atomic<uint64> _writtenBy{0};
+
+    friend struct BeatContext;
 };
 
 namespace Acore

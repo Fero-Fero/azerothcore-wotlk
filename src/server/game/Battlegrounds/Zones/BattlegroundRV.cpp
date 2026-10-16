@@ -102,16 +102,19 @@ void BattlegroundRV::PostUpdateImpl(uint32 diff)
                                 if (totem->GetPositionZ() < 28.0f)
                                     TeleportUnitToNewZ(totem, 28.28f, true);
 
-                    for (auto itr2 = player->m_Controlled.begin(); itr2 != player->m_Controlled.end(); ++itr2)
+                    for (ObjectGuid const& guid : player->m_Controlled)
                     {
-                        if ((*itr2)->GetPositionZ() < 28.0f)
-                            TeleportUnitToNewZ((*itr2), 28.28f, true);
+                        Unit* controlled = player->GetControlled(guid);
+                        if (!controlled)
+                            continue;
+                        if (controlled->GetPositionZ() < 28.0f)
+                            TeleportUnitToNewZ(controlled, 28.28f, true);
 
                         // Xinef: override stay position
-                        if (CharmInfo* charmInfo = (*itr2)->GetCharmInfo())
+                        if (CharmInfo* charmInfo = controlled->GetCharmInfo())
                             if (charmInfo->IsAtStay())
                             {
-                                (*itr2)->StopMovingOnCurrentPos();
+                                controlled->StopMovingOnCurrentPos();
                                 charmInfo->SaveStayPosition(false);
                             }
                     }

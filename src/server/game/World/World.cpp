@@ -412,6 +412,9 @@ void World::SetInitialWorldSettings()
     LOG_INFO("server.loading", "Loading SpellInfo Data Corrections...");
     sSpellMgr->LoadSpellInfoCorrections();
 
+    LOG_INFO("server.loading", "Loading Deferred Spell Hits...");
+    sSpellMgr->LoadDeferredHitSpells();
+
     LOG_INFO("server.loading", "Loading Spell Rank Data...");
     sSpellMgr->LoadSpellRanks();
 

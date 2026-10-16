@@ -16,6 +16,7 @@
  */
 
 #include "MapMgr.h"
+#include "BeatContext.h"
 #include "Chat.h"
 #include "DatabaseEnv.h"
 #include "GridDefines.h"
@@ -33,8 +34,10 @@
 #include "ScriptMgr.h"
 #include "TC9Sidecar.h"
 #include "Transport.h"
+#include "UnitRecordLog.h"
 #include "World.h"
 #include "WorldPacket.h"
+#include <algorithm>
 
 MapMgr::MapMgr()
 {
@@ -56,6 +59,10 @@ MapMgr* MapMgr::instance()
 void MapMgr::Initialize()
 {
     int num_threads(sWorld->getIntConfig(CONFIG_NUMTHREADS));
+
+    // One record log per core: the world thread plus every map update worker.
+    sRecordLogs->Init(uint8(std::clamp(num_threads, 0, 63) + 1));
+    sRecordLogs->BeginBeat(BeatContext::beat.load(std::memory_order_relaxed));
 
     // Start mtmaps if needed
     if (num_threads > 0)
@@ -297,6 +304,13 @@ void MapMgr::Update(uint32 diff)
         mapUpdateStep = 0;
         i_timer[3].SetCurrent(0);
     }
+
+    // The beat advances after the delayed removes freed this tick's objects: a handle resolved under the
+    // old beat number is never reused. The new beat's write logs are reset here; last beat's logs stay
+    // readable for the inboxes applied at the top of the next Map::Update.
+    BeatContext::FlushForeignReads();
+    uint32 const beat = BeatContext::beat.fetch_add(1, std::memory_order_relaxed) + 1;
+    sRecordLogs->BeginBeat(beat);
 }
 
 void MapMgr::DoDelayedMovesAndRemoves()

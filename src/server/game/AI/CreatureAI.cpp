@@ -155,8 +155,9 @@ void CreatureAI::DoZoneInCombat(Creature* creature /*= nullptr*/, float maxRange
 
             creature->EngageWithTarget(player);
 
-            for (Unit* pet : player->m_Controlled)
-                creature->EngageWithTarget(pet);
+            for (ObjectGuid const& guid : player->m_Controlled)
+                if (Unit* pet = player->GetControlled(guid))
+                    creature->EngageWithTarget(pet);
 
             if (Unit* vehicle = player->GetVehicleBase())
                 creature->EngageWithTarget(vehicle);
