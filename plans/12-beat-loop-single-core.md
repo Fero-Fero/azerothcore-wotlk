@@ -416,21 +416,53 @@ Order inside `World::Update` is unchanged: `UpdateSessions` (1227) → LFG (1248
 
 ## Checklist
 
-- [ ] `MapMgr::Update` accumulates to `MapUpdateInterval` and runs one beat; LFG update moved to the world thread.
-- [ ] Per-core state struct, swap of `current`/`next`, `published` fixed before each phase starts; `RunPhase` shared by all five phases.
-- [ ] `TaskBody`: group inbox, root then members `UpdateOne` with `TaskScope(obj, root)`, publish, clear mask, `_lastTaskNs`, view items queued, republish root only (heavy ring when over threshold).
-- [ ] U2: `ViewBody` with `ViewScan` (chunk 0) / `ViewBuild` / last-chunk `ViewCommit`; `slotBeat = beat`.
-- [ ] `_taskRoot` / `_taskMembers` on `WorldObject`; `TaskGroupJoin/Leave` applied in S1b; removal dissolves or detaches.
-- [ ] `IsDueNextBeat` = root ∧ (player ‖ `IsUpdateNeeded` ‖ pending records, for self or any member); `Wake` pushes the root onto `next`.
-- [ ] Heavy ring per core, `heavyThresholdNs` from the S2 median, `PopHeavy` before `current`, `.debug slowtasks`.
+- [x] `MapMgr::Update` accumulates to `MapUpdateInterval` and runs one beat; LFG update moved to the world thread.
+- [x] Per-core state struct, swap of `current`/`next`, `published` fixed before each phase starts; `RunPhase` shared by all five phases.
+- [x] `TaskBody`: group inbox, root then members `UpdateOne` with `TaskScope(obj, root)`, publish, clear mask, `_lastTaskNs`, view items queued, republish root only (heavy ring when over threshold).
+- [x] U2: `ViewBody` with `ViewScan` (chunk 0) / `ViewBuild` / last-chunk `ViewCommit`; `slotBeat = beat`. (One item per player: `Player::RunViewPhase` does scan, build 0 and commit; chunking stays a step 14 matter.)
+- [x] `_taskRoot` / `_taskMembers` on `WorldObject`; `TaskGroupJoin/Leave` applied in S1b; removal dissolves or detaches.
+- [x] `IsDueNextBeat` = root ∧ (player ‖ `IsUpdateNeeded` ‖ pending records, for self or any member); `Wake` pushes the root onto `next`.
+- [x] Heavy ring per core, `heavyThresholdNs` from the S2 median, `PopHeavy` before `current`, `.debug slowtasks`.
 - [ ] S1a: grid routing at append (`GridPending` per grid per core, touched-grid bitset), unlink round then link round, `GridBody` collects map-side work; `_lastGridNs`.
-- [ ] S1b: `SealApply` applies the collected map-side work, then map-wide defers, `DelayedUpdate`, `BeatEpilogue`; one task per map under `SealTaskScope`.
-- [ ] S2: global defers, log/defer/view reset, newcomers, free, slot index return, heavy threshold, clock. Nothing per unit or per map.
+- [x] S1b: `SealApply` applies the collected map-side work, then map-wide defers, `DelayedUpdate`, `BeatEpilogue`; one task per map under `SealTaskScope`.
+- [x] S2: global defers, log/defer/view reset, newcomers, free, slot index return, heavy threshold, clock. Nothing per unit or per map. (Newcomers are scheduled in S1b when the map drains its pending list; frees still happen in S1b's `DelayedUpdate`.)
 - [ ] `PrepareRemoval` on own-task removals does both halves and sets `_removing`; grid item does `RemoveFromGrid` only; unprepared removals two-sided in S1b.
 - [ ] `ProcessRespawns` emits `Spawn` defers; grid link round constructs; `ConstructFromSpawn` shared with `ObjectGridLoader`.
 - [ ] `DynamicMapTree::update` rebalance capped (16 dirty / 32 beats); residue table checked against `seal_tail` in the exit note.
-- [ ] `BeatEpilogue` carries lines 438, 458, 467–476, 511–516, 524–537 of the old `Map::Update`.
-- [ ] `inBeat` true from the U1 wake to the end of S1b.
-- [ ] Clock has `view`, `view_tail`, `grid`, `grid_tail`, `seal_map`, `seal_tail`, `seal_ser`.
-- [ ] Step 01 clock and key removed.
+- [x] `BeatEpilogue` carries lines 438, 458, 467–476, 511–516, 524–537 of the old `Map::Update`.
+- [x] `inBeat` true from the U1 wake to the end of S1b.
+- [x] Clock has `view`, `view_tail`, `grid`, `grid_tail`, `seal_map`, `seal_tail`, `seal_ser`.
+- [x] Step 01 clock and key removed.
 - [ ] Exit note has the `.server info` comparison.
+
+## Status
+
+### Done
+
+- `Maps/BeatPool.h/.cpp` (`sBeatPool`): `CoreState` per core (`current` / `next` / `heavy` rings, `viewItems`, `sealItems`, clocks, 64-bucket log histogram), `RunBeat(diff)` = beat++ and `BeginBeat`, map list, seed of maps that joined, `inBeat` on, U1 → U2 → S1b, `inBeat` off, S2. `RunPhase`/`WorkerLoop` are the shape step 14 adds workers to; at one core the world thread drains every ring itself.
+- `TaskBody`: skips non-roots and objects out of world, group inbox, `UpdateOne` for root then members (copy of the member list; a member that left the group inside the update is skipped), publish root and members, queue view items for in-world players, `_lastTaskNs`, histogram, republish via `IsDueNextBeat` with CAS on `_scheduledBeat` (heavy ring when over `heavyThresholdNs`), dormant non-player roots leave the map update list so a viewer's scan re-adds them. `UpdateOne` for a player = `WorldSession::Update(MapSessionFilter)` + `Player::Update` + `MarkNearbyCellsOf` (and viewpoint); otherwise `WorldObject::Update`.
+- U2 `ViewBody`: `LoadGridsInRange` when a scan is due, then `Player::RunViewPhase` under `TaskScope(p, p->TaskRoot())`. `Map::RunViewPhase` deleted.
+- `Map::SealApply(diff)` (S1b, under `SealTaskScope`): scripts, move lists, map-local `ApplyDefers`, pending updatable list drained and each newcomer's root scheduled, `DelayedUpdate` (transports, remove list). `Map::BeatEpilogue(diff)` (virtual): dynamic tree, `Events`, respawn timer, redirect kicks, weather, corpses, `OnMapUpdate`, deferred spell hits, metrics. `InstanceMap::BeatEpilogue` adds `instance_data->Update`.
+- S2 `SealSerial`: `ApplyGlobalDefers` per map (now returns the count), `MapMgr::DestroyExpiredInstances` (new `MapInstanced::DestroyExpiredInstances`, the old `CanUnload`/`DestroyInstance` loop), slot index return (`WorldObject::RemoveFromWorld` pushes to `_slotIndicesToReturn` instead of releasing), view item reset, heavy threshold = 8× histogram median, `FlushForeignReads`, clock line `pool timing: …` (≤1 per 5 s when wall ≥ 20 ms), top-10 slow tasks for `.debug slowtasks`.
+- `WorldObject`: `_taskMembers`, `_scheduledBeat`, `_lastTaskNs`, `IsTaskRoot`, `TaskMembers`, `JoinTaskGroup` (resolves to the top root ≤3 levels, moves own members along), `LeaveTaskGroup` (reschedules the member), `IsDueNextBeat`. `Map::ApplyDefer` applies `TaskGroupJoin`/`TaskGroupLeave`. `RemoveFromWorld` dissolves a root's group or detaches a member. `~WorldObject` calls `Unschedule` when `_scheduledBeat != 0` (rings and view items are scrubbed; `WorkRing::pop` skips the holes). `OnFirstRecordOfBeat` wakes via `sBeatPool->Wake`. `Map::AddPlayerToMap` schedules the player.
+- `MapMgr::Update` is the accumulator (`_beatAccum` / `_beatInterval`, `SetMapUpdateInterval` feeds it); `sLFGMgr->Update(diff, 1)` on the world thread each tick. `CollectAllMaps`, `DestroyExpiredInstances`. `i_timer`, `mapUpdateStep`, the type rotation and the `t_diff == 0` session ticks are gone. `Map::Update`, `InstanceMap::Update`, `MapInstanced::Update`/`DelayedUpdate`, `UpdateNonPlayerObjects`, `ApplyInboxes`, `_updatableObjectListRecheckTimer` deleted. `MapUpdater` keeps only the grid preload request (`MapUpdateRequest`, `LFGUpdateRequest`, `schedule_update`, `schedule_lfg_update` removed).
+- Step 01 `MapPhaseTiming.h/.cpp`, `_phaseTiming`, `CONFIG_MAPUPDATE_PHASE_TIMING` and the `MapUpdate.PhaseTiming` conf block removed.
+
+### Open
+
+- S1a is not in this step: there are no grid items, map-local defers (relink, grid load, cell marks, update list, dyn tree) are applied per map in S1b. `grid` / `grid_tail` read 0.
+- Frees are still inline in S1b (`RemoveListedObject` inside `DelayedUpdate`), not collected for S2; `PrepareRemoval` two-sided removals are unchanged from step 09.
+- `ProcessRespawns` still constructs inline in `BeatEpilogue`; no `Spawn` defers from it yet.
+- `DynamicMapTree::update` rebalance is uncapped.
+- Grid loads for a scanning viewer run inline in U2 (`LoadGridsInRange`), as in step 10.
+- `Unschedule` is a linear scan over the rings (step 14 gives rings a stable index).
+- `inBeat` is now true during U1–S1b, so `BeatContext::MayAccess` asserts that were latent since step 09 may surface in debug builds.
+- `sBeatPool->Init(1)`: a single core regardless of `MapUpdate.Threads`; the updater threads only serve startup grid preloads.
+- `.server info` comparison not done (not played).
+
+### Behaviour
+
+- Every map is updated every beat (`MapUpdateInterval`); no more continents / BG / instance rotation and no session-only ticks between map updates. Map-side packets wait for the player's task like everything else.
+- Dormancy is decided per task from `IsDueNextBeat`, not every 30 s: a creature with no marked cell, no inbox and not active leaves the update list right after its task and comes back when a viewer's scan collects it or a record wakes it. Cell marks are refreshed every beat by every player task.
+- Objects that leave the world keep their slot index until S2 of that beat.
+- Not built since these edits (the user builds). `codestyle-cpp.py` passes. Not played.

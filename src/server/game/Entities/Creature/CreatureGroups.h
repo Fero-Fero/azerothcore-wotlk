@@ -87,6 +87,13 @@ public:
     void AddCreatureToGroup(uint32 group_id, Creature* creature);
     void RemoveCreatureFromGroup(CreatureGroup* group, Creature* creature);
     void LoadCreatureFormations();
+    // Read-only after load (step 03). A lookup from a task uses find, never operator[], so a miss cannot
+    // insert into the shared map (step 13).
+    [[nodiscard]] uint8 GetGroupAI(ObjectGuid::LowType spawnId) const
+    {
+        auto itr = CreatureGroupMap.find(spawnId);
+        return itr != CreatureGroupMap.end() ? itr->second.groupAI : 0;
+    }
     CreatureGroupInfoType CreatureGroupMap;
     CreatureGroupMembersType CreatureGroupMembers;
 };

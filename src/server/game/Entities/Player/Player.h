@@ -41,8 +41,10 @@
 #include "TradeData.h"
 #include "Unit.h"
 #include "WorldSession.h"
+#include <atomic>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 struct CreatureTemplate;
@@ -2155,8 +2157,8 @@ public:
     uint8 GetGrantableLevels() { return m_grantableLevels; }
     void SetGrantableLevels(uint8 val) { m_grantableLevels = val; }
 
-    ReputationMgr&       GetReputationMgr()       { return *m_reputationMgr; }
-    [[nodiscard]] ReputationMgr const& GetReputationMgr() const { return *m_reputationMgr; }
+    ReputationMgr&       GetReputationMgr()       { ASSERT_OWNED(this); return *m_reputationMgr; }
+    [[nodiscard]] ReputationMgr const& GetReputationMgr() const { ASSERT_OWNED(this); return *m_reputationMgr; }
     [[nodiscard]] ReputationRank GetReputationRank(uint32 faction_id) const;
     void RewardReputation(Unit* victim);
     void RewardReputation(Quest const* quest);
@@ -2429,9 +2431,6 @@ public:
     [[nodiscard]] WorldLocation const& GetEntryPoint() const { return m_entryPointData.joinPos; }
     void SetEntryPoint();
 
-    // currently visible objects at player client
-    std::vector<Unit*> m_newVisible; // pussywizard
-
     [[nodiscard]] bool HaveAtClient(WorldObject const* u) const;
     [[nodiscard]] bool HaveAtClient(ObjectGuid guid) const;
 
@@ -2445,8 +2444,50 @@ public:
     void UpdateVisibilityOf(WorldObject* target);
     void UpdateTriggerVisibility();
 
-    template<class T>
-    void UpdateVisibilityOf(T* target, UpdateData& data, std::vector<Unit*>& visibleNow);
+    // ---- Step 10: the view phase. The player scans from slots, builds its own packet from slots, and the
+    // only write into another object is a VisibilityLink / VisibilityUnlink / VisibilityPoke record. ----
+
+    struct VisibilityDelta
+    {
+        std::vector<WorldObject*> entered;   // not at the client, seeable now
+        std::vector<WorldObject*> left;      // at the client, not seeable (or out of range) now
+    };
+
+    // Resident per player. ViewScan and ViewBuild write only this; ViewCommit is the one function that
+    // writes the player's containers and appends records (step 12 moves the three into phase U2, step 14
+    // chunks ViewBuild across cores).
+    struct ViewWork
+    {
+        uint32 slotBeat = 0;                          // slot stamp that counts as "changed this beat"
+        uint32 chunkCount = 1;                        // step 14: > 1 for a crowded viewer
+        std::atomic<uint32> chunksDone{0};
+        std::vector<UpdateData> chunkData;            // one per chunk; chunk 0 also takes the delta's blocks
+        VisibilityDelta delta;
+        std::unordered_set<ObjectGuid> seen;          // objects the current phase already decided on
+        std::vector<ObjectGuid> pokes;                // objects to re-evaluate (VisibilityPoke records)
+        bool scanDue = false;                         // the relocation timer fired or a scan was requested
+        bool scanForced = false;                      // skip the minimum-move-distance check
+        bool gobjOnly = false;                        // map change: grid visit limited to game objects
+    };
+
+    ViewWork& View() { return _view; }
+    void RequestViewScan(bool forced, bool gobjOnly = false);
+    // Per visited object: decide from its slot, record the decision in `work.delta`.
+    void ViewCollect(WorldObject* target, ViewWork& work);
+    // Another object asks this player to re-evaluate it (inline when this is the running task, else a record).
+    void PokeVisibilityOf(WorldObject* object);
+    // A unit this player sees through (shared vision) moved: a full scan is requested.
+    void PokeViewScan(WorldObject* from);
+    void ApplyVisibilityPoke(ObjectGuid object);
+    void ViewScan(ViewWork& work);
+    void ViewBuild(ViewWork& work, uint32 chunk);
+    void ViewCommit(ViewWork& work);
+    // Scan if due, pokes, build chunk 0, commit. Called by the pool's view phase (U2) after every object published.
+    void RunViewPhase();
+
+    // Items whose fields changed since the last view phase; their values blocks go in the owner's packet.
+    void AddChangedItem(Item* item) { _changedItems.insert(item); }
+    void RemoveChangedItem(Item* item) { _changedItems.erase(item); }
 
     uint8 m_forced_speed_changes[MAX_MOVE_TYPE];
 
@@ -2584,7 +2625,7 @@ public:
     void StartTimedAchievement(AchievementCriteriaTimedTypes type, uint32 entry, uint32 timeLost = 0);
     void RemoveTimedAchievement(AchievementCriteriaTimedTypes type, uint32 entry);
     void CompletedAchievement(AchievementEntry const* entry);
-    [[nodiscard]] AchievementMgr* GetAchievementMgr() const { return m_achievementMgr; }
+    [[nodiscard]] AchievementMgr* GetAchievementMgr() const { ASSERT_OWNED(this); return m_achievementMgr; }
 
     void SetCreationTime(Seconds creationTime) { m_creationTime = creationTime; }
     [[nodiscard]] Seconds GetCreationTime() const { return m_creationTime; }
@@ -2596,9 +2637,14 @@ public:
 
     //bool isActiveObject() const { return true; }
     bool CanSeeSpellClickOn(Creature const* creature) const;
+    // Overloads taking the npc flags the caller already holds (a viewer's update build reads them from the
+    // creature's slot, step 13); the plain forms read the live field.
+    bool CanSeeSpellClickOn(Creature const* creature, NPCFlags npcFlags) const;
     [[nodiscard]] bool CanSeeObjectByVisibilityConditions(WorldObject const* object) const;
     [[nodiscard]] bool CanSeeVendor(Creature const* creature) const;
+    [[nodiscard]] bool CanSeeVendor(Creature const* creature, NPCFlags npcFlags) const;
     [[nodiscard]] bool CanSeeTrainer(Creature const* creature) const;
+    [[nodiscard]] bool CanSeeTrainer(Creature const* creature, NPCFlags npcFlags) const;
 
 private:
     [[nodiscard]] bool AnyVendorOptionAvailable(uint32 menuId, Creature const* creature) const;
@@ -3075,6 +3121,9 @@ private:
     WorldLocation _corpseLocation;
 
     Optional<float> _farSightDistance = { };
+
+    ViewWork _view;
+    std::unordered_set<Item*> _changedItems;
 
     bool _wasOutdoor;
 

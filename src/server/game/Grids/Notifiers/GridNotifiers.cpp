@@ -27,66 +27,33 @@ using namespace Acore;
 void VisibleNotifier::Visit(GameObjectMapType& m)
 {
     for (GameObjectMapType::iterator iter = m.begin(); iter != m.end(); ++iter)
-    {
-        GameObject* go = iter->GetSource();
-        i_player.UpdateVisibilityOf(go, i_data, i_visibleNow);
-    }
+        i_player.ViewCollect(iter->GetSource(), i_work);
 }
 
-void VisibleNotifier::SendToSelf()
+void VisibleNotifier::CollectRest()
 {
-    // Update far visible objects
+    // Zone-wide visible objects
     ZoneWideVisibleWorldObjectsSet const* zoneWideVisibleObjects = i_player.GetMap()->GetZoneWideVisibleWorldObjectsForZone(i_player.GetZoneId());
     if (zoneWideVisibleObjects)
-    {
         for (WorldObject* obj : *zoneWideVisibleObjects)
-        {
-            switch (obj->GetTypeId())
-            {
-                case TYPEID_GAMEOBJECT:
-                    i_player.UpdateVisibilityOf(obj->ToGameObject(), i_data, i_visibleNow);
-                    break;
-                case TYPEID_UNIT:
-                    i_player.UpdateVisibilityOf(obj->ToCreature(), i_data, i_visibleNow);
-                    break;
-                case TYPEID_DYNAMICOBJECT:
-                    i_player.UpdateVisibilityOf(obj->ToDynObject(), i_data, i_visibleNow);
-                    break;
-                default:
-                    break;
-            }
-        }
-    }
+            if (obj->IsGameObject() || obj->IsCreature() || obj->IsDynamicObject())
+                i_player.ViewCollect(obj, i_work);
 
-    VisibleWorldObjectsMap* visibleWorldObjects = i_player.GetObjectVisibilityContainer().GetVisibleWorldObjectsMap();
-    for (VisibleWorldObjectsMap::iterator itr = visibleWorldObjects->begin(); itr != visibleWorldObjects->end();)
+    // What the client has and the scan did not reach: out of range, or no longer seeable (slot read).
+    for (auto const& [guid, obj] : *i_player.GetObjectVisibilityContainer().GetVisibleWorldObjectsMap())
     {
-        WorldObject* obj = itr->second;
-        if (!i_player.IsWorldObjectOutOfSightRange(obj)
-            || i_player.CanSeeOrDetect(obj, false, true))
-        {
-            ++itr;
+        if (i_work.seen.count(guid))
             continue;
-        }
 
-        i_data.AddOutOfRangeGUID(obj->GetGUID());
+        if (!i_player.IsWorldObjectOutOfSightRange(obj) || i_player.CanSeeOrDetect(obj->ReadSlot(), obj, false, true))
+            continue;
 
+        i_work.delta.left.push_back(obj);
+
+        // The other player re-evaluates us on its side.
         if (Player* objPlayer = obj->ToPlayer())
-            objPlayer->UpdateVisibilityOf(&i_player);
-
-        // Clean up references
-        itr = i_player.GetObjectVisibilityContainer().UnlinkVisibilityFromPlayer(obj, itr);
+            objPlayer->PokeVisibilityOf(&i_player);
     }
-
-    if (!i_data.HasData())
-        return;
-
-    WorldPacket packet;
-    i_data.BuildPacket(packet);
-    i_player.SendDirectMessage(&packet);
-
-    for (std::vector<Unit*>::const_iterator it = i_visibleNow.begin(); it != i_visibleNow.end(); ++it)
-        i_player.GetInitialVisiblePackets(*it);
 }
 
 void VisibleChangesNotifier::Visit(PlayerMapType& m)
@@ -96,12 +63,12 @@ void VisibleChangesNotifier::Visit(PlayerMapType& m)
         if (iter->GetSource() == &i_object)
             continue;
 
-        iter->GetSource()->UpdateVisibilityOf(&i_object);
+        iter->GetSource()->PokeVisibilityOf(&i_object);
 
         if (iter->GetSource()->HasSharedVision())
             for (SharedVisionList::const_iterator i = iter->GetSource()->GetSharedVisionList().begin(); i != iter->GetSource()->GetSharedVisionList().end(); ++i)
                 if ((*i)->m_seer == iter->GetSource())
-                    (*i)->UpdateVisibilityOf(&i_object);
+                    (*i)->PokeVisibilityOf(&i_object);
     }
 }
 
@@ -111,7 +78,7 @@ void VisibleChangesNotifier::Visit(CreatureMapType& m)
         if (iter->GetSource()->HasSharedVision())
             for (SharedVisionList::const_iterator i = iter->GetSource()->GetSharedVisionList().begin(); i != iter->GetSource()->GetSharedVisionList().end(); ++i)
                 if ((*i)->m_seer == iter->GetSource())
-                    (*i)->UpdateVisibilityOf(&i_object);
+                    (*i)->PokeVisibilityOf(&i_object);
 }
 
 void VisibleChangesNotifier::Visit(DynamicObjectMapType& m)
@@ -121,7 +88,7 @@ void VisibleChangesNotifier::Visit(DynamicObjectMapType& m)
             if (Unit* caster = iter->GetSource()->GetCaster())
                 if (Player* player = caster->ToPlayer())
                     if (player->m_seer == iter->GetSource())
-                        player->UpdateVisibilityOf(&i_object);
+                        player->PokeVisibilityOf(&i_object);
 }
 
 inline void CreatureUnitRelocationWorker(Creature* c, Unit* u)
@@ -149,20 +116,19 @@ void PlayerRelocationNotifier::Visit(PlayerMapType& m)
     for (PlayerMapType::iterator iter = m.begin(); iter != m.end(); ++iter)
     {
         Player* player = iter->GetSource();
-        i_player.UpdateVisibilityOf(player, i_data, i_visibleNow);
-        player->UpdateVisibilityOf(&i_player); // this notifier with different Visit(PlayerMapType&) than VisibleNotifier is needed to update visibility of self for other players when we move (eg. stealth detection changes)
+        i_player.ViewCollect(player, i_work);
+        // The other player re-evaluates us when we move (stealth detection changes with distance).
+        player->PokeVisibilityOf(&i_player);
     }
 }
 
 void CreatureRelocationNotifier::Visit(PlayerMapType& m)
 {
+    // Step 10: only the AI half. A creature that moved into a player's range is picked up by the player's
+    // own scan at its next interval; the creature writes no player.
     for (PlayerMapType::iterator iter = m.begin(); iter != m.end(); ++iter)
     {
         Player* player = iter->GetSource();
-
-        // NOTIFY_VISIBILITY_CHANGED does not guarantee that player will do it himself (because distance is also checked), but screw it, it's not that important
-        if (!player->m_seer->isNeedNotify(NOTIFY_VISIBILITY_CHANGED))
-            player->UpdateVisibilityOf(&i_creature);
 
         // NOTIFY_AI_RELOCATION does not guarantee that player will do it himself (because distance is also checked), but screw it, it's not that important
         if (!player->m_seer->isNeedNotify(NOTIFY_AI_RELOCATION) && !i_creature.IsMoveInLineOfSightStrictlyDisabled())

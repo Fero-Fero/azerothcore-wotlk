@@ -16,6 +16,7 @@
  */
 
 #include "PoolMgr.h"
+#include "BeatContext.h"
 #include "Containers.h"
 #include "Log.h"
 #include "MapMgr.h"
@@ -1166,6 +1167,7 @@ void PoolMgr::SpawnPool<Quest>(SpawnedPoolData& spawnedPoolData, uint32 pool_id,
 
 void PoolMgr::SpawnPool(SpawnedPoolData& spawnedPoolData, uint32 pool_id)
 {
+    ASSERT_NOT_IN_BEAT();
     SpawnPool<Pool>(spawnedPoolData, pool_id, 0);
     SpawnPool<GameObject>(spawnedPoolData, pool_id, 0);
     SpawnPool<Creature>(spawnedPoolData, pool_id, 0);
@@ -1174,6 +1176,7 @@ void PoolMgr::SpawnPool(SpawnedPoolData& spawnedPoolData, uint32 pool_id)
 // Call to despawn a pool, all gameobjects/creatures in this pool are removed
 void PoolMgr::DespawnPool(SpawnedPoolData& spawnedPoolData, uint32 pool_id)
 {
+    ASSERT_NOT_IN_BEAT();
     {
         auto it = mPoolCreatureGroups.find(pool_id);
         if (it != mPoolCreatureGroups.end() && !it->second.IsEmpty())
@@ -1248,6 +1251,7 @@ bool PoolMgr::CheckPool(uint32 pool_id) const
 template<typename T>
 void PoolMgr::UpdatePool(SpawnedPoolData& spawnedPoolData, uint32 pool_id, uint32 db_guid_or_pool_id)
 {
+    ASSERT_NOT_IN_BEAT();
     if (uint32 motherpoolid = IsPartOfAPool<Pool>(pool_id))
         SpawnPool<Pool>(spawnedPoolData, motherpoolid, pool_id);
     else

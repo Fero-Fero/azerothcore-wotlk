@@ -29,8 +29,8 @@
 #include "GridRefMgr.h"
 #include "Timer.h"
 #include "MapCollisionData.h"
+#include "MapDefer.h"
 #include "MapGridManager.h"
-#include "MapPhaseTiming.h"
 #include "MapRefMgr.h"
 #include "ObjectDefines.h"
 #include "ObjectGuid.h"
@@ -170,6 +170,7 @@ class Map : public GridRefMgr<MapGridType>
 {
     friend class MapReference;
     friend class GridObjectLoader;
+    friend class BeatPool;
 public:
     Map(uint32 id, uint32 InstanceId, uint8 SpawnMode, Map* _parent = nullptr);
     ~Map() override;
@@ -197,11 +198,27 @@ public:
 
     void MarkNearbyCellsOf(WorldObject* obj);
 
-    virtual void Update(const uint32, const uint32, bool thread = true);
+    // Step 12: the beat loop (BeatPool) runs the unit tasks; the map only seals. SealApply is phase S1b
+    // (scripts, move lists, map-local defers, newcomers, transports, remove list); BeatEpilogue is the
+    // per-beat map housekeeping that used to tail Map::Update (dynamic tree, events, respawns, weather, ...).
+    void SealApply(uint32 diff);
+    virtual void BeatEpilogue(uint32 diff);
 
     // Step 07 §11: a hit whose spell is in the Deferred table (duel, summon player, teleport, ...) lands at the
     // end of this map's update with no task running, so both units are live. Step 09's defer buffer takes over.
     void DeferSpellHit(DeferredSpellHitRecord const& hit);
+
+    // Step 09: append a write that must not run inside a unit task. Applied at the end of Map::Update.
+    template <typename T>
+    void AppendDefer(DeferKind kind, T const& payload)
+    {
+        _defers.Append(this, kind, payload);
+    }
+
+    // Per-map kinds at the map's seal (S1b), global kinds in S2 after every map sealed. Returns the number of
+    // global defers applied.
+    void ApplyDefers();
+    uint32 ApplyGlobalDefers();
 
     [[nodiscard]] float GetVisibilityRange() const { return m_VisibleDistance; }
     void SetVisibilityRange(float range) { m_VisibleDistance = range; }
@@ -240,10 +257,6 @@ public:
     [[nodiscard]] uint32 GetId() const { return i_mapEntry->MapID; }
 
     [[nodiscard]] Map const* GetParent() const { return m_parentMap; }
-
-    // pussywizard:
-    std::unordered_set<Unit*> i_objectsForDelayedVisibility;
-    void HandleDelayedVisibility();
 
     // some calls like isInWater should not use vmaps due to processor power
     // can return INVALID_HEIGHT if under z+2 z coord not found height
@@ -408,8 +421,8 @@ public:
     bool CanReachPositionAndGetValidCoords(WorldObject const* source, float startX, float startY, float startZ, float &destX, float &destY, float &destZ, bool failOnCollision = true, bool failOnSlopes = true) const;
     bool CheckCollisionAndGetValidCoords(WorldObject const* source, float startX, float startY, float startZ, float &destX, float &destY, float &destZ, bool failOnCollision = true) const;
     void Balance() { _mapCollisionData.GetDynamicTree().balance(); }
-    void RemoveGameObjectModel(GameObjectModel const& model) { _mapCollisionData.GetDynamicTree().remove(model); }
-    void InsertGameObjectModel(GameObjectModel const& model) { _mapCollisionData.GetDynamicTree().insert(model); }
+    void InsertGameObjectModel(GameObjectModel const& model);
+    void RemoveGameObjectModel(GameObjectModel const& model);
     [[nodiscard]] bool ContainsGameObjectModel(GameObjectModel const& model) const { return _mapCollisionData.GetDynamicTree().contains(model);}
     [[nodiscard]] DynamicMapTree const& GetDynamicMapTree() const { return _mapCollisionData.GetDynamicTree(); }
     [[nodiscard]] float GetGameObjectFloor(uint32 phasemask, float x, float y, float z, float maxSearchDist = DEFAULT_HEIGHT_SEARCH) const
@@ -457,6 +470,8 @@ public:
     bool SpawnGroupDespawn(uint32 groupId, bool deleteRespawnTimes = false);
     [[nodiscard]] bool IsSpawnGroupActive(uint32 groupId) const;
     void ProcessRespawns();
+    // Step 09: sPoolMgr writes from a unit task wait for ApplyGlobalDefers.
+    void UpdatePoolDeferred(uint8 typeId, uint32 poolId, ObjectGuid::LowType spawnId);
     void ProcessCreatureRespawn(ObjectGuid::LowType spawnId);
     void ProcessGameObjectRespawn(ObjectGuid::LowType spawnId);
 
@@ -540,16 +555,6 @@ public:
         return GetGuidSequenceGenerator<high>().Generate();
     }
 
-    void AddUpdateObject(Object* obj)
-    {
-        _updateObjects.insert(obj);
-    }
-
-    void RemoveUpdateObject(Object* obj)
-    {
-        _updateObjects.erase(obj);
-    }
-
     size_t GetUpdatableObjectsCount() const { return _updatableObjectList.size(); }
 
     virtual std::string GetDebugInfo() const;
@@ -601,8 +606,6 @@ private:
 
     void ScriptsProcess();
 
-    void SendObjectUpdates();
-
     void UpdatePlayersRedirectKickEvent(uint32 diff);
 
 protected:
@@ -652,12 +655,33 @@ private:
     template<class T>
     void DeleteFromWorld(T*);
 
-    void UpdateNonPlayerObjects(uint32 const diff);
-    // Applies last beat's records to every listed object with a non-zero writtenBy mask, before any Update.
-    // Step 12 replaces this scan with the wake rule.
-    void ApplyInboxes();
     void ApplyDeferredSpellHits();
     std::vector<std::unique_ptr<DeferredSpellHitRecord>> _deferredSpellHits;    // record type is complete in Map.cpp only
+
+    void ApplyDefer(DeferHeader const& header, uint8 const* payload);
+    WorldObject* GetWorldObjectForDefer(ObjectGuid const& guid);
+    void ApplyRelink(RelinkDefer const& rec);
+    void ApplyAddToMap(AddToMapDefer const& rec);
+    void ApplyRemoveFromMap(RemoveFromMapDefer const& rec);
+    void ApplyScriptSchedule(ScriptScheduleDefer const& rec);
+    void ApplyCellMark(CellMarkDefer const& rec);
+    void ApplyUpdateListAdd(UpdateListDefer const& rec);
+    void ApplyUpdateListRemove(UpdateListDefer const& rec);
+    void ApplyDynTreeInsert(DynTreeDefer const& rec);
+    void ApplyDynTreeRemove(DynTreeDefer const& rec);
+    void ApplyGroupEndRoll(GroupEndRollDefer const& rec);
+    void ApplyBattlegroundEvent(BattlegroundEventDefer const& rec);
+    void ApplyOutdoorPvPEvent(OutdoorPvPEventDefer const& rec);
+    void ApplyDuelEnd(DuelEndDefer const& rec);
+    void ApplyMapChange(MapChangeDefer const& rec);
+    void ApplyPoolEvent(PoolEventDefer const& rec);
+    void ApplyInstanceBind(InstanceBindDefer const& rec);
+    void ApplyGameEventAction(GameEventActionDefer const& rec);
+    void ApplySpawn(SpawnDefer const& rec);
+    void RelinkObjectNow(WorldObject* obj, Cell const& oldCell, Cell const& newCell);
+    void RemoveListedObject(WorldObject* obj);
+
+    DeferBuffer _defers;
 
     void _AddObjectToUpdateList(WorldObject* obj);
     void _RemoveObjectFromUpdateList(WorldObject* obj);
@@ -715,18 +739,19 @@ private:
     std::unordered_map<ObjectGuid, Corpse*> _corpsesByPlayer;
     std::unordered_set<Corpse*> _corpseBones;
 
-    std::unordered_set<Object*> _updateObjects;
-
     UpdatableObjectList _updatableObjectList;
     PendingAddUpdatableObjectList _pendingAddUpdatableObjectList;
-    IntervalTimer _updatableObjectListRecheckTimer;
     ZoneWideVisibleWorldObjectsMap _zoneWideVisibleWorldObjectsMap;
 
     TimeTrackerSmall _redirectKickTimer;
     TimeTrackerSmall _lastAnnounceRedirectKickTimer;
 
-    MapPhaseTiming _phaseTiming;
+    // Step 12: the pool scheduled this map's players and updatable list once (first beat the map took part in).
+    bool _beatSeeded{false};
 };
+
+// Declared before any use so the Transport path is never implicitly instantiated from the generic body.
+template<> void Map::RemoveFromMap(Transport*, bool);
 
 enum InstanceResetMethod
 {
@@ -745,7 +770,7 @@ public:
     bool AddPlayerToMap(Player*) override;
     void RemovePlayerFromMap(Player*, bool) override;
     void AfterPlayerUnlinkFromMap() override;
-    void Update(const uint32, const uint32, bool thread = true) override;
+    void BeatEpilogue(uint32 diff) override;
     void CreateInstanceScript(bool load, std::string data, uint32 completedEncounterMask);
     bool Reset(uint8 method, GuidList* globalSkipList = nullptr);
     [[nodiscard]] uint32 GetScriptId() const { return i_script_id; }

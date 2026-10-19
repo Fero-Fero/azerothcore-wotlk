@@ -22,6 +22,7 @@ class Unit;
 class AuraEffect;
 class Aura;
 class SpellInfo;
+struct PeriodicLandedRecord;
 
 #include "Spell.h"
 #include "SpellAuras.h"
@@ -331,17 +332,20 @@ public:
     void HandlePreventResurrection(AuraApplication const* aurApp, uint8 mode, bool apply) const;
 
     // aura effect periodic tick handlers
-    void HandlePeriodicDummyAuraTick(Unit* target, Unit* caster) const;
-    void HandlePeriodicTriggerSpellAuraTick(Unit* target, Unit* caster) const;
-    void HandlePeriodicTriggerSpellWithValueAuraTick(Unit* target, Unit* caster) const;
-    void HandlePeriodicDamageAurasTick(Unit* target, Unit* caster) const;
-    void HandlePeriodicHealthLeechAuraTick(Unit* target, Unit* caster) const;
-    void HandlePeriodicHealthFunnelAuraTick(Unit* target, Unit* caster) const;
-    void HandlePeriodicHealAurasTick(Unit* target, Unit* caster) const;
-    void HandlePeriodicManaLeechAuraTick(Unit* target, Unit* caster) const;
-    void HandleObsModPowerAuraTick(Unit* target, Unit* caster) const;
-    void HandlePeriodicEnergizeAuraTick(Unit* target, Unit* caster) const;
-    void HandlePeriodicPowerBurnAuraTick(Unit* target, Unit* caster) const;
+    // Step 08 §2: `caster` is a read handle. `fb` is non-null when the caster is outside the ticking task group;
+    // then every caster write goes into it (applied by Unit::ApplyPeriodicLanded) instead of through the handle.
+    void HandlePeriodicDummyAuraTick(Unit* target, Unit* caster, PeriodicLandedRecord* fb) const;
+    void HandlePeriodicTriggerSpellAuraTick(Unit* target, Unit* caster, PeriodicLandedRecord* fb) const;
+    void HandlePeriodicTriggerSpellWithValueAuraTick(Unit* target, Unit* caster, PeriodicLandedRecord* fb) const;
+    void HandlePeriodicDamageAurasTick(Unit* target, Unit* caster, PeriodicLandedRecord* fb) const;
+    void HandlePeriodicHealthLeechAuraTick(Unit* target, Unit* caster, PeriodicLandedRecord* fb) const;
+    void HandlePeriodicHealthFunnelAuraTick(Unit* target, Unit* caster, PeriodicLandedRecord* fb) const;
+    void HandlePeriodicHealAurasTick(Unit* target, Unit* caster, PeriodicLandedRecord* fb) const;
+    void HandlePeriodicManaLeechAuraTick(Unit* target, Unit* caster, PeriodicLandedRecord* fb) const;
+    void HandleObsModPowerAuraTick(Unit* target, Unit* caster, PeriodicLandedRecord* fb) const;
+    void HandlePeriodicEnergizeAuraTick(Unit* target, Unit* caster, PeriodicLandedRecord* fb) const;
+    void HandlePeriodicPowerBurnAuraTick(Unit* target, Unit* caster, PeriodicLandedRecord* fb) const;
+    void TriggerPeriodicSpell(Unit* target, Unit* caster, PeriodicLandedRecord* fb, SpellInfo const* triggeredSpellInfo, TriggerCastFlags triggerFlags, bool hasBp0, int32 bp0) const;
 
     // aura effect proc handlers
     void HandleBreakableCCAuraProc(AuraApplication* aurApp, ProcEventInfo& eventInfo);

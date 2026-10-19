@@ -201,18 +201,6 @@ void MotionTransport::CleanupsBeforeDelete(bool finalCleanup /*= true*/)
     GameObject::CleanupsBeforeDelete(finalCleanup);
 }
 
-void MotionTransport::BuildUpdate(UpdateDataMapType& data_map)
-{
-    Map::PlayerList const& players = GetMap()->GetPlayers();
-    if (players.IsEmpty())
-        return;
-
-    for (Map::PlayerList::const_iterator itr = players.begin(); itr != players.end(); ++itr)
-        BuildFieldsUpdate(itr->GetSource(), data_map);
-
-    ClearUpdateMask(true);
-}
-
 void MotionTransport::Update(uint32 diff)
 {
     if (_requiresFirstDepartureSync)
@@ -951,18 +939,6 @@ void StaticTransport::CleanupsBeforeDelete(bool finalCleanup /*= true*/)
     }
 
     GameObject::CleanupsBeforeDelete(finalCleanup);
-}
-
-void StaticTransport::BuildUpdate(UpdateDataMapType& data_map)
-{
-    Map::PlayerList const& players = GetMap()->GetPlayers();
-    if (players.IsEmpty())
-        return;
-
-    for (Map::PlayerList::const_iterator itr = players.begin(); itr != players.end(); ++itr)
-        BuildFieldsUpdate(itr->GetSource(), data_map);
-
-    ClearUpdateMask(true);
 }
 
 void StaticTransport::Update(uint32 diff)

@@ -29,6 +29,7 @@
 #include "AutobroadcastMgr.h"
 #include "BattlefieldMgr.h"
 #include "BattlegroundMgr.h"
+#include "BeatContext.h"
 #include "CalendarMgr.h"
 #include "Channel.h"
 #include "ChannelMgr.h"
@@ -943,6 +944,12 @@ void World::SetInitialWorldSettings()
     LOG_INFO("server.loading", " ");
     sMapMgr->Initialize();
 
+    // Step 11: from here on a synchronous query reached from a unit task is a crash in debug builds.
+    auto const syncQueryForbidden = []() { return BeatContext::InTask(); };
+    LoginDatabase.SetSyncQueryForbiddenGuard(syncQueryForbidden);
+    CharacterDatabase.SetSyncQueryForbiddenGuard(syncQueryForbidden);
+    WorldDatabase.SetSyncQueryForbiddenGuard(syncQueryForbidden);
+
     LOG_INFO("server.loading", "Starting Game Event system...");
     LOG_INFO("server.loading", " ");
     uint32 nextGameEvent = sGameEventMgr->StartSystem();
@@ -1045,17 +1052,17 @@ void World::SetInitialWorldSettings()
 
             if (mapEntry && !mapEntry->Instanceable())
             {
+                // Created here, on the loading thread: CreateBaseMap runs synchronous respawn / corpse queries.
+                Map* map = sMapMgr->CreateBaseMap(mapEntry->MapID);
+                if (!map)
+                    continue;
+
                 if (sMapMgr->GetMapUpdater()->activated())
                     sMapMgr->GetMapUpdater()->schedule_map_preload(mapEntry->MapID);
                 else
                 {
-                    Map* map = sMapMgr->CreateBaseMap(mapEntry->MapID);
-
-                    if (map)
-                    {
-                        LOG_INFO("server.loading", ">> Loading All Grids For Map {}", map->GetId());
-                        map->LoadAllGrids();
-                    }
+                    LOG_INFO("server.loading", ">> Loading All Grids For Map {}", map->GetId());
+                    map->LoadAllGrids();
                 }
             }
         }

@@ -122,7 +122,7 @@ public:
     explicit GameObject();
     ~GameObject() override;
 
-    void BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target) override;
+    void BuildValuesUpdateFrom(uint8 updateType, ByteBuffer* data, Player* target, UpdateValuesSource const& src) override;
 
     void AddToWorld() override;
     void RemoveFromWorld() override;
@@ -224,7 +224,7 @@ public:
 
     void Use(Unit* user);
 
-    [[nodiscard]] LootState getLootState() const { return m_lootState; }
+    [[nodiscard]] LootState getLootState() const { ASSERT_OWNED(this); return m_lootState; }
     // Note: unit is only used when s = GO_ACTIVATED
     void SetLootState(LootState s, Unit* unit = nullptr);
 
@@ -277,6 +277,7 @@ public:
     [[nodiscard]] bool IsNeverVisible() const override;
     bool IsAlwaysVisibleFor(WorldObject const* seer) const override;
     [[nodiscard]] bool IsInvisibleDueToDespawn() const override;
+    void FillSlot(ObjectSlot& slot) override;
 
     uint8 getLevelForTarget(WorldObject const* target) const override
     {

@@ -893,6 +893,10 @@ public:
     ObjectGuid GetCasterGUID() const;
     // returns object which casted the aura
     Unit* GetCaster() const;
+    // Step 08 §4: the caster as a read-only view. The aura ticks and procs on its owner's task; the caster may be
+    // on another one, where it is a slot read. Hooks that only read the caster (CalcAmount, periodic ticks,
+    // procs) should take this; writes to the caster belong in a record (PeriodicLanded / follow-up casts).
+    [[nodiscard]] UnitView GetCasterView() const;
     // returns gameobject which casted the aura or nullptr if not available (caster logged out for example)
     GameObject* GetGObjCaster() const;
     // returns object on which aura was casted, target for non-area auras, area aura source for area auras

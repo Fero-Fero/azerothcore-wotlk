@@ -16,6 +16,7 @@
  */
 
 #include "InstanceSaveMgr.h"
+#include "BeatContext.h"
 #include "Common.h"
 #include "Config.h"
 #include "GameTime.h"
@@ -66,6 +67,7 @@ InstanceSaveMgr* InstanceSaveMgr::instance()
 */
 InstanceSave* InstanceSaveMgr::AddInstanceSave(uint32 mapId, uint32 instanceId, Difficulty difficulty, bool startup /*=false*/)
 {
+    ASSERT_NOT_IN_BEAT();
     ASSERT(!GetInstanceSave(instanceId));
 
     MapEntry const* entry = sMapStore.LookupEntry(mapId);
@@ -253,6 +255,7 @@ void InstanceSaveMgr::SanitizeInstanceSavedData()
 
 void InstanceSaveMgr::DeleteInstanceSavedData(uint32 instanceId)
 {
+    ASSERT_NOT_IN_BEAT();
     if (instanceId)
     {
         CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DELETE_INSTANCE_SAVED_DATA);
@@ -793,6 +796,7 @@ void InstanceSaveMgr::_ResetOrWarnAll(uint32 mapid, Difficulty difficulty, bool 
 
 InstancePlayerBind* InstanceSaveMgr::PlayerBindToInstance(ObjectGuid guid, InstanceSave* save, bool permanent, Player* player /*= nullptr*/)
 {
+    ASSERT_NOT_IN_BEAT();
     bool const persistBinding = !sToCloud9Sidecar->ClusterModeEnabled() || sToCloud9Sidecar->IsMapAssigned(save->GetMapId());
     InstancePlayerBind& bind = playerBindStorage[guid]->m[save->GetDifficulty()][save->GetMapId()];
     ASSERT(!bind.perm || permanent); // ensure there's no changing permanent to temporary, this can be done only by unbinding
@@ -992,6 +996,7 @@ void InstanceSaveMgr::CopyBinds(ObjectGuid from, ObjectGuid to, Player* toPlr)
 
 void InstanceSaveMgr::UnbindAllFor(InstanceSave* save)
 {
+    ASSERT_NOT_IN_BEAT();
     uint32 mapId = save->GetMapId();
     Difficulty difficulty = save->GetDifficulty();
     GuidList players = save->m_playerList;

@@ -69,7 +69,8 @@ public:
         m->GetZoneAndAreaId(phaseMask, zoneid, areaid, x, y, z);
     }
 
-    void Initialize(void); // also inits sRecordLogs (one log per core on this step)
+    void Initialize(void); // also inits sRecordLogs and sBeatPool
+    // Step 12: accumulates diff and runs one beat (BeatPool::RunBeat) when the map update interval elapsed.
     void Update(uint32);
 
     void SetMapUpdateInterval(uint32 t)
@@ -77,9 +78,14 @@ public:
         if (t < MIN_MAP_UPDATE_DELAY)
             t = MIN_MAP_UPDATE_DELAY;
 
-        i_timer[3].SetInterval(t);
-        i_timer[3].Reset();
+        _beatInterval = t;
+        _beatAccum = 0;
     }
+
+    // Every base map, then every instance of every MapInstanced (step 12: the beat's map list).
+    void CollectAllMaps(std::vector<Map*>& out);
+    // S2: unload and free the instances whose unload timer elapsed.
+    void DestroyExpiredInstances(uint32 diff);
 
     //void LoadGrid(int mapid, int instId, float x, float y, WorldObject const* obj, bool no_unload = false);
     void UnloadAll();
@@ -170,8 +176,8 @@ private:
 
     std::mutex Lock;
     MapMapType i_maps;
-    IntervalTimer i_timer[4]; // continents, bgs/arenas, instances, total from the beginning
-    uint8 mapUpdateStep;
+    uint32 _beatInterval{MIN_MAP_UPDATE_DELAY};
+    uint32 _beatAccum{0};
 
     InstanceIds _instanceIds;
     uint32 _nextInstanceId;

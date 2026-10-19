@@ -40,25 +40,26 @@ class Player;
 
 namespace Acore
 {
+    // Step 10: the viewer's scan. Reads each visited object's slot and fills the player's ViewWork delta;
+    // writes nothing else. Create / destroy blocks, links and the packet are the commit's (Player::ViewCommit).
     struct VisibleNotifier
     {
         Player& i_player;
-        std::vector<Unit*>& i_visibleNow;
+        Player::ViewWork& i_work;
         bool i_gobjOnly;
-        UpdateData i_data;
 
-        VisibleNotifier(Player& player, bool gobjOnly) :
-            i_player(player), i_visibleNow(player.m_newVisible), i_gobjOnly(gobjOnly)
-        {
-            i_visibleNow.clear();
-        }
+        VisibleNotifier(Player& player, Player::ViewWork& work, bool gobjOnly) :
+            i_player(player), i_work(work), i_gobjOnly(gobjOnly) { }
 
         void Visit(GameObjectMapType&);
         template<class T> void Visit(std::vector<T>& m);
         template<class T> void Visit(GridRefMgr<T>& m);
-        void SendToSelf(void);
+        // Zone-wide objects and the sweep over what is at the client but now out of range.
+        void CollectRest();
     };
 
+    // An object whose visibility inputs changed asks nearby viewers to re-evaluate it (a VisibilityPoke record
+    // to a foreign viewer; inline when the viewer is the running task).
     struct VisibleChangesNotifier
     {
         WorldObject& i_object;
@@ -70,9 +71,11 @@ namespace Acore
         void Visit(DynamicObjectMapType&);
     };
 
+    // The timer-driven scan: VisibleNotifier plus a poke to every visited player so they re-evaluate the
+    // mover (stealth / detection changes with distance).
     struct PlayerRelocationNotifier : public VisibleNotifier
     {
-        PlayerRelocationNotifier(Player& player): VisibleNotifier(player, false) { }
+        PlayerRelocationNotifier(Player& player, Player::ViewWork& work) : VisibleNotifier(player, work, false) { }
 
         template<class T> void Visit(std::vector<T>& m) { VisibleNotifier::Visit(m); }
         template<class T> void Visit(GridRefMgr<T>& m) { VisibleNotifier::Visit(m); }

@@ -17,6 +17,7 @@
 
 #include "Creature.h"
 #include "BattlegroundMgr.h"
+#include "BeatContext.h"
 #include "CellImpl.h"
 #include "Common.h"
 #include "CreatureAI.h"
@@ -756,7 +757,17 @@ void Creature::Update(uint32 diff)
                 {
                     Group* group = sGroupMgr->GetGroupByGUID(lootingGroupLowGUID);
                     if (group)
-                        group->EndRoll(&loot);
+                    {
+                        if (BeatContext::InTask())
+                        {
+                            GroupEndRollDefer rec;
+                            rec.groupGuid = group->GetGUID();
+                            rec.corpseGuid = GetGUID();
+                            GetMap()->AppendDefer(DeferKind::GroupEndRoll, rec);
+                        }
+                        else
+                            group->EndRoll(&loot);
+                    }
                     m_groupLootTimer = 0;
                     lootingGroupLowGUID = 0;
                 }
@@ -2134,7 +2145,7 @@ void Creature::Respawn(bool force)
 
                 uint32 poolid = m_spawnId ? sPoolMgr->IsPartOfAPool<Creature>(m_spawnId) : 0;
                 if (poolid)
-                    sPoolMgr->UpdatePool<Creature>(GetMap()->GetPoolData(), poolid, m_spawnId);
+                    GetMap()->UpdatePoolDeferred(TYPEID_UNIT, poolid, m_spawnId);
 
                 //Re-initialize reactstate that could be altered by movementgenerators
                 InitializeReactState();

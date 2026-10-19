@@ -20,6 +20,7 @@
 #include "CellImpl.h"
 #include "Channel.h"
 #include "ChannelMgr.h"
+#include "DynamicVisibility.h"
 #include "Formulas.h"
 #include "GameTime.h"
 #include "GridNotifiers.h"
@@ -27,6 +28,7 @@
 #include "Guild.h"
 #include "InstanceScript.h"
 #include "Language.h"
+#include "ObjectAccessor.h"
 #include "OutdoorPvPMgr.h"
 #include "Pet.h"
 #include "Player.h"
@@ -34,6 +36,8 @@
 #include "SkillDiscovery.h"
 #include "SpellAuraEffects.h"
 #include "SpellMgr.h"
+#include "Transport.h"
+#include "UnitRecordLog.h"
 #include "UpdateFieldFlags.h"
 #include "Vehicle.h"
 #include "Weather.h"
@@ -1614,18 +1618,6 @@ void Player::UpdatePotionCooldown(Spell* spell)
     SetLastPotionId(0);
 }
 
-template void Player::UpdateVisibilityOf(Player* target, UpdateData& data,
-                                         std::vector<Unit*>& visibleNow);
-template void Player::UpdateVisibilityOf(Creature* target, UpdateData& data,
-                                         std::vector<Unit*>& visibleNow);
-template void Player::UpdateVisibilityOf(Corpse* target, UpdateData& data,
-                                         std::vector<Unit*>& visibleNow);
-template void Player::UpdateVisibilityOf(GameObject* target, UpdateData& data,
-                                         std::vector<Unit*>& visibleNow);
-template void Player::UpdateVisibilityOf(DynamicObject*      target,
-                                         UpdateData&         data,
-                                         std::vector<Unit*>& visibleNow);
-
 void Player::UpdateVisibilityForPlayer(bool mapChange)
 {
     // After added to map seer must be a player - there is no possibility to
@@ -1633,13 +1625,259 @@ void Player::UpdateVisibilityForPlayer(bool mapChange)
     if (mapChange && m_seer != this)
         m_seer = this;
 
-    Acore::VisibleNotifier notifier(*this, mapChange);
-    Cell::VisitObjects(GetSightPosition().GetPositionX(), GetSightPosition().GetPositionY(), GetMap(), notifier, GetSightRange());
-    Cell::VisitFarVisibleObjects(GetSightPosition().GetPositionX(), GetSightPosition().GetPositionY(), GetMap(), notifier, VISIBILITY_DISTANCE_GIGANTIC);
-    notifier.SendToSelf();
+    if (BeatContext::InTask())
+    {
+        // Lands in this beat's view phase (BeatPool U2), after every object published.
+        RequestViewScan(true, mapChange);
+    }
+    else
+    {
+        // Login / teleport, no task running: scan and commit now. Values blocks are the view phase's, so a
+        // mask published this beat is still sent exactly once.
+        _view.scanForced = true;
+        _view.gobjOnly = mapChange;
+        ViewScan(_view);
+        ViewCommit(_view);
+        _view.scanDue = _view.scanForced = _view.gobjOnly = false;
+    }
 
     if (mapChange)
         m_last_notify_position.Relocate(-5000.0f, -5000.0f, -5000.0f, 0.0f);
+}
+
+void Player::RequestViewScan(bool forced, bool gobjOnly)
+{
+    // A full scan already pending is never narrowed to game objects.
+    _view.gobjOnly = _view.scanDue ? (_view.gobjOnly && gobjOnly) : gobjOnly;
+    _view.scanDue = true;
+    _view.scanForced |= forced;
+}
+
+void Player::PokeVisibilityOf(WorldObject* object)
+{
+    if (IsForeignToTask())
+    {
+        VisibilityPokeRecord record;
+        record.object = object->GetGUID();
+        sRecordLogs->Append(object->GetGUID(), this, RecordKind::VisibilityPoke, record);
+        return;
+    }
+
+    _view.pokes.push_back(object->GetGUID());
+}
+
+void Player::PokeViewScan(WorldObject* from)
+{
+    if (IsForeignToTask())
+    {
+        VisibilityPokeRecord record;
+        sRecordLogs->Append(from->GetGUID(), this, RecordKind::VisibilityPoke, record);
+        return;
+    }
+
+    RequestViewScan(false);
+}
+
+void Player::ApplyVisibilityPoke(ObjectGuid object)
+{
+    if (object)
+        _view.pokes.push_back(object);
+    else
+        RequestViewScan(false);
+}
+
+void Player::ViewCollect(WorldObject* target, ViewWork& work)
+{
+    if (target == this || !target->IsInWorld())
+        return;
+
+    if (!work.seen.insert(target->GetGUID()).second)
+        return;
+
+    // Objects a viewer reaches are the ones that update (and publish).
+    GetMap()->AddObjectToPendingUpdateList(target);
+
+    bool const atClient = HaveAtClient(target);
+    bool const seeable = CanSeeOrDetect(target->ReadSlot(), target, false, true);
+    if (atClient && !seeable)
+        work.delta.left.push_back(target);
+    else if (!atClient && seeable)
+        work.delta.entered.push_back(target);
+}
+
+void Player::ViewScan(ViewWork& work)
+{
+    WorldObject* viewPoint = this;
+    if (m_seer && m_seer->IsInWorld())
+        viewPoint = m_seer;
+
+    if (viewPoint->GetMapId() != GetMapId() || !viewPoint->IsPositionValid() || !IsPositionValid())
+        return;
+
+    if (!work.scanForced)
+    {
+        if (Unit* active = viewPoint->ToUnit())
+        {
+            if (active->IsVehicle())
+                active = this;
+
+            if (!GetFarSightDistance())
+            {
+                float const distsq = active->m_last_notify_position.GetExactDistSq(active);
+                float const mindistsq = DynamicVisibilityMgr::GetReqMoveDistSq(active->FindMap()->GetEntry()->map_type);
+                if (distsq < mindistsq)
+                    return;
+
+                active->m_last_notify_position.Relocate(active->GetPositionX(), active->GetPositionY(), active->GetPositionZ());
+            }
+        }
+    }
+
+    float const x = GetSightPosition().GetPositionX();
+    float const y = GetSightPosition().GetPositionY();
+    if (work.gobjOnly)
+    {
+        Acore::VisibleNotifier notifier(*this, work, true);
+        Cell::VisitObjects(x, y, GetMap(), notifier, GetSightRange());
+        Cell::VisitFarVisibleObjects(x, y, GetMap(), notifier, VISIBILITY_DISTANCE_GIGANTIC);
+        notifier.CollectRest();
+    }
+    else
+    {
+        Acore::PlayerRelocationNotifier notifier(*this, work);
+        Cell::VisitObjects(x, y, GetMap(), notifier, GetSightRange());
+        Cell::VisitFarVisibleObjects(x, y, GetMap(), notifier, VISIBILITY_DISTANCE_GIGANTIC);
+        notifier.CollectRest();
+    }
+
+    AddToNotify(NOTIFY_AI_RELOCATION);
+}
+
+void Player::ViewBuild(ViewWork& work, uint32 chunk)
+{
+    if (work.chunkData.size() <= chunk)
+        work.chunkData.resize(chunk + 1);
+    UpdateData& data = work.chunkData[chunk];
+
+    // Chunk 0: self, items and transports. Other chunks (step 14) take a bucket range of the visible map.
+    if (chunk == 0)
+    {
+        ObjectSlot const& own = ReadSlot();
+        if (own.beat == work.slotBeat && own.AnyChange())
+            BuildValuesUpdateFromSlot(own, &data, this);
+
+        for (Item* item : _changedItems)
+        {
+            item->BuildValuesUpdateBlockForPlayer(&data, this);
+            item->ClearUpdateMask(false);
+        }
+        _changedItems.clear();
+
+        for (Transport* transport : GetMap()->GetAllTransports())
+        {
+            if (!transport->IsInWorld() || GetObjectVisibilityContainer().GetVisibleWorldObjectsMap()->count(transport->GetGUID()))
+                continue;
+
+            ObjectSlot const& s = transport->ReadSlot();
+            if (s.beat != work.slotBeat || !s.AnyChange())
+                continue;
+
+            // Motion transports are always at the client; a static one only when in range and seeable.
+            if (!transport->IsMotionTransport() && (IsWorldObjectOutOfSightRange(transport) || !CanSeeOrDetect(s, transport, false, false)))
+                continue;
+
+            transport->BuildValuesUpdateFromSlot(s, &data, this);
+        }
+    }
+
+    VisibleWorldObjectsMap const& visible = *GetObjectVisibilityContainer().GetVisibleWorldObjectsMap();
+    uint32 const buckets = visible.bucket_count();
+    uint32 const from = buckets * chunk / work.chunkCount;
+    uint32 const to = buckets * (chunk + 1) / work.chunkCount;
+    for (uint32 b = from; b < to; ++b)
+    {
+        for (auto it = visible.begin(b); it != visible.end(b); ++it)
+        {
+            WorldObject* obj = it->second;
+            ObjectSlot const& s = obj->ReadSlot();
+            if (s.beat == work.slotBeat && s.AnyChange())
+                obj->BuildValuesUpdateFromSlot(s, &data, this);
+        }
+    }
+
+    work.chunksDone.fetch_add(1, std::memory_order_release);
+}
+
+void Player::ViewCommit(ViewWork& work)
+{
+    if (work.chunkData.empty())
+        work.chunkData.resize(1);
+    UpdateData& data = work.chunkData[0];
+
+    for (WorldObject* obj : work.delta.left)
+    {
+        if (Creature* creature = obj->ToCreature())
+            if (GetPetGUID() == creature->GetGUID() && creature->IsPet())
+                ((Pet*)creature)->Remove(PET_SAVE_NOT_IN_SLOT, true);
+
+        obj->BuildOutOfRangeUpdateBlock(&data);
+        GetObjectVisibilityContainer().UnlinkWorldObjectVisibility(obj);
+    }
+
+    for (WorldObject* obj : work.delta.entered)
+    {
+        obj->BuildCreateUpdateBlockFromSlot(obj->ReadSlot(), &data, this);
+        GetObjectVisibilityContainer().LinkWorldObjectVisibility(obj);
+    }
+
+    for (uint32 chunk = 1; chunk < work.chunkData.size(); ++chunk)
+    {
+        data.AddUpdateBlock(work.chunkData[chunk]);
+        work.chunkData[chunk].Clear();
+    }
+
+    if (data.HasData())
+    {
+        if (sScriptMgr->CanSendObjectUpdatesToPlayer(GetMap(), this))
+        {
+            WorldPacket packet;
+            data.BuildPacket(packet);
+            SendDirectMessage(&packet);
+        }
+        data.Clear();
+    }
+
+    // Auras and attack state of units that just appeared, after their create block.
+    for (WorldObject* obj : work.delta.entered)
+        if (Unit* unit = obj->ToUnit())
+            GetInitialVisiblePackets(unit);
+
+    work.delta.left.clear();
+    work.delta.entered.clear();
+    work.seen.clear();
+    work.chunksDone.store(0, std::memory_order_relaxed);
+}
+
+void Player::RunViewPhase()
+{
+    if (!IsInWorld())
+        return;
+
+    ViewWork& work = _view;
+    work.slotBeat = BeatContext::beat.load(std::memory_order_relaxed);
+
+    if (work.scanDue)
+        ViewScan(work);
+
+    // Re-evaluate what asked for it (a scan that reached the object already decided; ViewCollect dedups).
+    for (ObjectGuid guid : work.pokes)
+        if (WorldObject* obj = ObjectAccessor::GetWorldObject(*this, guid))
+            ViewCollect(obj, work);
+    work.pokes.clear();
+    work.scanDue = work.scanForced = work.gobjOnly = false;
+
+    ViewBuild(work, 0);
+    ViewCommit(work);
 }
 
 void Player::UpdateObjectVisibility(bool forced, bool fromUpdate)
@@ -1662,74 +1900,6 @@ void Player::UpdateObjectVisibility(bool forced, bool fromUpdate)
     }
 }
 
-template <class T>
-inline void UpdateVisibilityOf_helper(Player* player, T* target,
-                                      std::vector<Unit*>& /*v*/)
-{
-    player->GetObjectVisibilityContainer().LinkWorldObjectVisibility(target);
-}
-
-template <>
-inline void UpdateVisibilityOf_helper(Player* player, GameObject* target,
-                                      std::vector<Unit*>& /*v*/)
-{
-    player->GetObjectVisibilityContainer().LinkWorldObjectVisibility(target);
-}
-
-template <>
-inline void UpdateVisibilityOf_helper(Player* player, Creature* target,
-                                      std::vector<Unit*>& v)
-{
-    player->GetObjectVisibilityContainer().LinkWorldObjectVisibility(target);
-    v.push_back(target);
-}
-
-template <>
-inline void UpdateVisibilityOf_helper(Player* player, Player* target,
-                                      std::vector<Unit*>& v)
-{
-    player->GetObjectVisibilityContainer().LinkWorldObjectVisibility(target);
-    v.push_back(target);
-}
-
-template <class T>
-inline void BeforeVisibilityDestroy(T* /*t*/, Player* /*p*/)
-{
-}
-
-template <>
-inline void BeforeVisibilityDestroy<Creature>(Creature* t, Player* p)
-{
-    if (p->GetPetGUID() == t->GetGUID() && t->IsPet())
-        ((Pet*) t)->Remove(PET_SAVE_NOT_IN_SLOT, true);
-}
-
-template <class T>
-void Player::UpdateVisibilityOf(T* target, UpdateData& data,
-                                std::vector<Unit*>& visibleNow)
-{
-    GetMap()->AddObjectToPendingUpdateList(target);
-
-    if (HaveAtClient(target))
-    {
-        if (!CanSeeOrDetect(target, false, true))
-        {
-            BeforeVisibilityDestroy<T>(target, this);
-
-            target->BuildOutOfRangeUpdateBlock(&data);
-            GetObjectVisibilityContainer().UnlinkWorldObjectVisibility(target);
-        }
-    }
-    else
-    {
-        if (CanSeeOrDetect(target, false, true))
-        {
-            target->BuildCreateUpdateBlockForPlayer(&data, this);
-            UpdateVisibilityOf_helper(this, target, visibleNow);
-        }
-    }
-}
-
 void Player::GetInitialVisiblePackets(Unit* target)
 {
     GetAurasForTarget(target);
@@ -1743,31 +1913,16 @@ void Player::GetInitialVisiblePackets(Unit* target)
 
 void Player::UpdateVisibilityOf(WorldObject* target)
 {
-    if (HaveAtClient(target))
+    // In a task the decision waits for the view phase; outside one (viewpoint set at login, scripts) it is
+    // taken and sent now.
+    if (BeatContext::InTask())
     {
-        if (!CanSeeOrDetect(target, false, true))
-        {
-            if (target->IsCreature())
-                BeforeVisibilityDestroy<Creature>(target->ToCreature(), this);
-
-            target->DestroyForPlayer(this);
-            GetObjectVisibilityContainer().UnlinkWorldObjectVisibility(target);
-        }
+        PokeVisibilityOf(target);
+        return;
     }
-    else
-    {
-        if (CanSeeOrDetect(target, false, true))
-        {
-            target->SendUpdateToPlayer(this);
-            GetObjectVisibilityContainer().LinkWorldObjectVisibility(target);
 
-            // target aura duration for caster show only if target exist at
-            // caster client send data at target visibility change (adding to
-            // client)
-            if (target->IsUnit())
-                GetInitialVisiblePackets((Unit*) target);
-        }
-    }
+    ViewCollect(target, _view);
+    ViewCommit(_view);
 }
 
 void Player::UpdateTriggerVisibility()
@@ -1778,22 +1933,26 @@ void Player::UpdateTriggerVisibility()
     if (GetObjectVisibilityContainer().GetVisibleWorldObjectsMap()->empty())
         return;
 
+    // Step 13: the objects are foreign; read their slots and force the public fields through the build's
+    // notifyFlags instead of writing their notify flags.
     UpdateData udata;
     DoForAllVisibleWorldObjects([this, &udata](WorldObject* worldObject)
     {
         if (worldObject->IsCreature())
         {
             Creature* creature = worldObject->ToCreature();
-            // Update fields of triggers, transformed units or unselectable
-            // units (values dependent on GM state)
-            if (!creature || (!creature->IsTrigger() &&
-                !creature->HasTransformAura() &&
-                !creature->HasUnitFlag(UNIT_FLAG_NOT_SELECTABLE)))
+            if (!creature)
                 return;
 
-            creature->SetFieldNotifyFlag(UF_FLAG_PUBLIC);
-            creature->BuildValuesUpdateBlockForPlayer(&udata, this);
-            creature->RemoveFieldNotifyFlag(UF_FLAG_PUBLIC);
+            // Update fields of triggers, transformed units or unselectable
+            // units (values dependent on GM state)
+            ObjectSlot const& s = creature->ReadSlot();
+            SlotReader const reader(s);
+            if (!creature->IsTrigger() && !reader.HasAuraType(SPELL_AURA_TRANSFORM) &&
+                !reader.Flag(UNIT_FIELD_FLAGS, UNIT_FLAG_NOT_SELECTABLE))
+                return;
+
+            creature->BuildValuesUpdateFromSlot(s, &udata, this, UF_FLAG_PUBLIC);
         }
         else if (worldObject->IsGameObject())
         {
@@ -1801,9 +1960,7 @@ void Player::UpdateTriggerVisibility()
             if (!go)
                 return;
 
-            go->SetFieldNotifyFlag(UF_FLAG_PUBLIC);
-            go->BuildValuesUpdateBlockForPlayer(&udata, this);
-            go->RemoveFieldNotifyFlag(UF_FLAG_PUBLIC);
+            go->BuildValuesUpdateFromSlot(go->ReadSlot(), &udata, this, UF_FLAG_PUBLIC);
         }
     });
 
@@ -1820,13 +1977,14 @@ void Player::UpdateForQuestWorldObjects()
     if (GetObjectVisibilityContainer().GetVisibleWorldObjectsMap()->empty())
         return;
 
+    // Step 13: foreign objects are read through their slots.
     UpdateData udata;
     DoForAllVisibleWorldObjects([this, &udata](WorldObject* worldObject)
     {
         if (worldObject->IsGameObject())
         {
             if (GameObject* obj = worldObject->ToGameObject())
-                obj->BuildValuesUpdateBlockForPlayer(&udata, this);
+                obj->BuildValuesUpdateFromSlot(obj->ReadSlot(), &udata, this);
         }
         else if (worldObject->IsCreature())
         {
@@ -1834,8 +1992,11 @@ void Player::UpdateForQuestWorldObjects()
             if (!obj)
                 return;
 
+            ObjectSlot const& s = obj->ReadSlot();
+            NPCFlags const npcFlags = NPCFlags(s.values[UNIT_NPC_FLAGS]);
+
             // check if this unit requires quest specific flags
-            if (obj->HasNpcFlag(UNIT_NPC_FLAG_SPELLCLICK))
+            if (npcFlags & UNIT_NPC_FLAG_SPELLCLICK)
             {
                 SpellClickInfoMapBounds clickPair = sObjectMgr->GetSpellClickInfoMapBounds(obj->GetEntry());
                 for (SpellClickInfoContainer::const_iterator _itr = clickPair.first; _itr != clickPair.second; ++_itr)
@@ -1850,13 +2011,13 @@ void Player::UpdateForQuestWorldObjects()
 
                     if (buildUpdateBlock)
                     {
-                        obj->BuildValuesUpdateBlockForPlayer(&udata, this);
+                        obj->BuildValuesUpdateFromSlot(s, &udata, this);
                         break;
                     }
                 }
             }
-            else if (obj->HasNpcFlag(UNIT_NPC_FLAG_VENDOR_MASK | UNIT_NPC_FLAG_TRAINER))
-                obj->BuildValuesUpdateBlockForPlayer(&udata, this);
+            else if (npcFlags & (UNIT_NPC_FLAG_VENDOR_MASK | UNIT_NPC_FLAG_TRAINER))
+                obj->BuildValuesUpdateFromSlot(s, &udata, this);
         }
     });
 
@@ -2236,6 +2397,7 @@ void Player::UpdateAchievementCriteria(AchievementCriteriaTypes type,
                                        uint32                   miscValue2 /*= 0*/,
                                        Unit*                    unit /*= nullptr*/)
 {
+    ASSERT_OWNED(this);
     m_achievementMgr->UpdateAchievementCriteria(type, miscValue1, miscValue2,
                                                 unit);
 }

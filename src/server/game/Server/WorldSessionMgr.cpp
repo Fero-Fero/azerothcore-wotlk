@@ -16,6 +16,7 @@
  */
 
 #include "Chat.h"
+#include "BeatContext.h"
 #include "ChatPackets.h"
 #include "RBAC.h"
 #include "GameTime.h"
@@ -314,6 +315,7 @@ int32 WorldSessionMgr::GetQueuePos(WorldSession* session)
 
 void WorldSessionMgr::AddSession_(WorldSession* session)
 {
+    ASSERT_NOT_IN_TASK();
     ASSERT(session);
 
     // kick existing session with same account (if any)

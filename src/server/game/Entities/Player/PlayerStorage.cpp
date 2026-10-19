@@ -17,6 +17,7 @@
 
 #include "AccountMgr.h"
 #include "AchievementMgr.h"
+#include "BeatContext.h"
 #include "ArenaTeam.h"
 #include "ArenaTeamMgr.h"
 #include "Battlefield.h"
@@ -330,6 +331,7 @@ InventoryResult Player::CanUnequipItems(uint32 item, uint32 count) const
 
 uint32 Player::GetItemCount(uint32 item, bool inBankAlso, Item* skipItem) const
 {
+    ASSERT_OWNED(this);
     uint32 count = 0;
     for (uint8 i = EQUIPMENT_SLOT_START; i < INVENTORY_SLOT_ITEM_END; i++)
         if (Item* pItem = GetItemByPos(INVENTORY_SLOT_BAG_0, i))
@@ -410,6 +412,7 @@ uint32 Player::GetItemCountWithLimitCategory(uint32 limitCategory, Item* skipIte
 
 Item* Player::GetItemByGuid(ObjectGuid guid) const
 {
+    ASSERT_OWNED(this);
     for (uint8 i = EQUIPMENT_SLOT_START; i < INVENTORY_SLOT_ITEM_END; ++i)
         if (Item* pItem = GetItemByPos(INVENTORY_SLOT_BAG_0, i))
             if (pItem->GetGUID() == guid)
@@ -451,6 +454,7 @@ Item* Player::GetItemByPos(uint16 pos) const
 
 Item* Player::GetItemByPos(uint8 bag, uint8 slot) const
 {
+    ASSERT_OWNED(this);
     if (bag == INVENTORY_SLOT_BAG_0 && (slot < BANK_SLOT_BAG_END || (slot >= KEYRING_SLOT_START && slot < CURRENCYTOKEN_SLOT_END)))
         return m_items[slot];
     else if (Bag* pBag = GetBagByPos(bag))
@@ -658,6 +662,7 @@ bool Player::IsValidPos(uint8 bag, uint8 slot, bool explicit_pos)
 
 bool Player::HasItemCount(uint32 item, uint32 count, bool inBankAlso) const
 {
+    ASSERT_OWNED(this);
     uint32 tempcount = 0;
     for (uint8 i = EQUIPMENT_SLOT_START; i < INVENTORY_SLOT_ITEM_END; i++)
     {
@@ -6695,6 +6700,17 @@ void Player::_LoadGroup()
 
 void Player::BindToInstance()
 {
+    if (BeatContext::InTask())
+    {
+        InstanceBindDefer rec;
+        rec.mapId = GetMapId();
+        rec.instanceId = GetInstanceId();
+        rec.permanent = 1;
+        rec.player = GetGUID();
+        GetMap()->AppendDefer(DeferKind::InstanceBind, rec);
+        return;
+    }
+
     InstanceSave* mapSave = sInstanceSaveMgr->GetInstanceSave(_pendingBindId);
     if (!mapSave) //it seems sometimes mapSave is nullptr, but I did not check why
         return;

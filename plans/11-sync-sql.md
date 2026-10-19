@@ -51,7 +51,32 @@ Debug-only: `DatabaseWorkerPool::GetFreeConnection` already logs a stack when `W
 
 ## Checklist
 
-- [ ] `CHAR_INS_RECOVERY_ITEM` is `CONNECTION_ASYNC`; `recoveryItem` uses `Execute`.
-- [ ] Preload: `CreateBaseMap` on the loading thread, `LoadAllGrids` on the worker.
-- [ ] Debug `ASSERT(!InTask())` in `GetFreeConnection`.
-- [ ] No `data/sql` change.
+- [x] `CHAR_INS_RECOVERY_ITEM` is `CONNECTION_ASYNC`; `recoveryItem` uses `Execute`.
+- [x] Preload: `CreateBaseMap` on the loading thread, `LoadAllGrids` on the worker.
+- [x] Debug `ASSERT(!InTask())` in `GetFreeConnection`.
+- [x] No `data/sql` change.
+
+## Status
+
+Not built since these edits (the user builds). `codestyle-cpp.py` passes. Not played.
+
+### Done
+
+- `CharacterDatabase.cpp`: `CHAR_INS_RECOVERY_ITEM` → `CONNECTION_ASYNC`. `WorldSession::recoveryItem` enqueues with
+  `CharacterDatabase.Execute(stmt)` and returns `true` as before.
+- `World.cpp` preload loop: `CreateBaseMap` on the loading thread for every non-instanceable map (skipped on
+  `nullptr`), then `schedule_map_preload` when the updater is active, `LoadAllGrids` inline otherwise.
+  `MapPreloadRequest::call` fetches the map with `FindBaseMap` and only loads the grids; logs an error and
+  returns if the map is missing.
+- Guard: the database library cannot see `BeatContext`, so `DatabaseWorkerPool` gained a debug-only static
+  predicate `SetSyncQueryForbiddenGuard(bool (*)())`; `GetFreeConnection` asserts it is unset or false
+  (`"Synchronous query on a unit task path"`), next to the existing `WarnAboutSyncQueries` stack dump.
+  `World::SetInitialWorldSettings` installs `[]() { return BeatContext::InTask(); }` on the three pools right after
+  `sMapMgr->Initialize()`, so the startup loads before it are not guarded.
+
+### Open
+
+- `ModuleDatabasePool::GetFreeConnection` has no guard (modules' own pools).
+- The predicate fires for any sync query under a `TaskScope`, including session packets handled in the player's
+  task (`Map::Update` sessions phase); in a debug build that is the intended crash, and the sites it finds are
+  this step's follow-ups.

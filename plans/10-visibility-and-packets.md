@@ -126,9 +126,86 @@ void Player::ViewCommit(ViewWork&);               // create / out-of-range block
 
 ## Checklist
 
-- [ ] `ClearUpdateMask` after `PublishSlot`; `AddToObjectUpdate*`, `_updateObjects`, `SendObjectUpdates`, `BuildUpdate`, `BuildFieldsUpdate` deleted.
-- [ ] `BuildValuesUpdateFromSlot` / `BuildCreateUpdateBlockFromSlot` for every object type; movement block pre-serialised at publish.
-- [ ] Player task builds and sends its own packet; `packet` field measured.
-- [ ] Scan on the unit's task; map-side visibility pass deleted.
-- [ ] `VisibilityLink`/`Unlink` are the only writes to `_visiblePlayersMap` during a tick.
-- [ ] `CanSeeOrDetect` slot overload covers stealth, invisibility, GM, phase.
+- [x] `ClearUpdateMask` after `PublishSlot`; `AddToObjectUpdate*`, `_updateObjects`, `SendObjectUpdates`, `BuildUpdate`, `BuildFieldsUpdate` deleted.
+- [x] `BuildValuesUpdateFromSlot` / `BuildCreateUpdateBlockFromSlot` for every object type; movement block pre-serialised at publish.
+- [x] Player task builds and sends its own packet; `packet` field measured. (resident `ViewWork::chunkData`; no measurement yet)
+- [x] Scan on the unit's task; map-side visibility pass deleted.
+- [ ] `VisibilityLink`/`Unlink` are the only writes to `_visiblePlayersMap` during a tick. (records wired, direct write kept — see Status)
+- [x] `CanSeeOrDetect` slot overload covers stealth, invisibility, GM, phase.
+
+## Status
+
+Not built since these edits (the user builds). `codestyle-cpp.py` passes. Not played.
+
+### Done
+
+- `ObjectSlot.h`: `SlotFlaggedValues<N>`, `SlotVisibilityFlags`, `SlotVisibility vis` (stealth / invisibility /
+  server-side arrays and their detect sides, team, group / summoner / vehicle-base / owner / farsight guids, combat
+  reach, level), `updateFlag`, `movementBlock` (+ `EnsureMovementCapacity`, doubling from 64 like auras),
+  `AnyChange()` / `Changed(index)`. `PublishSlot` fills `vis` (per-type `FillSlot` adds the unit / player / GO
+  parts), serialises the movement block with `m_updateFlag` (+ `HAS_TARGET`, never `SELF`), commits, then
+  `ClearUpdateMask(false)`: the mask lives in the slot from here on.
+- `UpdateValuesSource { values, changesMask }` replaces `UpdateDataMapType`. `BuildValuesUpdateFrom(type, buf,
+  viewer, src)` is the one virtual values builder (Object / Unit / GameObject / Corpse); the live
+  `BuildValuesUpdate` packs the owner's mask and calls it. `Unit::_valuesUpdateCache` is owner-only (live path).
+  `BuildValuesUpdateFromSlot`, `BuildCreateUpdateBlockFromSlot` (self → live create block; others from
+  `slot.updateFlag`, viewer pet guid, GO type / `vis.ownerGuid`, appended `movementBlock`).
+  `BuildUpdate` / `BuildFieldsUpdate` on Object, WorldObject, Item, Motion/StaticTransport deleted.
+- `Map::_updateObjects`, `AddUpdateObject`, `RemoveUpdateObject`, `SendObjectUpdates`, `HandleDelayedVisibility`,
+  `i_objectsForDelayedVisibility` deleted. `WorldObject::AddToObjectUpdate` only nudges a non-player into the
+  updatable list so it publishes; `WorldObject::AddToWorld` publishes a first slot. `Item::AddToObjectUpdate`
+  → owner's `_changedItems`.
+- `Player::ViewWork` (resident: `slotBeat`, `chunkCount` / `chunksDone` / `chunkData` for step 14, `delta`,
+  `seen`, `pokes`, `scanDue` / `scanForced` / `gobjOnly`), `ViewCollect` (slot `CanSeeOrDetect`, decision into
+  `delta`, nudges the object into the update list), `ViewScan` (viewpoint + minimum-move check, grid visit via
+  `VisibleNotifier` / `PlayerRelocationNotifier`, `CollectRest` for zone-wide objects and the out-of-range sweep),
+  `ViewBuild(chunk)` (chunk 0: own slot, changed items, transports; every chunk: a bucket range of
+  `_visibleWorldObjectsMap`, values from any slot stamped `slotBeat` with a non-empty mask), `ViewCommit`
+  (pet removal on leave, out-of-range / create blocks, unlink / link, chunk merge, `CanSendObjectUpdatesToPlayer`,
+  one packet, `GetInitialVisiblePackets` for entered units), `RunViewPhase` (scan if due, pokes, build, commit).
+- `Map::RunViewPhase()` after `ApplyDefers` in both the `t_diff == 0` and the normal path (`Visibility` phase
+  label): every object published, so each slot's mask is sent exactly once; `LoadGridsInRange` for a scanning
+  player runs there, outside the player's task, so grid loads stay off the defer path.
+- Scan on the unit's task: `Unit::Update` calls `ExecuteDelayedUnitRelocationEvent` inline; a player
+  `RequestViewScan(false)`, a shared-vision unit `PokeViewScan`s its viewers, a creature runs
+  `CreatureRelocationNotifier` (AI half only; the player half is the player's own scan). `Map::PlayerRelocation`
+  arms `NOTIFY_VISIBILITY_CHANGED` in and out of a task.
+- Pokes replace every push to another player's visible set: `VisibleChangesNotifier`, the player half of
+  `PlayerRelocationNotifier`, the out-of-range sweep, `Player::UpdateVisibilityOf(WorldObject*)` in a task.
+  `VisibilityPokeRecord { object }` (empty guid = scan request) to a foreign player, inline otherwise; applied
+  in `ApplyVisibilityPoke`, consumed by the next `RunViewPhase` (`ViewCollect` dedups against the scan).
+- `UpdateVisibilityForPlayer(mapChange)`: in a task a forced scan request (`gobjOnly` never narrows a pending
+  full scan); outside one (login, teleport) `ViewScan` + `ViewCommit` now, no `ViewBuild`, so the beat's masks are
+  still sent once by the view phase.
+- Records: `VisibilityLinkRecord` / `VisibilityUnlinkRecord { viewer }`, `VisibilityPoke` kind + name,
+  `WorldObject::ApplyCommonRecord` (link / unlink / poke / wake) used by the base `ApplyRecords` and by the
+  `Unit::ApplyRecord` default. `ObjectVisibilityContainer::LinkTargetSide` / `UnlinkTargetSide` hold the routing;
+  `ApplyLinkFromViewer` / `ApplyUnlinkFromViewer` are the appliers.
+- `CanSeeOrDetect(ObjectSlot const&, obj, …)`, `CanDetectInvisibilityOf(slot, …)`, `CanDetectStealthOf(slot, …)`:
+  never-visible, phase (vehicle exception), spectator, summoner-only, ghost / corpse, vehicle base, arena pet,
+  far-sight arc, distance (slot position, combat reach as size), GM, ghost team / group, despawn, invisibility and
+  stealth arrays all from the slot; AI `CanBeSeen`, visibility conditions, `IsAlwaysVisibleFor` /
+  `IsAlwaysDetectableFor` / `CanAlwaysSee`, group membership, detect-stealth auras through the handle.
+
+### Open
+
+- `VisibilityLink` / `Unlink` records are not used (`USE_VISIBILITY_LINK_RECORDS = false` in
+  `ObjectVisibilityContainer.cpp`): an object removed at this tick's end would be freed before the record lands
+  next beat and the viewer's map would keep the dead pointer. The target side is still written directly; safe
+  while the view phase has no concurrent task (until step 14). Step 12 (seal after inbox) can flip the constant.
+- `Pet::Remove` on leaving visibility (`ViewCommit`) writes the pet from the owner's task, as before.
+- `CanSeeOrDetect` from slot still reads a few live fields through the handle (`IsPet`, `GetObjectSize` of
+  non-units, GO owner level for stealth, `CanBeSeen`, conditions); the slot `beat` cross-check is not asserted.
+- `ViewBuild` chunk > 0 and `chunksDone` exist but only chunk 0 runs (step 14).
+- No measurement of packet size / build time; `Must not`'s "no per-beat allocation" holds for `UpdateData`
+  (resident) but `WorldPacket` is still built per send.
+- Transports: a static transport's values go to players in range that can see it; a motion transport's to every
+  player of the map (as `HaveAtClient` always reports it), both only when its slot changed this beat.
+
+### Behaviour
+
+- Values changed after an object's publish in the same tick (scripts, movement phase) ship next beat.
+- An object entering view gets its create block from the slot (position / movement as of its last publish).
+- Visibility changes requested by another object (pokes) land at that viewer's view phase next beat; its own
+  timer-driven scans unchanged (`DynamicVisibilityMgr` delays and move distance).
+- `UpdateVisibilityOf(target)` off-task sends immediately; in a task it is a poke (one beat later).

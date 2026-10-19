@@ -20,17 +20,31 @@
 #include "DatabaseEnv.h"
 #include "Log.h"
 #include "MailMgr.h"
+#include "BeatContext.h"
 #include "Player.h"
 #include "Timer.h"
 #include "World.h"
 #include <algorithm>
 #include <limits>
+#include <shared_mutex>
 #include <unordered_map>
 
 namespace
 {
     std::unordered_map<ObjectGuid, CharacterCacheEntry> _characterCacheStore;
     std::unordered_map<std::string, CharacterCacheEntry*> _characterCacheByNameStore;
+
+    // Step 03 marks the cache *mutex*: level, guild and arena updates come from player tasks a few times a
+    // minute server-wide; entries are added and erased between beats. Writers count their acquisitions for
+    // .debug singletons (step 13).
+    std::shared_mutex _cacheLock;
+
+    struct WriteLock
+    {
+        std::unique_lock<std::shared_mutex> lock;
+        WriteLock() : lock(_cacheLock) { BeatContext::CountSingletonLock(BeatContext::LOCK_CHARACTER_CACHE); }
+    };
+    using ReadLock = std::shared_lock<std::shared_mutex>;
 }
 
 CharacterCache* CharacterCache::instance()
@@ -108,6 +122,8 @@ Modifying functions
 */
 void CharacterCache::AddCharacterCacheEntry(ObjectGuid const& guid, uint32 accountId, std::string const& name, uint8 gender, uint8 race, uint8 playerClass, uint8 level)
 {
+    ASSERT_NOT_IN_TASK();
+    WriteLock const guard;
     CharacterCacheEntry& data = _characterCacheStore[guid];
     data.Guid = guid;
     data.Name = name;
@@ -128,12 +144,15 @@ void CharacterCache::AddCharacterCacheEntry(ObjectGuid const& guid, uint32 accou
 
 void CharacterCache::DeleteCharacterCacheEntry(ObjectGuid const& guid, std::string const& name)
 {
+    ASSERT_NOT_IN_TASK();
+    WriteLock const guard;
     _characterCacheStore.erase(guid);
     _characterCacheByNameStore.erase(name);
 }
 
 void CharacterCache::UpdateCharacterData(ObjectGuid const& guid, std::string const& name, Optional<uint8> gender /*= {}*/, Optional<uint8> race /*= {}*/)
 {
+    WriteLock const guard;
     auto itr = _characterCacheStore.find(guid);
     if (itr == _characterCacheStore.end())
         return;
@@ -161,6 +180,7 @@ void CharacterCache::UpdateCharacterData(ObjectGuid const& guid, std::string con
 
 void CharacterCache::UpdateCharacterLevel(ObjectGuid const& guid, uint8 level)
 {
+    WriteLock const guard;
     auto itr = _characterCacheStore.find(guid);
     if (itr == _characterCacheStore.end())
     {
@@ -172,6 +192,7 @@ void CharacterCache::UpdateCharacterLevel(ObjectGuid const& guid, uint8 level)
 
 void CharacterCache::UpdateCharacterAccountId(ObjectGuid const& guid, uint32 accountId)
 {
+    WriteLock const guard;
     auto itr = _characterCacheStore.find(guid);
     if (itr == _characterCacheStore.end())
     {
@@ -183,6 +204,7 @@ void CharacterCache::UpdateCharacterAccountId(ObjectGuid const& guid, uint32 acc
 
 void CharacterCache::UpdateCharacterGuildId(ObjectGuid const& guid, ObjectGuid::LowType guildId)
 {
+    WriteLock const guard;
     auto itr = _characterCacheStore.find(guid);
     if (itr == _characterCacheStore.end())
     {
@@ -194,6 +216,7 @@ void CharacterCache::UpdateCharacterGuildId(ObjectGuid const& guid, ObjectGuid::
 
 void CharacterCache::UpdateCharacterArenaTeamId(ObjectGuid const& guid, uint8 slot, uint32 arenaTeamId)
 {
+    WriteLock const guard;
     auto itr = _characterCacheStore.find(guid);
     if (itr == _characterCacheStore.end())
     {
@@ -205,6 +228,7 @@ void CharacterCache::UpdateCharacterArenaTeamId(ObjectGuid const& guid, uint8 sl
 
 void CharacterCache::UpdateCharacterMailCount(ObjectGuid const& guid, int32 count, bool update)
 {
+    WriteLock const guard;
     auto itr = _characterCacheStore.find(guid);
     if (itr == _characterCacheStore.end())
         return;
@@ -226,6 +250,7 @@ void CharacterCache::UpdateCharacterMailCount(ObjectGuid const& guid, int32 coun
 
 void CharacterCache::UpdateCharacterGroup(ObjectGuid const& guid, ObjectGuid groupGUID)
 {
+    WriteLock const guard;
     auto itr = _characterCacheStore.find(guid);
     if (itr == _characterCacheStore.end())
     {
@@ -240,11 +265,13 @@ Getters
 */
 bool CharacterCache::HasCharacterCacheEntry(ObjectGuid const& guid) const
 {
+    ReadLock const guard(_cacheLock);
     return _characterCacheStore.find(guid) != _characterCacheStore.end();
 }
 
 CharacterCacheEntry const* CharacterCache::GetCharacterCacheByGuid(ObjectGuid const& guid) const
 {
+    ReadLock const guard(_cacheLock);
     auto itr = _characterCacheStore.find(guid);
     if (itr != _characterCacheStore.end())
     {
@@ -256,6 +283,7 @@ CharacterCacheEntry const* CharacterCache::GetCharacterCacheByGuid(ObjectGuid co
 
 CharacterCacheEntry const* CharacterCache::GetCharacterCacheByName(std::string const& name) const
 {
+    ReadLock const guard(_cacheLock);
     auto itr = _characterCacheByNameStore.find(name);
     if (itr != _characterCacheByNameStore.end())
     {
@@ -267,6 +295,7 @@ CharacterCacheEntry const* CharacterCache::GetCharacterCacheByName(std::string c
 
 ObjectGuid CharacterCache::GetCharacterGuidByName(std::string const& name) const
 {
+    ReadLock const guard(_cacheLock);
     auto itr = _characterCacheByNameStore.find(name);
     if (itr != _characterCacheByNameStore.end())
     {
@@ -278,6 +307,7 @@ ObjectGuid CharacterCache::GetCharacterGuidByName(std::string const& name) const
 
 bool CharacterCache::GetCharacterNameByGuid(ObjectGuid guid, std::string& name) const
 {
+    ReadLock const guard(_cacheLock);
     auto itr = _characterCacheStore.find(guid);
     if (itr == _characterCacheStore.end())
     {
@@ -290,6 +320,7 @@ bool CharacterCache::GetCharacterNameByGuid(ObjectGuid guid, std::string& name) 
 
 uint32 CharacterCache::GetCharacterTeamByGuid(ObjectGuid guid) const
 {
+    ReadLock const guard(_cacheLock);
     auto itr = _characterCacheStore.find(guid);
     if (itr == _characterCacheStore.end())
     {
@@ -301,6 +332,7 @@ uint32 CharacterCache::GetCharacterTeamByGuid(ObjectGuid guid) const
 
 uint32 CharacterCache::GetCharacterAccountIdByGuid(ObjectGuid guid) const
 {
+    ReadLock const guard(_cacheLock);
     auto itr = _characterCacheStore.find(guid);
     if (itr == _characterCacheStore.end())
     {
@@ -312,6 +344,7 @@ uint32 CharacterCache::GetCharacterAccountIdByGuid(ObjectGuid guid) const
 
 uint32 CharacterCache::GetCharacterAccountIdByName(std::string const& name) const
 {
+    ReadLock const guard(_cacheLock);
     auto itr = _characterCacheByNameStore.find(name);
     if (itr != _characterCacheByNameStore.end())
     {
@@ -323,6 +356,7 @@ uint32 CharacterCache::GetCharacterAccountIdByName(std::string const& name) cons
 
 uint8 CharacterCache::GetCharacterLevelByGuid(ObjectGuid guid) const
 {
+    ReadLock const guard(_cacheLock);
     auto itr = _characterCacheStore.find(guid);
     if (itr == _characterCacheStore.end())
     {
@@ -334,6 +368,7 @@ uint8 CharacterCache::GetCharacterLevelByGuid(ObjectGuid guid) const
 
 ObjectGuid::LowType CharacterCache::GetCharacterGuildIdByGuid(ObjectGuid guid) const
 {
+    ReadLock const guard(_cacheLock);
     auto itr = _characterCacheStore.find(guid);
     if (itr == _characterCacheStore.end())
     {
@@ -345,6 +380,7 @@ ObjectGuid::LowType CharacterCache::GetCharacterGuildIdByGuid(ObjectGuid guid) c
 
 uint32 CharacterCache::GetCharacterArenaTeamIdByGuid(ObjectGuid guid, uint8 type) const
 {
+    ReadLock const guard(_cacheLock);
     auto itr = _characterCacheStore.find(guid);
     if (itr == _characterCacheStore.end())
     {
@@ -356,6 +392,7 @@ uint32 CharacterCache::GetCharacterArenaTeamIdByGuid(ObjectGuid guid, uint8 type
 
 ObjectGuid CharacterCache::GetCharacterGroupGuidByGuid(ObjectGuid guid) const
 {
+    ReadLock const guard(_cacheLock);
     auto itr = _characterCacheStore.find(guid);
     if (itr == _characterCacheStore.end())
     {

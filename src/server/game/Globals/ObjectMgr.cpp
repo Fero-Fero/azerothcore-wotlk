@@ -16,6 +16,7 @@
  */
 
 #include "ObjectMgr.h"
+#include "BeatContext.h"
 #include "AchievementMgr.h"
 #include "ArenaTeamMgr.h"
 #include "CharacterCache.h"
@@ -2105,6 +2106,7 @@ void ObjectMgr::LoadLinkedRespawn()
 
 bool ObjectMgr::SetCreatureLinkedRespawn(ObjectGuid::LowType guidLow, ObjectGuid::LowType linkedGuidLow)
 {
+    ASSERT_NOT_IN_TASK();
     if (!guidLow)
         return false;
 
@@ -2782,6 +2784,7 @@ void ObjectMgr::LoadCreatureSparring()
 
 void ObjectMgr::AddCreatureToGrid(ObjectGuid::LowType guid, CreatureData const* data)
 {
+    ASSERT_NOT_IN_TASK();
     uint8 mask = data->spawnMask;
     for (uint8 i = 0; mask != 0; i++, mask >>= 1)
     {
@@ -2796,6 +2799,7 @@ void ObjectMgr::AddCreatureToGrid(ObjectGuid::LowType guid, CreatureData const* 
 
 void ObjectMgr::RemoveCreatureFromGrid(ObjectGuid::LowType guid, CreatureData const* data)
 {
+    ASSERT_NOT_IN_TASK();
     uint8 mask = data->spawnMask;
     for (uint8 i = 0; mask != 0; i++, mask >>= 1)
     {
@@ -2810,6 +2814,7 @@ void ObjectMgr::RemoveCreatureFromGrid(ObjectGuid::LowType guid, CreatureData co
 
 ObjectGuid::LowType ObjectMgr::AddGOData(uint32 entry, uint32 mapId, float x, float y, float z, float o, uint32 spawntimedelay, float rotation0, float rotation1, float rotation2, float rotation3)
 {
+    ASSERT_NOT_IN_TASK();
     GameObjectTemplate const* goinfo = GetGameObjectTemplate(entry);
     if (!goinfo)
         return 0;
@@ -2863,6 +2868,7 @@ ObjectGuid::LowType ObjectMgr::AddGOData(uint32 entry, uint32 mapId, float x, fl
 
 ObjectGuid::LowType ObjectMgr::AddCreData(uint32 entry, uint32 mapId, float x, float y, float z, float o, uint32 spawntimedelay)
 {
+    ASSERT_NOT_IN_TASK();
     CreatureTemplate const* cInfo = GetCreatureTemplate(entry);
     if (!cInfo)
         return 0;
@@ -3234,6 +3240,7 @@ GameObjectData const* ObjectMgr::LoadGameObjectDataFromDB(ObjectGuid::LowType sp
 
 void ObjectMgr::AddGameobjectToGrid(ObjectGuid::LowType guid, GameObjectData const* data)
 {
+    ASSERT_NOT_IN_TASK();
     uint8 mask = data->spawnMask;
     for (uint8 i = 0; mask != 0; i++, mask >>= 1)
     {
@@ -3248,6 +3255,7 @@ void ObjectMgr::AddGameobjectToGrid(ObjectGuid::LowType guid, GameObjectData con
 
 void ObjectMgr::RemoveGameobjectFromGrid(ObjectGuid::LowType guid, GameObjectData const* data)
 {
+    ASSERT_NOT_IN_TASK();
     uint8 mask = data->spawnMask;
     for (uint8 i = 0; mask != 0; i++, mask >>= 1)
     {
@@ -8645,6 +8653,7 @@ void ObjectMgr::LoadNPCSpellClickSpells()
 
 void ObjectMgr::DeleteCreatureData(ObjectGuid::LowType guid)
 {
+    ASSERT_NOT_IN_TASK();
     // remove mapid*cellid -> guid_set map
     CreatureData const* data = GetCreatureData(guid);
     if (data)
@@ -8655,6 +8664,7 @@ void ObjectMgr::DeleteCreatureData(ObjectGuid::LowType guid)
 
 void ObjectMgr::DeleteGOData(ObjectGuid::LowType guid)
 {
+    ASSERT_NOT_IN_TASK();
     // remove mapid*cellid -> guid_set map
     GameObjectData const* data = GetGameObjectData(guid);
     if (data)

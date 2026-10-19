@@ -135,6 +135,58 @@ struct ProcActorRecord
     uint8 appliedModCount = 0;
 };
 
+// Step 08 §1: auto-attack split. The attacker rolls the outcome and computes the pre-mitigation numbers on
+// its own task (CalculateMeleeDamage without the victim-side part), the victim consumes absorb / resist,
+// applies DealDamageMods, broadcasts SMSG_ATTACKERSTATEUPDATE from its own position and runs DealMeleeDamage,
+// whose attacker writes come back as a MeleeLandedRecord.
+constexpr uint8 MELEE_RECORD_DAMAGES = 2;   // MAX_ITEM_PROTO_DAMAGES
+
+struct MeleeHitRecord
+{
+    ObjectGuid attacker;
+    uint8 attackType = 0;           // WeaponAttackType
+    uint8 extra = 0;                // extra attack (Sword Specialization, Windfury)
+    uint8 hitOutCome = 0;           // MeleeHitOutcome
+    uint8 durabilityLoss = 1;
+    uint32 targetState = 0;         // VictimState
+    uint32 hitInfo = 0;             // HitInfo flags before absorb / resist
+    uint32 cleanDamage = 0;
+    uint32 blockedAmount = 0;
+    uint32 procAttacker = 0;
+    uint32 procVictim = 0;
+    uint8 attackerCanDaze = 0;      // creature not controlled by a player; the victim rolls the daze
+    uint32 attackerMeleeSkill = 0;
+    struct
+    {
+        uint32 damageSchoolMask = 0;
+        uint32 damage = 0;          // after armor, crit and block; before resilience, absorb / resist
+    } damages[MELEE_RECORD_DAMAGES];
+};
+
+// Attacker half of DealMeleeDamage, applied by the attacker after the victim ran the land step.
+struct MeleeLandedRecord
+{
+    ObjectGuid victim;
+    uint8 attackType = 0;
+    uint8 hitOutCome = 0;
+    uint8 rageFromAvoid = 0;        // fully blocked / dodged / parried: RewardRage(cleanDamage, weaponSpeedHitFactor, true)
+    uint8 daze = 0;                 // creature attacking from behind rolled the daze: CastSpell(victim, 1604)
+    uint8 castItemCombatSpell = 0;  // player: CastItemCombatSpell(victim, attackType, procVictim, hitMask)
+    uint8 damageShield = 0;         // DealDamageShieldDamage(victim)
+    uint32 targetState = 0;
+    uint32 cleanDamage = 0;
+    uint32 procVictim = 0;
+    uint32 hitMask = 0;
+    uint32 damage = 0;              // dealt, for the debug log
+    uint32 absorb = 0;
+    uint32 resist = 0;
+    uint32 blocked = 0;
+
+    [[nodiscard]] bool Any() const { return rageFromAvoid || daze || castItemCombatSpell || damageShield; }
+};
+
+static_assert(std::is_trivially_copyable_v<MeleeHitRecord>, "record payloads are plain values");
+static_assert(std::is_trivially_copyable_v<MeleeLandedRecord>, "record payloads are plain values");
 static_assert(std::is_trivially_copyable_v<DamageDealtRecord>, "record payloads are plain values");
 static_assert(std::is_trivially_copyable_v<HealDoneRecord>, "record payloads are plain values");
 static_assert(std::is_trivially_copyable_v<KillingBlowRecord>, "record payloads are plain values");

@@ -58,6 +58,12 @@ struct HealDoneRecord;
 struct KillingBlowRecord;
 struct KillCreditRecord;
 struct ProcActorRecord;
+struct MeleeHitRecord;
+struct MeleeLandedRecord;
+struct PeriodicLandedRecord;
+struct AreaAuraApplyRecord;
+struct AreaAuraRemoveRecord;
+struct TriggeredByAuraSpellData;
 struct AuraLaunchData;
 class UnitView;
 
@@ -515,6 +521,9 @@ struct CalcDamageInfo
     uint32 procVictim;
     uint32 cleanDamage;          // Used only for rage calculation
     MeleeHitOutcome hitOutCome;  /// @todo: remove this field (need use TargetState)
+    // Step 08 §1: attacker numbers the victim's daze roll needs, read at launch so land does not read the attacker
+    bool attackerCanDaze = false;    // creature not controlled by a player
+    uint32 attackerMeleeSkill = 0;
 };
 
 // Spell damage info structure based on structure sending in SMSG_SPELLNONMELEEDAMAGELOG opcode
@@ -730,6 +739,15 @@ public:
     void ApplyKillingBlow(KillingBlowRecord const& blow);
     void ApplyKillCredit(KillCreditRecord const& credit);
     void ApplyProcActor(ProcActorRecord const& proc);
+    // Step 08 §1: land step of an auto-attack on this unit, and the attacker half of DealMeleeDamage.
+    void ApplyMeleeHit(MeleeHitRecord const& hit);
+    void ApplyMeleeLanded(MeleeLandedRecord const& landed);
+    // Step 08 §2: caster half of a periodic tick of an aura this unit cast on someone else.
+    void ApplyPeriodicLanded(PeriodicLandedRecord const& landed);
+    // Step 08 §3: this unit is a member of a foreign area aura: create / refresh / remove the clone it owns.
+    void ApplyAreaAuraApply(AreaAuraApplyRecord const& apply);
+    void ApplyAreaAuraRemove(AreaAuraRemoveRecord const& remove);
+    [[nodiscard]] Aura* FindAreaAuraClone(uint32 spellId, ObjectGuid casterGuid, ObjectGuid areaOwnerGuid) const;
 
     [[nodiscard]] Unit* GetControlled(ObjectGuid const& guid) const;
 
@@ -767,9 +785,9 @@ public:
 
     // Unit state
     void AddUnitState(uint32 f) { m_state |= f; }
-    [[nodiscard]] bool HasUnitState(const uint32 f) const { return (m_state & f); }
+    [[nodiscard]] bool HasUnitState(const uint32 f) const { ASSERT_OWNED(this); return (m_state & f); }
     void ClearUnitState(uint32 f) { m_state &= ~f; }
-    [[nodiscard]] uint32 GetUnitState() const { return m_state; }
+    [[nodiscard]] uint32 GetUnitState() const { ASSERT_OWNED(this); return m_state; }
 
     // Unit mask
     [[nodiscard]] uint32 HasUnitTypeMask(uint32 mask) const { return mask & m_unitTypeMask; }
@@ -805,8 +823,8 @@ public:
     // Movement flags
     void AddUnitMovementFlag(uint32 f) { m_movementInfo.flags |= f; }
     void RemoveUnitMovementFlag(uint32 f) { m_movementInfo.flags &= ~f; }
-    [[nodiscard]] bool HasUnitMovementFlag(uint32 f) const { return (m_movementInfo.flags & f) != 0; }
-    [[nodiscard]] uint32 GetUnitMovementFlags() const { return m_movementInfo.flags; }
+    [[nodiscard]] bool HasUnitMovementFlag(uint32 f) const { ASSERT_OWNED(this); return (m_movementInfo.flags & f) != 0; }
+    [[nodiscard]] uint32 GetUnitMovementFlags() const { ASSERT_OWNED(this); return m_movementInfo.flags; }
     void SetUnitMovementFlags(uint32 f) { m_movementInfo.flags = f; }
 
     void AddExtraUnitMovementFlag(uint16 f) { m_movementInfo.flags2 |= f; }
@@ -932,7 +950,7 @@ public:
     void CastStop(uint32 except_spellid = 0, bool withInstant = true);
     bool AttackStop();
     void RemoveAllAttackers();
-    [[nodiscard]] AttackerSet const& getAttackers() const { return m_attackers; }
+    [[nodiscard]] AttackerSet const& getAttackers() const { ASSERT_OWNED(this); return m_attackers; }
     [[nodiscard]] bool GetMeleeAttackPoint(Unit* attacker, Position& pos);
     [[nodiscard]] bool isAttackingPlayer() const;
     [[nodiscard]] Unit* GetVictim() const { return m_attacking; }
@@ -988,10 +1006,10 @@ public:
     void AtTargetAttacked(Unit* target, bool canInitialAggro);
 
     // ThreatManager/CombatManager accessors
-    ThreatManager& GetThreatMgr() { return m_threatManager; }
-    ThreatManager const& GetThreatMgr() const { return m_threatManager; }
-    CombatManager& GetCombatManager() { return m_combatManager; }
-    CombatManager const& GetCombatManager() const { return m_combatManager; }
+    ThreatManager& GetThreatMgr() { ASSERT_OWNED(this); return m_threatManager; }
+    ThreatManager const& GetThreatMgr() const { ASSERT_OWNED(this); return m_threatManager; }
+    CombatManager& GetCombatManager() { ASSERT_OWNED(this); return m_combatManager; }
+    CombatManager const& GetCombatManager() const { ASSERT_OWNED(this); return m_combatManager; }
 
     // Combat state methods
     [[nodiscard]] bool IsThreatened() const;
@@ -1281,6 +1299,12 @@ public:
     /*********************************************************/
     static uint32 DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage const* cleanDamage = nullptr, DamageEffectType damagetype = DIRECT_DAMAGE, SpellSchoolMask damageSchoolMask = SPELL_SCHOOL_MASK_NORMAL, SpellInfo const* spellProto = nullptr, bool durabilityLoss = true, bool allowGM = false, Spell const* spell = nullptr);
     void DealMeleeDamage(CalcDamageInfo* damageInfo, bool durabilityLoss);
+    // Step 08 §1: the victim-side part of CalculateMeleeDamage (victim AI hook, absorb, resist, HitInfo bits),
+    // run by the victim at land for a recorded hit and inline by the attacker otherwise.
+    static void CalcMeleeAbsorbResist(CalcDamageInfo* damageInfo);
+    void BuildMeleeHitRecord(CalcDamageInfo const& damageInfo, bool extra, MeleeHitRecord& out) const;
+    // land step (victim's task): DealDamageMods, SMSG_ATTACKERSTATEUPDATE, DealMeleeDamage, procs
+    static void LandMeleeHit(CalcDamageInfo* damageInfo);
     void DealSpellDamage(SpellNonMeleeDamage* damageInfo, bool durabilityLoss, Spell const* spell = nullptr);
     void DealDamageShieldDamage(Unit* victim);
     static void DealDamageMods(Unit const* victim, uint32& damage, uint32* absorb);
@@ -1291,7 +1315,8 @@ public:
     // Calculate methods
     uint32 CalculateDamage(WeaponAttackType attType, bool normalized, bool addTotalPct, uint8 itemDamagesMask = 0);
     virtual void CalculateMinMaxDamage(WeaponAttackType attType, bool normalized, bool addTotalPct, float& minDamage, float& maxDamage, uint8 damageIndex = 0) = 0;
-    void CalculateMeleeDamage(Unit* victim, CalcDamageInfo* damageInfo, WeaponAttackType attackType = BASE_ATTACK, const bool sittingVictim = false);
+    // victimSide = false: stop before the victim-side part (CalcMeleeAbsorbResist), which the victim runs at land
+    void CalculateMeleeDamage(Unit* victim, CalcDamageInfo* damageInfo, WeaponAttackType attackType = BASE_ATTACK, const bool sittingVictim = false, bool victimSide = true);
     void CalculateSpellDamageTaken(SpellNonMeleeDamage* damageInfo, int32 damage, SpellInfo const* spellInfo, WeaponAttackType attackType = BASE_ATTACK, bool crit = false);
     float CalculateDefaultCoefficient(SpellInfo const* spellInfo, DamageEffectType damagetype) const;
 
@@ -1349,6 +1374,8 @@ public:
         return (Unit*)this;
     }
     [[nodiscard]] Player* GetCharmerOrOwnerPlayerOrPlayerItself() const;
+    // Same, for an update build: reads the guid from the build's source (the slot on a viewer's build, step 13).
+    [[nodiscard]] Player* GetCharmerOrOwnerPlayerOrPlayerItself(UpdateValuesSource const& src) const;
     [[nodiscard]] ObjectGuid GetCharmerOrOwnerGUID() const override { return GetCharmerGUID() ? GetCharmerGUID() : GetOwnerGUID(); }
     [[nodiscard]] ObjectGuid GetCharmerOrOwnerOrOwnGUID() const
     {
@@ -1427,8 +1454,8 @@ public:
     void _RegisterAuraEffect(AuraEffect* aurEff, bool apply);
 
     // m_ownedAuras container management
-    AuraMap&       GetOwnedAuras()       { return m_ownedAuras; }
-    [[nodiscard]] AuraMap const& GetOwnedAuras() const { return m_ownedAuras; }
+    AuraMap&       GetOwnedAuras()       { ASSERT_OWNED(this); return m_ownedAuras; }
+    [[nodiscard]] AuraMap const& GetOwnedAuras() const { ASSERT_OWNED(this); return m_ownedAuras; }
 
     void RemoveOwnedAura(AuraMap::iterator& i, AuraRemoveMode removeMode = AURA_REMOVE_BY_DEFAULT);
     void RemoveOwnedAura(uint32 spellId, ObjectGuid casterGUID = ObjectGuid::Empty, uint8 reqEffMask = 0, AuraRemoveMode removeMode = AURA_REMOVE_BY_DEFAULT);
@@ -1437,8 +1464,8 @@ public:
     Aura* GetOwnedAura(uint32 spellId, ObjectGuid casterGUID = ObjectGuid::Empty, ObjectGuid itemCasterGUID = ObjectGuid::Empty, uint8 reqEffMask = 0, Aura* except = nullptr) const;
 
     // m_appliedAuras container management
-    AuraApplicationMap&       GetAppliedAuras()       { return m_appliedAuras; }
-    [[nodiscard]] AuraApplicationMap const& GetAppliedAuras() const { return m_appliedAuras; }
+    AuraApplicationMap&       GetAppliedAuras()       { ASSERT_OWNED(this); return m_appliedAuras; }
+    [[nodiscard]] AuraApplicationMap const& GetAppliedAuras() const { ASSERT_OWNED(this); return m_appliedAuras; }
 
     void RemoveAura(AuraApplicationMap::iterator& i, AuraRemoveMode mode = AURA_REMOVE_BY_DEFAULT);
     void RemoveAura(uint32 spellId, ObjectGuid casterGUID = ObjectGuid::Empty, uint8 reqEffMask = 0, AuraRemoveMode removeMode = AURA_REMOVE_BY_DEFAULT);
@@ -1482,7 +1509,7 @@ public:
     void _RemoveAllAuraStatMods();
     void _ApplyAllAuraStatMods();
 
-    [[nodiscard]] AuraEffectList const& GetAuraEffectsByType(AuraType type) const { return m_modAuras[type]; }
+    [[nodiscard]] AuraEffectList const& GetAuraEffectsByType(AuraType type) const { ASSERT_OWNED(this); return m_modAuras[type]; }
     AuraList&       GetSingleCastAuras()       { return m_scAuras; }
     [[nodiscard]] AuraList const& GetSingleCastAuras() const { return m_scAuras; }
 
@@ -1631,8 +1658,8 @@ public:
     /***            METHODS RELATED TO SPELLS              ***/
     /*********************************************************/
     [[nodiscard]] Player* GetSpellModOwner() const override;
-    [[nodiscard]] Spell* GetCurrentSpell(CurrentSpellTypes spellType) const { return m_currentSpells[spellType]; }
-    [[nodiscard]] Spell* GetCurrentSpell(uint32 spellType) const { return m_currentSpells[spellType]; }
+    [[nodiscard]] Spell* GetCurrentSpell(CurrentSpellTypes spellType) const { ASSERT_OWNED(this); return m_currentSpells[spellType]; }
+    [[nodiscard]] Spell* GetCurrentSpell(uint32 spellType) const { ASSERT_OWNED(this); return m_currentSpells[spellType]; }
     [[nodiscard]] Spell* GetFirstCurrentCastingSpell() const;
     [[nodiscard]] Spell* FindCurrentSpellBySpellId(uint32 spell_id) const;
     [[nodiscard]] int32 GetCurrentSpellCastTime(uint32 spell_id) const;
@@ -1729,6 +1756,8 @@ public:
     // Unit::CastSpell overload and never sees WorldObject's.
     using WorldObject::CastSpell;
     SpellCastResult CastSpell(SpellCastTargets const& targets, SpellInfo const* spellInfo, CustomSpellValues const* value, TriggerCastFlags triggerFlags = TRIGGERED_NONE, Item* castItem = nullptr, AuraEffect const* triggeredByAura = nullptr, ObjectGuid originalCaster = ObjectGuid::Empty);
+    // Step 08 §2: the triggering periodic aura as ids (it lives on another unit's task)
+    SpellCastResult CastSpell(SpellCastTargets const& targets, SpellInfo const* spellInfo, CustomSpellValues const* value, TriggerCastFlags triggerFlags, TriggeredByAuraSpellData const& triggeredByAura, bool interruptChannelOnFail, ObjectGuid originalCaster = ObjectGuid::Empty);
     SpellCastResult CastSpell(Unit* victim, uint32 spellId, bool triggered, Item* castItem = nullptr, AuraEffect const* triggeredByAura = nullptr, ObjectGuid originalCaster = ObjectGuid::Empty);
     SpellCastResult CastSpell(Unit* victim, uint32 spellId, TriggerCastFlags triggerFlags = TRIGGERED_NONE, Item* castItem = nullptr, AuraEffect const* triggeredByAura = nullptr, ObjectGuid originalCaster = ObjectGuid::Empty);
     SpellCastResult CastSpell(Unit* victim, SpellInfo const* spellInfo, bool triggered, Item* castItem = nullptr, AuraEffect const* triggeredByAura = nullptr, ObjectGuid originalCaster = ObjectGuid::Empty);
@@ -1811,8 +1840,8 @@ public:
     void SetFeatherFall(bool enable);
     void SetHover(bool enable);
 
-    MotionMaster* GetMotionMaster() { return i_motionMaster; }
-    [[nodiscard]] MotionMaster const* GetMotionMaster() const { return i_motionMaster; }
+    MotionMaster* GetMotionMaster() { ASSERT_OWNED(this); return i_motionMaster; }
+    [[nodiscard]] MotionMaster const* GetMotionMaster() const { ASSERT_OWNED(this); return i_motionMaster; }
     [[nodiscard]] virtual MovementGeneratorType GetDefaultMovementType() const;
 
     [[nodiscard]] bool IsStopped() const { return !(HasUnitState(UNIT_STATE_MOVING)); }
@@ -1843,10 +1872,10 @@ public:
     void  RemoveStandFlags(uint8 flags) { RemoveByteFlag(UNIT_FIELD_BYTES_1,  UNIT_BYTES_1_OFFSET_VIS_FLAG, flags); }
 
     // DeathState
-    DeathState getDeathState() { return m_deathState; };
+    DeathState getDeathState() { ASSERT_OWNED(this); return m_deathState; };
     virtual void setDeathState(DeathState s, bool despawn = false);           // overwrited in Creature/Player/Pet
 
-    [[nodiscard]] bool IsAlive() const { return (m_deathState == DeathState::Alive); };
+    [[nodiscard]] bool IsAlive() const { ASSERT_OWNED(this); return (m_deathState == DeathState::Alive); };
     [[nodiscard]] bool isDying() const { return (m_deathState == DeathState::JustDied); };
     [[nodiscard]] bool isDead() const { return (m_deathState == DeathState::Dead || m_deathState == DeathState::Corpse); };
 
@@ -1935,7 +1964,7 @@ public:
     static ReputationRank GetFactionReactionTo(FactionTemplateEntry const* factionTemplateEntry, FactionTemplateEntry const* targetFactionTemplateEntry);
 
     // Shared vision
-    SharedVisionList const& GetSharedVisionList() { return m_sharedVision; }
+    SharedVisionList const& GetSharedVisionList() { ASSERT_OWNED(this); return m_sharedVision; }
     void AddPlayerToVision(Player* player);
     void RemovePlayerFromVision(Player* player);
     [[nodiscard]] bool HasSharedVision() const { return !m_sharedVision.empty(); }
@@ -2105,6 +2134,7 @@ public:
     void SendSpellNonMeleeDamageLog(Unit* target, SpellInfo const* spellInfo, uint32 Damage, SpellSchoolMask damageSchoolMask, uint32 AbsorbedDamage, uint32 Resist, bool PhysicalDamage, uint32 Blocked, bool CriticalHit = false, bool Split = false);
     void SendSpellDamageResist(Unit* target, uint32 spellId);
     void SendSpellDamageImmune(Unit* target, uint32 spellId);
+    void SendSpellDamageImmuneFrom(ObjectGuid casterGuid, uint32 spellId);
 
     void SendTameFailure(uint8 result);
 
@@ -2181,7 +2211,7 @@ public:
 protected:
     explicit Unit();
 
-    void BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target) override;
+    void BuildValuesUpdateFrom(uint8 updateType, ByteBuffer* data, Player* target, UpdateValuesSource const& src) override;
     void FillSlot(ObjectSlot& slot) override;
     void PrepareRemovalForeign() override;
     void PrepareRemovalOwn() override;
@@ -2289,7 +2319,7 @@ private:
     [[nodiscard]] float GetCombatRatingReduction(CombatRating cr) const;
     [[nodiscard]] uint32 GetCombatRatingDamageReduction(CombatRating cr, float rate, float cap, uint32 damage) const;
 
-    void PatchValuesUpdate(ByteBuffer& valuesUpdateBuf, BuildValuesCachePosPointers& posPointers, Player* target);
+    void PatchValuesUpdate(ByteBuffer& valuesUpdateBuf, BuildValuesCachePosPointers& posPointers, Player* target, UpdateValuesSource const& src);
     void InvalidateValuesUpdateCache() { _valuesUpdateCache.clear(); }
 
     [[nodiscard]] float processDummyAuras(float TakenTotalMod) const;
@@ -2313,6 +2343,7 @@ private:
 
     bool m_cleanupDone; // lock made to not add stuff after cleanup before delete
     bool m_duringRemoveFromWorld; // lock made to not add stuff after begining removing from world
+    bool m_creatingAreaClone = false; // step 08 §3: _AddAura runs the stacking checks of an area aura member for the clone being created
 
     uint32 _oldFactionId;           ///< faction before charm
     bool _isWalkingBeforeCharm;     ///< Are we walking before we were charmed?

@@ -18,11 +18,9 @@
 #include "MapUpdater.h"
 #include "BeatContext.h"
 #include "DatabaseEnv.h"
-#include "LFGMgr.h"
 #include "Log.h"
 #include "Map.h"
 #include "MapMgr.h"
-#include "Metric.h"
 
 class UpdateRequest
 {
@@ -31,28 +29,6 @@ public:
     virtual ~UpdateRequest() = default;
 
     virtual void call() = 0;
-};
-
-class MapUpdateRequest : public UpdateRequest
-{
-public:
-    MapUpdateRequest(Map& m, MapUpdater& u, uint32 d, uint32 sd)
-        : m_map(m), m_updater(u), m_diff(d), s_diff(sd)
-    {
-    }
-
-    void call() override
-    {
-        METRIC_TIMER("map_update_time_diff", METRIC_TAG("map_id", std::to_string(m_map.GetId())));
-        m_map.Update(m_diff, s_diff);
-        m_updater.update_finished();
-    }
-
-private:
-    Map& m_map;
-    MapUpdater& m_updater;
-    uint32 m_diff;
-    uint32 s_diff;
 };
 
 class MapPreloadRequest : public UpdateRequest
@@ -65,30 +41,22 @@ public:
 
     void call() override
     {
-        Map* map = sMapMgr->CreateBaseMap(_mapId);
-        LOG_INFO("server.loading", ">> Loading All Grids For Map {} ({})", map->GetId(), map->GetMapName());
-        map->LoadAllGrids();
+        // The map was created on the loading thread (respawn and corpse queries are synchronous); the worker
+        // only loads the grids (step 11).
+        if (Map* map = sMapMgr->FindBaseMap(_mapId))
+        {
+            LOG_INFO("server.loading", ">> Loading All Grids For Map {} ({})", map->GetId(), map->GetMapName());
+            map->LoadAllGrids();
+        }
+        else
+            LOG_ERROR("server.loading", "MapPreloadRequest: base map {} was not created before the preload", _mapId);
+
         _updater.update_finished();
     }
 
 private:
     uint32 _mapId;
     MapUpdater& _updater;
-};
-
-class LFGUpdateRequest : public UpdateRequest
-{
-public:
-    LFGUpdateRequest(MapUpdater& u, uint32 d) : m_updater(u), m_diff(d) {}
-
-    void call() override
-    {
-        sLFGMgr->Update(m_diff, 1);
-        m_updater.update_finished();
-    }
-private:
-    MapUpdater& m_updater;
-    uint32 m_diff;
 };
 
 MapUpdater::MapUpdater() : pending_requests(0), _cancelationToken(false)
@@ -139,19 +107,9 @@ void MapUpdater::schedule_task(UpdateRequest* request)
     _queue.Push(request);
 }
 
-void MapUpdater::schedule_update(Map& map, uint32 diff, uint32 s_diff)
-{
-    schedule_task(new MapUpdateRequest(map, *this, diff, s_diff));
-}
-
 void MapUpdater::schedule_map_preload(uint32 mapid)
 {
     schedule_task(new MapPreloadRequest(mapid, *this));
-}
-
-void MapUpdater::schedule_lfg_update(uint32 diff)
-{
-    schedule_task(new LFGUpdateRequest(*this, diff));
 }
 
 bool MapUpdater::activated()

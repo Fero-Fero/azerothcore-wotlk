@@ -41,17 +41,12 @@ void MapInstanced::InitVisibilityDistance()
     }
 }
 
-void MapInstanced::Update(const uint32 t, const uint32 s_diff, bool /*thread*/)
+void MapInstanced::DestroyExpiredInstances(uint32 diff)
 {
-    // take care of loaded GridMaps (when unused, unload it!)
-    Map::Update(t, s_diff, false);
-
-    // update the instanced maps
     InstancedMaps::iterator i = m_InstancedMaps.begin();
-
     while (i != m_InstancedMaps.end())
     {
-        if (i->second->CanUnload(t))
+        if (i->second->CanUnload(diff))
         {
             if (!DestroyInstance(i))                             // iterator incremented
             {
@@ -59,23 +54,8 @@ void MapInstanced::Update(const uint32 t, const uint32 s_diff, bool /*thread*/)
             }
         }
         else
-        {
-            // update only here, because it may schedule some bad things before delete
-            if (sMapMgr->GetMapUpdater()->activated())
-                sMapMgr->GetMapUpdater()->schedule_update(*i->second, t, s_diff);
-            else
-                i->second->Update(t, s_diff);
             ++i;
-        }
     }
-}
-
-void MapInstanced::DelayedUpdate(const uint32 diff)
-{
-    for (InstancedMaps::iterator i = m_InstancedMaps.begin(); i != m_InstancedMaps.end(); ++i)
-        i->second->DelayedUpdate(diff);
-
-    Map::DelayedUpdate(diff); // this may be removed
 }
 
 /*

@@ -16,10 +16,12 @@
  */
 
 #include "Vehicle.h"
+#include "BeatContext.h"
 #include "ObjectAccessor.h"
 #include "AreaDefines.h"
 #include "BattlefieldWG.h"
 #include "Log.h"
+#include "Map.h"
 #include "MoveSplineInit.h"
 #include "ObjectMgr.h"
 #include "Player.h"
@@ -253,6 +255,7 @@ bool Vehicle::HasEmptySeat(int8 seatId) const
 
 Unit* Vehicle::GetPassenger(int8 seatId) const
 {
+    ASSERT_OWNED(_me);
     SeatMap::const_iterator seat = Seats.find(seatId);
     if (seat == Seats.end())
         return nullptr;
@@ -485,6 +488,16 @@ bool Vehicle::AddPassenger(Unit* unit, int8 seatId)
 
     // Remove parachute on vehicle switch
     unit->RemoveAurasDueToSpell(VEHICLE_SPELL_PARACHUTE);
+
+    if (BeatContext::InTask() && _me->FindMap())
+    {
+        TaskGroupJoinDefer rec;
+        rec.root = _me->GetGUID();
+        rec.member = unit->GetGUID();
+        rec.seatId = seatId;
+        rec.charm = 0;
+        _me->GetMap()->AppendDefer(DeferKind::TaskGroupJoin, rec);
+    }
     return true;
 }
 
@@ -543,6 +556,14 @@ void Vehicle::RemovePassenger(Unit* unit)
 
     if (_me->IsCreature() && _me->ToCreature()->IsAIEnabled)
         _me->ToCreature()->AI()->PassengerBoarded(unit, seat->first, false);
+
+    if (BeatContext::InTask() && _me->FindMap())
+    {
+        TaskGroupLeaveDefer rec;
+        rec.member = unit->GetGUID();
+        rec.charm = 0;
+        _me->GetMap()->AppendDefer(DeferKind::TaskGroupLeave, rec);
+    }
 }
 
 void Vehicle::RelocatePassengers()

@@ -469,6 +469,20 @@ void ThreatManager::AddThreat(Unit* target, float amount, SpellInfo const* spell
         amount = 0.0f;
     }
 
+    // The attacker's redirect info: its own list when it is in the running task group, its published slot
+    // otherwise (step 13: the attacker's threat manager belongs to the attacker's task). A private copy: the
+    // nested AddThreat calls below may cause AI calls which modify redirect info through spells. Empty (no
+    // allocation) for everyone but a misdirecting hunter or rogue.
+    std::vector<std::pair<ObjectGuid, uint32>> redirInfo;
+    if (target->IsForeignToTask())
+    {
+        ObjectSlot const& slot = target->ReadSlot();
+        for (uint8 i = 0; i < slot.threatRedirectCount; ++i)
+            redirInfo.emplace_back(slot.threatRedirects[i].guid, slot.threatRedirects[i].pct);
+    }
+    else
+        redirInfo = target->GetThreatMgr()._redirectInfo;
+
     // if we cannot actually have a threat list, we instead just set combat state and avoid creating threat refs altogether
     if (!CanHaveThreatList())
     {
@@ -476,7 +490,7 @@ void ThreatManager::AddThreat(Unit* target, float amount, SpellInfo const* spell
         if (!combatMgr.SetInCombatWith(target))
             return;
         // traverse redirects and put them in combat, too
-        for (auto const& pair : target->GetThreatMgr()._redirectInfo)
+        for (auto const& pair : redirInfo)
             if (!combatMgr.IsInCombatWith(pair.first))
                 if (Unit* redirTarget = ObjectAccessor::GetUnit(*_owner, pair.first))
                     combatMgr.SetInCombatWith(redirTarget);
@@ -490,11 +504,9 @@ void ThreatManager::AddThreat(Unit* target, float amount, SpellInfo const* spell
     // if we're increasing threat, send some/all of it to redirection targets instead if applicable
     if (!ignoreRedirects && amount > 0.0f)
     {
-        auto const& redirInfo = target->GetThreatMgr()._redirectInfo;
         if (!redirInfo.empty())
         {
             float const origAmount = amount;
-            // intentional iteration by index - there's a nested AddThreat call further down that might cause AI calls which might modify redirect info through spells
             for (size_t i = 0; i < redirInfo.size(); ++i)
             {
                 auto const pair = redirInfo[i]; // (victim,pct)

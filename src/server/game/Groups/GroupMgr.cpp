@@ -16,6 +16,7 @@
  */
 
 #include "GroupMgr.h"
+#include "BeatContext.h"
 #include "Common.h"
 #include "DBCStores.h"
 #include "InstanceSaveMgr.h"
@@ -93,11 +94,13 @@ Group* GroupMgr::GetGroupByGUID(ObjectGuid::LowType groupId) const
 
 void GroupMgr::AddGroup(Group* group)
 {
+    ASSERT_NOT_IN_TASK();
     GroupStore[group->GetGUID().GetCounter()] = group;
 }
 
 void GroupMgr::RemoveGroup(Group* group)
 {
+    ASSERT_NOT_IN_TASK();
     GroupStore.erase(group->GetGUID().GetCounter());
 }
 

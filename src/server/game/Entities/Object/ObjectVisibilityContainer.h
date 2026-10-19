@@ -50,29 +50,26 @@ public:
     VisibleWorldObjectsMap::iterator UnlinkVisibilityFromPlayer(WorldObject* worldObject, VisibleWorldObjectsMap::iterator itr);
     VisiblePlayersMap::iterator UnlinkVisibilityFromWorldObject(Player* player, VisiblePlayersMap::iterator itr);
 
+    // Step 10: appliers of the VisibilityLink / VisibilityUnlink records (the target's half, on its own task).
+    void ApplyLinkFromViewer(Player* viewer);
+    void ApplyUnlinkFromViewer(ObjectGuid viewer);
+
     // Returns a list of all players who can see us
-    VisiblePlayersMap& GetVisiblePlayersMap() { return _visiblePlayersMap; }
-    VisiblePlayersMap const& GetVisiblePlayersMap() const { return _visiblePlayersMap; }
+    // Step 13: the maps are the owner's; a foreign task reads the viewer's own map or a slot instead
+    // (ASSERT_OWNED(_selfObject) in debug builds, out of line because WorldObject is incomplete here).
+    VisiblePlayersMap& GetVisiblePlayersMap();
+    VisiblePlayersMap const& GetVisiblePlayersMap() const;
 
     // Returns a list of all worldobjects who we can see
     // Warning: This is for player objects only, all other objects will return a nullptr
-    VisibleWorldObjectsMap* GetVisibleWorldObjectsMap()
-    {
-        if (!_visibleWorldObjectsMap)
-            return nullptr;
-
-        return _visibleWorldObjectsMap.get();
-    }
-
-    VisibleWorldObjectsMap const* GetVisibleWorldObjectsMap() const
-    {
-        if (!_visibleWorldObjectsMap)
-            return nullptr;
-
-        return _visibleWorldObjectsMap.get();
-    }
+    VisibleWorldObjectsMap* GetVisibleWorldObjectsMap();
+    VisibleWorldObjectsMap const* GetVisibleWorldObjectsMap() const;
 
 private:
+
+    // The target's half of a link: a record for a foreign unit, a direct write otherwise.
+    void LinkTargetSide(WorldObject* worldObject);
+    void UnlinkTargetSide(WorldObject* worldObject);
 
     // Directly removes visibility reference. This is to be ONLY used as
     // a more efficient method for cleaning up visibility references.

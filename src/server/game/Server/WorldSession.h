@@ -462,7 +462,11 @@ public:
     bool VerifyMovementInfo(MovementInfo const& movementInfo, Player* plrMover, Unit* mover, Opcodes opcode) const;
     bool ProcessMovementInfo(MovementInfo& movementInfo, Unit* mover, Player* plrMover, WorldPacket& recvData);
 
+    // Thread-safe from any task: enqueues on the socket's own locked queue and reads no session field. The
+    // allowed exception to the one-writer rule for packets to another player (step 13). SendPacketFromAnyThread
+    // is the same call under a name that states the intent at a cross-task site (group / guild broadcasts).
     void SendPacket(WorldPacket const* packet);
+    void SendPacketFromAnyThread(WorldPacket const* packet);
     void SendPetNameInvalid(uint32 error, std::string const& name, DeclinedName* declinedName);
     void SendPartyResult(PartyOperation operation, std::string const& member, PartyResult res, uint32 val = 0);
 

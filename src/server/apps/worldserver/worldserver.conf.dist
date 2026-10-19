@@ -1332,15 +1332,6 @@ MapUpdateInterval = 10
 MapUpdate.Threads = 1
 
 #
-#    MapUpdate.PhaseTiming
-#        Description: Record per-phase durations inside Map::Update and log a
-#                     summary for slow maps. 0 leaves Map::Update unchanged.
-#        Default:     0 - (Off)
-#                     1 - (On, measurement only)
-
-MapUpdate.PhaseTiming = 0
-
-#
 #    MapUpdate.PhaseThreads
 #        Description: Cores that run unit tasks. 1 runs the beat loop on the
 #                     world thread alone and starts no worker thread. Set it

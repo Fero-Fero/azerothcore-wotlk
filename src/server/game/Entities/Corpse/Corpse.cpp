@@ -207,7 +207,7 @@ void Corpse::ResetGhostTime()
     m_time = GameTime::GetGameTime().count();
 }
 
-void Corpse::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target)
+void Corpse::BuildValuesUpdateFrom(uint8 updateType, ByteBuffer* data, Player* target, UpdateValuesSource const& src)
 {
     if (!target)
         return;
@@ -217,17 +217,18 @@ void Corpse::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* targe
     updateMask.SetCount(m_valuesCount);
 
     uint32* flags = nullptr;
-    uint32 visibleFlag = GetUpdateFieldData(target, flags);
+    uint32 visibleFlag = GetUpdateFieldData(target, flags, src);
 
     for (uint16 index = 0; index < m_valuesCount; ++index)
     {
-        if (_fieldNotifyFlags & flags[index] || ((updateType == UPDATETYPE_VALUES ? _changesMask.GetBit(index) : m_uint32Values[index]) && (flags[index] & visibleFlag)))
+        if ((_fieldNotifyFlags | src.notifyFlags) & flags[index] || ((updateType == UPDATETYPE_VALUES ? src.Changed(index) : src.values[index]) && (flags[index] & visibleFlag)))
         {
             updateMask.SetBit(index);
 
             if (index == CORPSE_FIELD_BYTES_1 || index == CORPSE_FIELD_BYTES_2)
             {
-                Player* owner = ObjectAccessor::GetPlayer(*this, GetOwnerGUID());
+                ObjectGuid const ownerGuid(uint64(src.values[CORPSE_FIELD_OWNER]) | (uint64(src.values[CORPSE_FIELD_OWNER + 1]) << 32));
+                Player* owner = ObjectAccessor::GetPlayer(*this, ownerGuid);
                 if (owner && owner != target && sWorld->getBoolConfig(CONFIG_ALLOW_TWO_SIDE_INTERACTION_GROUP) && owner->IsInRaidWith(target) && owner->GetTeamId() != target->GetTeamId())
                 {
                     uint32 playerBytes = target->GetUInt32Value(PLAYER_BYTES);
@@ -254,12 +255,12 @@ void Corpse::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* targe
                 }
                 else
                 {
-                    fieldBuffer << m_uint32Values[index];
+                    fieldBuffer << src.values[index];
                 }
             }
             else
             {
-                fieldBuffer << m_uint32Values[index];
+                fieldBuffer << src.values[index];
             }
         }
     }

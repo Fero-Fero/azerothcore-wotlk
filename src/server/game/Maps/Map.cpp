@@ -17,14 +17,21 @@
 
 #include "Map.h"
 #include "Battleground.h"
+#include "BeatContext.h"
+#include "BeatPool.h"
 #include "CellImpl.h"
 #include "Chat.h"
+#include "Creature.h"
 #include "DisableMgr.h"
 #include "DynamicTree.h"
+#include "GameEventMgr.h"
 #include "GameTime.h"
+#include "GameObject.h"
 #include "Geometry.h"
 #include "GridNotifiers.h"
 #include "Group.h"
+#include "GroupMgr.h"
+#include "InstanceSaveMgr.h"
 #include "InstanceScript.h"
 #include "IVMapMgr.h"
 #include "LFGMgr.h"
@@ -35,7 +42,9 @@
 #include "Object.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
+#include "OutdoorPvP.h"
 #include "Pet.h"
+#include "Player.h"
 #include "PoolMgr.h"
 #include "ScriptMgr.h"
 #include "SpellHitRecord.h"
@@ -46,6 +55,7 @@
 #include "VMapMgr2.h"
 #include "Weather.h"
 #include "WeatherMgr.h"
+#include <algorithm>
 #include <optional>
 
 #define MAP_INVALID_ZONE        0xFFFFFFFF
@@ -76,8 +86,6 @@ Map::Map(uint32 id, uint32 InstanceId, uint8 SpawnMode, Map* _parent) :
     m_parentMap = (_parent ? _parent : this);
 
     _zonePlayerCountMap.clear();
-    _updatableObjectListRecheckTimer.SetInterval(UPDATABLE_OBJECT_LIST_RECHECK_TIMER);
-
     //lets initialize visibility distance for map
     Map::InitVisibilityDistance();
 
@@ -177,8 +185,6 @@ template<>
 void Map::DeleteFromWorld(Player* player)
 {
     ObjectAccessor::RemoveObject(player);
-
-    RemoveUpdateObject(player); //TODO: I do not know why we need this, it should be removed in ~Object anyway
     delete player;
 }
 
@@ -276,6 +282,9 @@ bool Map::AddPlayerToMap(Player* player)
     player->SetMap(this);
     player->AddToWorld();
 
+    // Step 12: the player's first task on this map runs next beat.
+    sBeatPool->Schedule(player->TaskRoot());
+
     SendInitTransports(player);
     SendInitSelf(player);
 
@@ -328,6 +337,16 @@ bool Map::AddToMap(T* obj, bool checkTransport)
         return false; //Should delete object
     }
 
+    // Step 09: a summon constructed on a unit task is not in the store yet; the seal inserts it.
+    if (BeatContext::InTask())
+    {
+        AddToMapDefer rec;
+        rec.obj = obj;
+        rec.checkTransport = checkTransport ? 1 : 0;
+        AppendDefer(DeferKind::AddToMap, rec);
+        return true;
+    }
+
     Cell cell(cellCoord);
     if (obj->isActiveObject())
         EnsureGridLoaded(cell);
@@ -364,6 +383,15 @@ bool Map::AddToMap(Transport* obj, bool /*checkTransport*/)
     //TODO: Needs clean up. An object should not be added to map twice.
     if (obj->IsInWorld())
         return true;
+
+    if (BeatContext::InTask())
+    {
+        AddToMapDefer rec;
+        rec.obj = obj;
+        rec.checkTransport = 0;
+        AppendDefer(DeferKind::AddToMap, rec);
+        return true;
+    }
 
     CellCoord cellCoord = Acore::ComputeCellCoord(obj->GetPositionX(), obj->GetPositionY());
     if (!cellCoord.IsCoordValid())
@@ -405,8 +433,25 @@ void Map::MarkNearbyCellsOf(WorldObject* obj)
     if (!obj->IsPositionValid())
         return;
 
-    // Update mobs/objects in ALL visible cells around object!
     CellArea area = Cell::CalculateCellArea(obj->GetPositionX(), obj->GetPositionY(), obj->GetGridActivationRange());
+    if (BeatContext::InTask())
+    {
+        CellMarkDefer rec;
+        for (uint32 x = area.low_bound.x_coord; x <= area.high_bound.x_coord; ++x)
+        {
+            for (uint32 y = area.low_bound.y_coord; y <= area.high_bound.y_coord; ++y)
+            {
+                if (rec.count >= MAX_CELL_MARKS)
+                    break;
+                rec.cellIds[rec.count++] = (y * TOTAL_NUMBER_OF_CELLS_PER_MAP) + x;
+            }
+        }
+        if (rec.count)
+            AppendDefer(DeferKind::CellMark, rec);
+        return;
+    }
+
+    // Update mobs/objects in ALL visible cells around object!
     for (uint32 x = area.low_bound.x_coord; x <= area.high_bound.x_coord; ++x)
     {
         for (uint32 y = area.low_bound.y_coord; y <= area.high_bound.y_coord; ++y)
@@ -424,6 +469,15 @@ void Map::UpdatePlayerZoneStats(uint32 oldZone, uint32 newZone)
     if (oldZone == newZone)
         return;
 
+    if (BeatContext::InTask())
+    {
+        ZonePlayerCountDefer rec;
+        rec.oldZone = oldZone;
+        rec.newZone = newZone;
+        AppendDefer(DeferKind::ZonePlayerCount, rec);
+        return;
+    }
+
     if (oldZone != MAP_INVALID_ZONE)
     {
         uint32& oldZoneCount = _zonePlayerCountMap[oldZone];
@@ -435,110 +489,11 @@ void Map::UpdatePlayerZoneStats(uint32 oldZone, uint32 newZone)
         ++_zonePlayerCountMap[newZone];
 }
 
-void Map::Update(const uint32 t_diff, const uint32 s_diff, bool  /*thread*/)
+// Step 12: seal phase S1b, one task per map. Everything that used to sit between the object updates and the
+// end of Map::Update lands here, after every unit task of the beat ran.
+void Map::SealApply(uint32 diff)
 {
-    std::optional<MapPhaseClock> phases;
-    if (sWorld->getBoolConfig(CONFIG_MAPUPDATE_PHASE_TIMING))
-        phases.emplace(&_phaseTiming, *this);
-    auto nextPhase = [&](MapUpdatePhase p) { if (phases) phases->Next(p); };
-
-    // Records written to this map's objects in the previous beat land before anything runs this beat.
-    ApplyInboxes();
-
-    if (t_diff)
-    {
-        nextPhase(MapUpdatePhase::DynamicTree);
-        _mapCollisionData.GetDynamicTree().update(t_diff);
-    }
-
-    // Update world sessions and players
-    nextPhase(MapUpdatePhase::Sessions);
-    for (m_mapRefIter = m_mapRefMgr.begin(); m_mapRefIter != m_mapRefMgr.end(); ++m_mapRefIter)
-    {
-        Player* player = m_mapRefIter->GetSource();
-        if (player && player->IsInWorld())
-        {
-            // Map-side packets and the player's update run as the player's task (step 12 keeps them together).
-            TaskScope task(player, player);
-
-            // Update session
-            WorldSession* session = player->GetSession();
-            MapSessionFilter updater(session);
-            session->Update(s_diff, updater);
-
-            // update players at tick
-            if (!t_diff)
-            {
-                player->Update(s_diff);
-                player->PublishSlot();
-            }
-        }
-    }
-
-    nextPhase(MapUpdatePhase::Respawn);
-    Events.Update(t_diff);
-
-    if (!t_diff)
-    {
-        HandleDelayedVisibility();
-        if (phases)
-            phases->Abandon();
-        return;
-    }
-
-    /// Process any due respawns (non-compatibility mode spawns)
-    if (!sWorld->getBoolConfig(CONFIG_RESPAWN_FORCE_COMPATIBILITY_MODE))
-    {
-        if (_respawnCheckTimer <= t_diff)
-        {
-            ProcessRespawns();
-            _respawnCheckTimer = 5000; // Check every 5 seconds
-        }
-        else
-            _respawnCheckTimer -= t_diff;
-    }
-
-    _updatableObjectListRecheckTimer.Update(t_diff);
-    resetMarkedCells();
-
-    // Update players
-    nextPhase(MapUpdatePhase::Players);
-    for (m_mapRefIter = m_mapRefMgr.begin(); m_mapRefIter != m_mapRefMgr.end(); ++m_mapRefIter)
-    {
-        Player* player = m_mapRefIter->GetSource();
-
-        if (!player || !player->IsInWorld())
-            continue;
-
-        {
-            TaskScope task(player, player);
-            player->Update(s_diff);
-            player->PublishSlot();
-        }
-
-        if (_updatableObjectListRecheckTimer.Passed())
-        {
-            MarkNearbyCellsOf(player);
-
-            // If player is using far sight, update viewpoint
-            if (WorldObject* viewPoint = player->GetViewpoint())
-            {
-                if (Creature* viewCreature = viewPoint->ToCreature())
-                    MarkNearbyCellsOf(viewCreature);
-                else if (DynamicObject* viewObject = viewPoint->ToDynObject())
-                    MarkNearbyCellsOf(viewObject);
-            }
-        }
-    }
-
-    nextPhase(MapUpdatePhase::NonPlayers);
-    UpdateNonPlayerObjects(t_diff);
-
-    nextPhase(MapUpdatePhase::ObjectUpdates);
-    SendObjectUpdates();
-
     ///- Process necessary scripts
-    nextPhase(MapUpdatePhase::Scripts);
     if (!m_scriptSchedule.empty())
     {
         i_scriptLock = true;
@@ -546,21 +501,50 @@ void Map::Update(const uint32 t_diff, const uint32 s_diff, bool  /*thread*/)
         i_scriptLock = false;
     }
 
-    nextPhase(MapUpdatePhase::Movement);
     MoveAllCreaturesInMoveList();
     MoveAllGameObjectsInMoveList();
     MoveAllDynamicObjectsInMoveList();
 
-    nextPhase(MapUpdatePhase::Visibility);
-    HandleDelayedVisibility();
+    // Step 09: map-container writes appended during the object updates land here. Map-local kinds only; the
+    // global kinds wait for S2.
+    ApplyDefers();
 
-    nextPhase(MapUpdatePhase::Tail);
-    UpdatePlayersRedirectKickEvent(t_diff);
+    // Newcomers to the updatable list: their first task runs next beat.
+    for (WorldObject* obj : _pendingAddUpdatableObjectList)
+    {
+        _AddObjectToUpdateList(obj);
+        sBeatPool->Schedule(obj->TaskRoot());
+    }
+    _pendingAddUpdatableObjectList.clear();
 
-    UpdateWeather(t_diff);
-    UpdateExpiredCorpses(t_diff);
+    // Transports, then the remove list (frees happen here, after every task of the beat).
+    DelayedUpdate(diff);
+}
 
-    sScriptMgr->OnMapUpdate(this, t_diff);
+void Map::BeatEpilogue(uint32 diff)
+{
+    _mapCollisionData.GetDynamicTree().update(diff);
+
+    Events.Update(diff);
+
+    /// Process any due respawns (non-compatibility mode spawns)
+    if (!sWorld->getBoolConfig(CONFIG_RESPAWN_FORCE_COMPATIBILITY_MODE))
+    {
+        if (_respawnCheckTimer <= diff)
+        {
+            ProcessRespawns();
+            _respawnCheckTimer = 5000; // Check every 5 seconds
+        }
+        else
+            _respawnCheckTimer -= diff;
+    }
+
+    UpdatePlayersRedirectKickEvent(diff);
+
+    UpdateWeather(diff);
+    UpdateExpiredCorpses(diff);
+
+    sScriptMgr->OnMapUpdate(this, diff);
 
     // Deferred spell hits: both units live, no task running (step 07 §11)
     ApplyDeferredSpellHits();
@@ -572,39 +556,6 @@ void Map::Update(const uint32 t_diff, const uint32 s_diff, bool  /*thread*/)
     METRIC_VALUE("map_gameobjects", uint64(GetObjectsStore().Size<GameObject>()),
         METRIC_TAG("map_id", std::to_string(GetId())),
         METRIC_TAG("map_instanceid", std::to_string(GetInstanceId())));
-
-    BeatContext::FlushForeignReads();
-}
-
-void Map::ApplyInboxes()
-{
-    // Collect first: an applier may wake, add or remove list members (a CombatEnd can despawn through AI).
-    thread_local std::vector<WorldObject*> withInbox;
-    withInbox.clear();
-
-    for (MapReference const& ref : m_mapRefMgr)
-        if (Player* player = ref.GetSource())
-            if (player->HasInbox())
-                withInbox.push_back(player);
-
-    for (WorldObject* obj : _updatableObjectList)
-        if (obj->HasInbox())
-            withInbox.push_back(obj);
-
-    for (WorldObject* obj : _pendingAddUpdatableObjectList)
-        if (obj->HasInbox())
-            withInbox.push_back(obj);
-
-    for (WorldObject* obj : withInbox)
-    {
-        // Records whose target is gone are dropped. Nothing in this list has been freed: frees happen at the
-        // end of the tick, after every map updated.
-        if (!obj->IsInWorld() || obj->IsRemoving())
-            continue;
-
-        TaskScope task(obj, obj);
-        obj->ApplyInbox();
-    }
 }
 
 void Map::DeferSpellHit(DeferredSpellHitRecord const& hit)
@@ -635,52 +586,469 @@ void Map::ApplyDeferredSpellHits()
     }
 }
 
-void Map::UpdateNonPlayerObjects(uint32 const diff)
+WorldObject* Map::GetWorldObjectForDefer(ObjectGuid const& guid)
 {
-    for (WorldObject* obj : _pendingAddUpdatableObjectList)
-        _AddObjectToUpdateList(obj);
-    _pendingAddUpdatableObjectList.clear();
+    if (guid.IsEmpty())
+        return nullptr;
+    if (guid.IsPlayer())
+        return ObjectAccessor::GetPlayer(this, guid);
+    if (guid.IsPet())
+        return GetPet(guid);
+    if (guid.IsAnyTypeCreature())
+        return GetCreature(guid);
+    if (guid.IsAnyTypeGameObject())
+        return GetGameObject(guid);
+    if (guid.IsDynamicObject())
+        return GetDynamicObject(guid);
+    if (guid.IsCorpse())
+        return GetCorpse(guid);
+    return nullptr;
+}
 
-    if (_updatableObjectListRecheckTimer.Passed())
-    {
-        for (uint32 i = 0; i < _updatableObjectList.size();)
+void Map::ApplyDefers()
+{
+    ASSERT(!BeatContext::InTask());
+
+    std::vector<DeferHeader const*> all;
+    _defers.DrainInto(all);
+
+    bool anyMark = false;
+    for (DeferHeader const* hdr : all)
+        if (hdr->kind == DeferKind::CellMark && !IsGlobalDefer(hdr->kind))
         {
-            WorldObject* obj = _updatableObjectList[i];
-            if (!obj->IsInWorld())
-            {
-                ++i;
-                continue;
-            }
-
-            {
-                TaskScope task(obj, obj);
-                obj->Update(diff);
-                obj->PublishSlot();
-            }
-
-            if (!obj->IsUpdateNeeded())
-            {
-                _RemoveObjectFromUpdateList(obj);
-                // Intentional no iteration here, obj is swapped with last element in
-                // _updatableObjectList so next loop will update that object at the same index
-            }
-            else
-                ++i;
+            anyMark = true;
+            break;
         }
-        _updatableObjectListRecheckTimer.Reset();
+    if (anyMark)
+        resetMarkedCells();
+
+    std::stable_sort(all.begin(), all.end(), [](DeferHeader const* a, DeferHeader const* b)
+    {
+        return a->sequence < b->sequence;
+    });
+
+    for (DeferHeader const* hdr : all)
+    {
+        if (IsGlobalDefer(hdr->kind))
+            continue;
+        ApplyDefer(*hdr, reinterpret_cast<uint8 const*>(hdr) + DEFER_HEADER_SIZE);
     }
-    else
-    {
-        for (uint32 i = 0; i < _updatableObjectList.size(); ++i)
-        {
-            WorldObject* obj = _updatableObjectList[i];
-            if (!obj->IsInWorld())
-                continue;
+}
 
-            TaskScope task(obj, obj);
-            obj->Update(diff);
-            obj->PublishSlot();
+uint32 Map::ApplyGlobalDefers()
+{
+    ASSERT(!BeatContext::InTask());
+
+    std::vector<DeferHeader const*> all;
+    _defers.DrainInto(all);
+
+    std::stable_sort(all.begin(), all.end(), [](DeferHeader const* a, DeferHeader const* b)
+    {
+        return a->sequence < b->sequence;
+    });
+
+    uint32 applied = 0;
+    for (DeferHeader const* hdr : all)
+    {
+        if (!IsGlobalDefer(hdr->kind))
+            continue;
+        ApplyDefer(*hdr, reinterpret_cast<uint8 const*>(hdr) + DEFER_HEADER_SIZE);
+        ++applied;
+    }
+
+    _defers.Reset();
+    return applied;
+}
+
+void Map::ApplyDefer(DeferHeader const& header, uint8 const* payload)
+{
+    switch (header.kind)
+    {
+        case DeferKind::Relink:
+            ApplyRelink(DeferPayload<RelinkDefer>(payload));
+            break;
+        case DeferKind::GridLoad:
+        {
+            Cell cell;
+            cell.data.All = DeferPayload<GridLoadDefer>(payload).cell;
+            EnsureGridLoaded(cell);
+            break;
         }
+        case DeferKind::AddToMap:
+            ApplyAddToMap(DeferPayload<AddToMapDefer>(payload));
+            break;
+        case DeferKind::RemoveFromMap:
+            ApplyRemoveFromMap(DeferPayload<RemoveFromMapDefer>(payload));
+            break;
+        case DeferKind::ScriptSchedule:
+            ApplyScriptSchedule(DeferPayload<ScriptScheduleDefer>(payload));
+            break;
+        case DeferKind::CellMark:
+            ApplyCellMark(DeferPayload<CellMarkDefer>(payload));
+            break;
+        case DeferKind::UpdateListAdd:
+            ApplyUpdateListAdd(DeferPayload<UpdateListDefer>(payload));
+            break;
+        case DeferKind::UpdateListRemove:
+            ApplyUpdateListRemove(DeferPayload<UpdateListDefer>(payload));
+            break;
+        case DeferKind::DynTreeInsert:
+            ApplyDynTreeInsert(DeferPayload<DynTreeDefer>(payload));
+            break;
+        case DeferKind::DynTreeRemove:
+            ApplyDynTreeRemove(DeferPayload<DynTreeDefer>(payload));
+            break;
+        case DeferKind::ZonePlayerCount:
+        {
+            ZonePlayerCountDefer const& rec = DeferPayload<ZonePlayerCountDefer>(payload);
+            UpdatePlayerZoneStats(rec.oldZone, rec.newZone);
+            break;
+        }
+        case DeferKind::GroupEndRoll:
+            ApplyGroupEndRoll(DeferPayload<GroupEndRollDefer>(payload));
+            break;
+        case DeferKind::BattlegroundEvent:
+            ApplyBattlegroundEvent(DeferPayload<BattlegroundEventDefer>(payload));
+            break;
+        case DeferKind::OutdoorPvPEvent:
+            ApplyOutdoorPvPEvent(DeferPayload<OutdoorPvPEventDefer>(payload));
+            break;
+        case DeferKind::DuelEnd:
+            ApplyDuelEnd(DeferPayload<DuelEndDefer>(payload));
+            break;
+        case DeferKind::DeferredSpellHit:
+            break;
+        case DeferKind::MapChange:
+            ApplyMapChange(DeferPayload<MapChangeDefer>(payload));
+            break;
+        case DeferKind::TaskGroupJoin:
+        {
+            TaskGroupJoinDefer const& rec = DeferPayload<TaskGroupJoinDefer>(payload);
+            WorldObject* member = GetWorldObjectForDefer(rec.member);
+            WorldObject* root = GetWorldObjectForDefer(rec.root);
+            if (member && root && member->IsInWorld() && root->IsInWorld())
+                member->JoinTaskGroup(root);
+            break;
+        }
+        case DeferKind::TaskGroupLeave:
+        {
+            TaskGroupLeaveDefer const& rec = DeferPayload<TaskGroupLeaveDefer>(payload);
+            if (WorldObject* member = GetWorldObjectForDefer(rec.member))
+                member->LeaveTaskGroup();
+            break;
+        }
+        case DeferKind::PoolEvent:
+            ApplyPoolEvent(DeferPayload<PoolEventDefer>(payload));
+            break;
+        case DeferKind::InstanceBind:
+            ApplyInstanceBind(DeferPayload<InstanceBindDefer>(payload));
+            break;
+        case DeferKind::GameEventAction:
+            ApplyGameEventAction(DeferPayload<GameEventActionDefer>(payload));
+            break;
+        case DeferKind::Spawn:
+            ApplySpawn(DeferPayload<SpawnDefer>(payload));
+            break;
+        default:
+            LOG_DEBUG("maps.defers", "ApplyDefer: no applier for {}", DeferKindName(header.kind));
+            break;
+    }
+}
+
+void Map::RelinkObjectNow(WorldObject* obj, Cell const& oldCell, Cell const& newCell)
+{
+    if (!obj->IsInWorld())
+        return;
+
+    if (obj->IsFarVisible())
+        RemoveWorldObjectFromFarVisibleMap(obj);
+
+    if (oldCell.DiffGrid(newCell))
+        EnsureGridLoaded(newCell);
+
+    // IsInGrid/RemoveFromGrid live on GridObject<T>, so the unlink is per concrete type.
+    auto relink = [&](auto* typed)
+    {
+        if (typed->IsInGrid())
+            typed->RemoveFromGrid();
+        AddToGrid(typed, newCell);
+    };
+
+    if (Player* player = obj->ToPlayer())
+        relink(player);
+    else if (Creature* creature = obj->ToCreature())
+        relink(creature);
+    else if (GameObject* go = obj->ToGameObject())
+        relink(go);
+    else if (DynamicObject* dyn = obj->ToDynObject())
+        relink(dyn);
+}
+
+void Map::ApplyRelink(RelinkDefer const& rec)
+{
+    WorldObject* obj = GetWorldObjectForDefer(rec.guid);
+    if (!obj)
+        return;
+
+    Cell oldCell;
+    oldCell.data.All = rec.oldCell;
+    // Two Relinks of one object in one tick collapse to the last: the live position is what the owner wrote.
+    Cell newCell(obj->GetPositionX(), obj->GetPositionY());
+    RelinkObjectNow(obj, oldCell, newCell);
+}
+
+void Map::ApplyAddToMap(AddToMapDefer const& rec)
+{
+    WorldObject* obj = rec.obj;
+    if (!obj)
+        return;
+
+    if (Transport* transport = obj->ToGameObject() ? obj->ToGameObject()->ToTransport() : nullptr)
+        AddToMap(transport, false);
+    else if (Creature* creature = obj->ToCreature())
+        AddToMap(creature, rec.checkTransport != 0);
+    else if (GameObject* go = obj->ToGameObject())
+        AddToMap(go, rec.checkTransport != 0);
+    else if (DynamicObject* dyn = obj->ToDynObject())
+        AddToMap(dyn, rec.checkTransport != 0);
+    else if (Corpse* corpse = obj->ToCorpse())
+        AddToMap(corpse, rec.checkTransport != 0);
+}
+
+void Map::RemoveListedObject(WorldObject* obj)
+{
+    switch (obj->GetTypeId())
+    {
+        case TYPEID_CORPSE:
+        {
+            Corpse* corpse = ObjectAccessor::GetCorpse(*obj, obj->GetGUID());
+            if (!corpse)
+                LOG_ERROR("maps", "Tried to delete corpse/bones {} that is not in map.", obj->GetGUID().ToString());
+            else
+                RemoveFromMap(corpse, true);
+            break;
+        }
+        case TYPEID_DYNAMICOBJECT:
+            RemoveFromMap((DynamicObject*)obj, true);
+            break;
+        case TYPEID_GAMEOBJECT:
+            if (Transport* transport = obj->ToGameObject()->ToTransport())
+                RemoveFromMap(transport, true);
+            else
+                RemoveFromMap(obj->ToGameObject(), true);
+            break;
+        case TYPEID_UNIT:
+            ASSERT(obj->IsRemoving());
+            obj->ToCreature()->CleanupsBeforeDelete();
+            RemoveFromMap(obj->ToCreature(), true);
+            break;
+        default:
+            LOG_ERROR("maps", "Non-grid object (TypeId: {}) is in grid object remove list, ignored.", obj->GetTypeId());
+            break;
+    }
+}
+
+void Map::ApplyRemoveFromMap(RemoveFromMapDefer const& rec)
+{
+    WorldObject* obj = GetWorldObjectForDefer(rec.guid);
+    if (!obj)
+        return;
+
+    if (!rec.prepared && !obj->IsRemoving())
+        obj->PrepareRemoval();
+
+    RemoveListedObject(obj);
+}
+
+void Map::ApplyScriptSchedule(ScriptScheduleDefer const& rec)
+{
+    Object* source = rec.source ? GetWorldObjectForDefer(rec.source) : nullptr;
+    Object* target = rec.target ? GetWorldObjectForDefer(rec.target) : nullptr;
+
+    if (rec.scripts)
+    {
+        ScriptMapMap const& scripts = *static_cast<ScriptMapMap const*>(rec.scripts);
+        ScriptsStart(scripts, rec.id, source, target);
+        return;
+    }
+
+    if (rec.script)
+        ScriptCommandStart(*static_cast<ScriptInfo const*>(rec.script), rec.delay, source, target);
+}
+
+void Map::ApplyCellMark(CellMarkDefer const& rec)
+{
+    for (uint16 i = 0; i < rec.count && i < MAX_CELL_MARKS; ++i)
+        markCell(rec.cellIds[i]);
+}
+
+void Map::ApplyUpdateListAdd(UpdateListDefer const& rec)
+{
+    WorldObject* obj = GetWorldObjectForDefer(rec.guid);
+    if (obj)
+        AddObjectToPendingUpdateList(obj);
+}
+
+void Map::ApplyUpdateListRemove(UpdateListDefer const& rec)
+{
+    WorldObject* obj = GetWorldObjectForDefer(rec.guid);
+    if (obj)
+        RemoveObjectFromMapUpdateList(obj);
+}
+
+void Map::InsertGameObjectModel(GameObjectModel const& model)
+{
+    if (BeatContext::InTask())
+    {
+        // The model is owned by the GO whose task is running; apply looks it up by that GO's guid.
+        if (WorldObject* owner = BeatContext::root)
+        {
+            DynTreeDefer rec;
+            rec.goGuid = owner->GetGUID();
+            AppendDefer(DeferKind::DynTreeInsert, rec);
+            return;
+        }
+    }
+    _mapCollisionData.GetDynamicTree().insert(model);
+}
+
+void Map::RemoveGameObjectModel(GameObjectModel const& model)
+{
+    if (BeatContext::InTask())
+    {
+        if (WorldObject* owner = BeatContext::root)
+        {
+            DynTreeDefer rec;
+            rec.goGuid = owner->GetGUID();
+            AppendDefer(DeferKind::DynTreeRemove, rec);
+            return;
+        }
+    }
+    _mapCollisionData.GetDynamicTree().remove(model);
+}
+
+void Map::ApplyDynTreeInsert(DynTreeDefer const& rec)
+{
+    GameObject* go = GetGameObject(rec.goGuid);
+    if (go && go->m_model)
+        _mapCollisionData.GetDynamicTree().insert(*go->m_model);
+}
+
+void Map::ApplyDynTreeRemove(DynTreeDefer const& rec)
+{
+    GameObject* go = GetGameObject(rec.goGuid);
+    if (go && go->m_model)
+        _mapCollisionData.GetDynamicTree().remove(*go->m_model);
+}
+
+void Map::ApplyGroupEndRoll(GroupEndRollDefer const& rec)
+{
+    Group* group = sGroupMgr->GetGroupByGUID(rec.groupGuid.GetCounter());
+    if (!group)
+        return;
+
+    WorldObject* obj = GetWorldObjectForDefer(rec.corpseGuid);
+    if (!obj)
+        return;
+
+    if (Creature* creature = obj->ToCreature())
+        group->EndRoll(&creature->loot);
+    else if (GameObject* go = obj->ToGameObject())
+        group->EndRoll(&go->loot);
+}
+
+void Map::ApplyBattlegroundEvent(BattlegroundEventDefer const& rec)
+{
+    Player* killer = ObjectAccessor::FindPlayer(rec.killer);
+    if (!killer)
+        return;
+
+    Battleground* bg = killer->GetBattleground();
+    if (!bg)
+        return;
+
+    if (rec.kind == 0)
+    {
+        if (Player* victim = ObjectAccessor::FindPlayer(rec.victim))
+            bg->HandleKillPlayer(victim, killer);
+    }
+    else if (Creature* victim = GetCreature(rec.victim))
+        bg->HandleKillUnit(victim, killer);
+}
+
+void Map::ApplyOutdoorPvPEvent(OutdoorPvPEventDefer const& rec)
+{
+    Player* killer = ObjectAccessor::FindPlayer(rec.killer);
+    if (!killer)
+        return;
+
+    Unit* victim = ObjectAccessor::GetUnit(*killer, rec.victim);
+    if (!victim)
+        return;
+
+    if (OutdoorPvP* pvp = killer->GetOutdoorPvP())
+        pvp->HandleKill(killer, victim);
+}
+
+void Map::ApplyDuelEnd(DuelEndDefer const& rec)
+{
+    Player* player = ObjectAccessor::FindPlayer(rec.player);
+    if (player)
+        player->DuelComplete(DuelCompleteType(rec.type));
+}
+
+void Map::ApplyMapChange(MapChangeDefer const& rec)
+{
+    Player* player = ObjectAccessor::FindPlayer(rec.player);
+    if (!player)
+        return;
+
+    Unit* target = rec.target ? ObjectAccessor::GetUnit(*player, rec.target) : nullptr;
+    player->TeleportTo(rec.mapId, rec.x, rec.y, rec.z, rec.o, rec.options, target, rec.newInstance != 0);
+}
+
+void Map::ApplyPoolEvent(PoolEventDefer const& rec)
+{
+    if (rec.typeId == TYPEID_UNIT)
+        sPoolMgr->UpdatePool<Creature>(GetPoolData(), rec.poolId, rec.spawnId);
+    else if (rec.typeId == TYPEID_GAMEOBJECT)
+        sPoolMgr->UpdatePool<GameObject>(GetPoolData(), rec.poolId, rec.spawnId);
+}
+
+void Map::ApplyInstanceBind(InstanceBindDefer const& rec)
+{
+    if (rec.player)
+    {
+        if (Player* player = ObjectAccessor::FindConnectedPlayer(rec.player))
+            player->BindToInstance();
+        return;
+    }
+
+    if (InstanceMap* instance = ToInstanceMap())
+        instance->PermBindAllPlayers();
+}
+
+void Map::ApplyGameEventAction(GameEventActionDefer const& rec)
+{
+    if (rec.start)
+        sGameEventMgr->StartEvent(rec.eventId, rec.overwrite != 0);
+    else
+        sGameEventMgr->StopEvent(rec.eventId, rec.overwrite != 0);
+}
+
+void Map::ApplySpawn(SpawnDefer const& rec)
+{
+    if (rec.type == SPAWN_TYPE_CREATURE)
+    {
+        Creature* creature = new Creature();
+        if (!creature->LoadCreatureFromDB(rec.spawnId, this, true, true))
+            delete creature;
+    }
+    else if (rec.type == SPAWN_TYPE_GAMEOBJECT)
+    {
+        GameObject* gameobject = new GameObject();
+        if (!gameobject->LoadGameObjectFromDB(rec.spawnId, this, true))
+            delete gameobject;
     }
 }
 
@@ -692,6 +1060,14 @@ void Map::AddObjectToPendingUpdateList(WorldObject* obj)
     UpdatableMapObject* mapUpdatableObject = dynamic_cast<UpdatableMapObject*>(obj);
     if (!mapUpdatableObject || mapUpdatableObject->GetUpdateState() != UpdatableMapObject::UpdateState::NotUpdating)
         return;
+
+    if (BeatContext::InTask())
+    {
+        UpdateListDefer rec;
+        rec.guid = obj->GetGUID();
+        AppendDefer(DeferKind::UpdateListAdd, rec);
+        return;
+    }
 
     _pendingAddUpdatableObjectList.insert(obj);
     mapUpdatableObject->SetUpdateState(UpdatableMapObject::UpdateState::PendingAdd);
@@ -728,6 +1104,14 @@ void Map::RemoveObjectFromMapUpdateList(WorldObject* obj)
 {
     if (!obj->CanBeAddedToMapUpdateList())
         return;
+
+    if (BeatContext::InTask())
+    {
+        UpdateListDefer rec;
+        rec.guid = obj->GetGUID();
+        AppendDefer(DeferKind::UpdateListRemove, rec);
+        return;
+    }
 
     UpdatableMapObject* mapUpdatableObject = dynamic_cast<UpdatableMapObject*>(obj);
     if (mapUpdatableObject->GetUpdateState() == UpdatableMapObject::UpdateState::PendingAdd)
@@ -797,15 +1181,6 @@ ZoneWideVisibleWorldObjectsSet const* Map::GetZoneWideVisibleWorldObjectsForZone
         return nullptr;
 
     return &itr->second;
-}
-
-void Map::HandleDelayedVisibility()
-{
-    if (i_objectsForDelayedVisibility.empty())
-        return;
-    for (std::unordered_set<Unit*>::iterator itr = i_objectsForDelayedVisibility.begin(); itr != i_objectsForDelayedVisibility.end(); ++itr)
-        (*itr)->ExecuteDelayedUnitRelocationEvent();
-    i_objectsForDelayedVisibility.clear();
 }
 
 struct ResetNotifier
@@ -910,20 +1285,32 @@ void Map::PlayerRelocation(Player* player, float x, float y, float z, float o)
     Cell old_cell(player->GetPositionX(), player->GetPositionY());
     Cell new_cell(x, y);
 
-    if (old_cell.DiffGrid(new_cell) || old_cell.DiffCell(new_cell))
-    {
-        player->RemoveFromGrid();
-
-        if (old_cell.DiffGrid(new_cell))
-            EnsureGridLoaded(new_cell);
-
-        AddToGrid(player, new_cell);
-    }
-
     player->Relocate(x, y, z, o);
     if (player->IsVehicle())
         player->GetVehicleKit()->RelocatePassengers();
     player->UpdatePositionData();
+
+    if (old_cell.DiffGrid(new_cell) || old_cell.DiffCell(new_cell))
+    {
+        if (BeatContext::InTask())
+        {
+            if (old_cell.DiffGrid(new_cell))
+            {
+                GridLoadDefer load;
+                load.cell = new_cell.data.All;
+                AppendDefer(DeferKind::GridLoad, load);
+            }
+            RelinkDefer rec;
+            rec.guid = player->GetGUID();
+            rec.oldCell = old_cell.data.All;
+            rec.newCell = new_cell.data.All;
+            AppendDefer(DeferKind::Relink, rec);
+        }
+        else
+            RelinkObjectNow(player, old_cell, new_cell);
+    }
+
+    // Arms the relocation timer; the scan itself runs in the player's view phase (step 10).
     player->UpdateObjectVisibility(false);
 }
 
@@ -936,12 +1323,28 @@ void Map::CreatureRelocation(Creature* creature, float x, float y, float z, floa
 
     if (cellChanged)
     {
-        if (old_cell.DiffGrid(new_cell))
-            EnsureGridLoaded(new_cell);
-
-        AddCreatureToMoveList(creature);
+        if (BeatContext::InTask())
+        {
+            if (old_cell.DiffGrid(new_cell))
+            {
+                GridLoadDefer load;
+                load.cell = new_cell.data.All;
+                AppendDefer(DeferKind::GridLoad, load);
+            }
+            RelinkDefer rec;
+            rec.guid = creature->GetGUID();
+            rec.oldCell = old_cell.data.All;
+            rec.newCell = new_cell.data.All;
+            AppendDefer(DeferKind::Relink, rec);
+        }
+        else
+        {
+            if (old_cell.DiffGrid(new_cell))
+                EnsureGridLoaded(new_cell);
+            AddCreatureToMoveList(creature);
+        }
     }
-    else
+    else if (!BeatContext::InTask())
         RemoveCreatureFromMoveList(creature);
 
     creature->Relocate(x, y, z, o);
@@ -978,12 +1381,28 @@ void Map::GameObjectRelocation(GameObject* go, float x, float y, float z, float 
 
     if (old_cell.DiffGrid(new_cell) || old_cell.DiffCell(new_cell))
     {
-        if (old_cell.DiffGrid(new_cell))
-            EnsureGridLoaded(new_cell);
-
-        AddGameObjectToMoveList(go);
+        if (BeatContext::InTask())
+        {
+            if (old_cell.DiffGrid(new_cell))
+            {
+                GridLoadDefer load;
+                load.cell = new_cell.data.All;
+                AppendDefer(DeferKind::GridLoad, load);
+            }
+            RelinkDefer rec;
+            rec.guid = go->GetGUID();
+            rec.oldCell = old_cell.data.All;
+            rec.newCell = new_cell.data.All;
+            AppendDefer(DeferKind::Relink, rec);
+        }
+        else
+        {
+            if (old_cell.DiffGrid(new_cell))
+                EnsureGridLoaded(new_cell);
+            AddGameObjectToMoveList(go);
+        }
     }
-    else
+    else if (!BeatContext::InTask())
         RemoveGameObjectFromMoveList(go);
 
     go->Relocate(x, y, z, o);
@@ -999,12 +1418,28 @@ void Map::DynamicObjectRelocation(DynamicObject* dynObj, float x, float y, float
 
     if (old_cell.DiffGrid(new_cell) || old_cell.DiffCell(new_cell))
     {
-        if (old_cell.DiffGrid(new_cell))
-            EnsureGridLoaded(new_cell);
-
-        AddDynamicObjectToMoveList(dynObj);
+        if (BeatContext::InTask())
+        {
+            if (old_cell.DiffGrid(new_cell))
+            {
+                GridLoadDefer load;
+                load.cell = new_cell.data.All;
+                AppendDefer(DeferKind::GridLoad, load);
+            }
+            RelinkDefer rec;
+            rec.guid = dynObj->GetGUID();
+            rec.oldCell = old_cell.data.All;
+            rec.newCell = new_cell.data.All;
+            AppendDefer(DeferKind::Relink, rec);
+        }
+        else
+        {
+            if (old_cell.DiffGrid(new_cell))
+                EnsureGridLoaded(new_cell);
+            AddDynamicObjectToMoveList(dynObj);
+        }
     }
-    else
+    else if (!BeatContext::InTask())
         RemoveDynamicObjectFromMoveList(dynObj);
 
     dynObj->Relocate(x, y, z, o);
@@ -1831,34 +2266,6 @@ void Map::SendRemoveTransports(Player* player)
     player->SendDirectMessage(&packet);
 }
 
-void Map::SendObjectUpdates()
-{
-    UpdateDataMapType update_players;
-
-    while (!_updateObjects.empty())
-    {
-        Object* obj = *_updateObjects.begin();
-        ASSERT(obj->IsInWorld());
-
-        _updateObjects.erase(_updateObjects.begin());
-        obj->BuildUpdate(update_players);
-    }
-
-    WorldPacket packet;                                     // here we allocate a std::vector with a size of 0x10000
-    for (UpdateDataMapType::iterator iter = update_players.begin(); iter != update_players.end(); ++iter)
-    {
-        if (!sScriptMgr->CanSendObjectUpdatesToPlayer(this, iter->first))
-        {
-            iter->second.Clear();
-            continue;
-        }
-
-        iter->second.BuildPacket(packet);
-        iter->first->SendDirectMessage(&packet);
-        packet.clear();                                     // clean the string
-    }
-}
-
 uint32 Map::ApplyDynamicModeRespawnScaling(WorldObject const* obj, uint32 respawnDelay) const
 {
     ASSERT(obj->GetMap() == this);
@@ -1931,8 +2338,16 @@ void Map::AddObjectToRemoveList(WorldObject* obj)
     // Own half of the cleanup now, foreign half as records; the removal itself waits for the tick's end.
     obj->PrepareRemoval();
 
+    if (BeatContext::InTask())
+    {
+        RemoveFromMapDefer rec;
+        rec.guid = obj->GetGUID();
+        rec.prepared = 1;
+        AppendDefer(DeferKind::RemoveFromMap, rec);
+        return;
+    }
+
     i_objectsToRemove.insert(obj);
-    //LOG_DEBUG("maps", "Object ({}) added to removing list.", obj->GetGUID().ToString());
 }
 
 void Map::RemoveAllObjectsInRemoveList()
@@ -2258,13 +2673,12 @@ bool InstanceMap::AddPlayerToMap(Player* player)
     return true;
 }
 
-void InstanceMap::Update(const uint32 t_diff, const uint32 s_diff, bool /*thread*/)
+void InstanceMap::BeatEpilogue(uint32 diff)
 {
-    Map::Update(t_diff, s_diff);
+    Map::BeatEpilogue(diff);
 
-    if (t_diff)
-        if (instance_data)
-            instance_data->Update(t_diff);
+    if (instance_data)
+        instance_data->Update(diff);
 }
 
 void InstanceMap::RemovePlayerFromMap(Player* player, bool remove)
@@ -2387,6 +2801,17 @@ void InstanceMap::PermBindAllPlayers()
 {
     if (!IsDungeon())
         return;
+
+    // sInstanceSaveMgr is a global: defer from any point inside a beat, a map seal task included (step 13).
+    if (BeatContext::InBeat())
+    {
+        InstanceBindDefer rec;
+        rec.mapId = GetId();
+        rec.instanceId = GetInstanceId();
+        rec.permanent = 1;
+        AppendDefer(DeferKind::InstanceBind, rec);
+        return;
+    }
 
     InstanceSave* save = sInstanceSaveMgr->GetInstanceSave(GetInstanceId());
     if (!save)
@@ -2895,6 +3320,25 @@ bool Map::SpawnGroupDespawn(uint32 groupId, bool deleteRespawnTimes /*= false*/)
     return true;
 }
 
+void Map::UpdatePoolDeferred(uint8 typeId, uint32 poolId, ObjectGuid::LowType spawnId)
+{
+    // sPoolMgr is a global: defer from any point inside a beat, the epilogue's ProcessRespawns included (step 13).
+    if (BeatContext::InBeat())
+    {
+        PoolEventDefer rec;
+        rec.poolId = poolId;
+        rec.spawnId = spawnId;
+        rec.typeId = typeId;
+        AppendDefer(DeferKind::PoolEvent, rec);
+        return;
+    }
+
+    if (typeId == TYPEID_UNIT)
+        sPoolMgr->UpdatePool<Creature>(GetPoolData(), poolId, spawnId);
+    else if (typeId == TYPEID_GAMEOBJECT)
+        sPoolMgr->UpdatePool<GameObject>(GetPoolData(), poolId, spawnId);
+}
+
 void Map::ProcessRespawns()
 {
     time_t now = GameTime::GetGameTime().count();
@@ -3010,9 +3454,11 @@ void Map::ProcessCreatureRespawn(ObjectGuid::LowType spawnId)
     // reads it back and loads as DEAD instead of ALIVE
     RemoveCreatureRespawnTime(spawnId);
 
-    Creature* creature = new Creature();
-    if (!creature->LoadCreatureFromDB(spawnId, this, true, true))
-        delete creature;
+    // Step 09: construction is a Spawn defer applied at tick end (step 12: on the spawn's grid task).
+    SpawnDefer rec;
+    rec.spawnId = spawnId;
+    rec.type = uint8(SPAWN_TYPE_CREATURE);
+    AppendDefer(DeferKind::Spawn, rec);
 }
 
 void Map::ProcessGameObjectRespawn(ObjectGuid::LowType spawnId)
@@ -3065,9 +3511,10 @@ void Map::ProcessGameObjectRespawn(ObjectGuid::LowType spawnId)
     // reads it back and loads as despawned
     RemoveGORespawnTime(spawnId);
 
-    GameObject* gameobject = new GameObject();
-    if (!gameobject->LoadGameObjectFromDB(spawnId, this, true))
-        delete gameobject;
+    SpawnDefer rec;
+    rec.spawnId = spawnId;
+    rec.type = uint8(SPAWN_TYPE_GAMEOBJECT);
+    AppendDefer(DeferKind::Spawn, rec);
 }
 
 void Map::UpdateEncounterState(EncounterCreditType type, uint32 creditEntry, Unit* source)

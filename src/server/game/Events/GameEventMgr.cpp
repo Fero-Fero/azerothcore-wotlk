@@ -17,6 +17,7 @@
 
 #include "GameEventMgr.h"
 #include "BattlegroundMgr.h"
+#include "BeatContext.h"
 #include "Chat.h"
 #include "DisableMgr.h"
 #include "GameObjectAI.h"
@@ -24,6 +25,7 @@
 #include "HolidayDateCalculator.h"
 #include "Language.h"
 #include "Log.h"
+#include "Map.h"
 #include "MapMgr.h"
 #include "ObjectMgr.h"
 #include "Player.h"
@@ -136,6 +138,18 @@ void GameEventMgr::StartInternalEvent(uint16 eventId)
 
 bool GameEventMgr::StartEvent(uint16 eventId, bool overwrite)
 {
+    // A global mutation: defer from a unit task and from a map seal task alike (step 13), applied in S2.
+    if (Map* map = BeatContext::DeferMap())
+    {
+        GameEventActionDefer rec;
+        rec.eventId = eventId;
+        rec.start = 1;
+        rec.overwrite = overwrite ? 1 : 0;
+        map->AppendDefer(DeferKind::GameEventAction, rec);
+        return false;
+    }
+    ASSERT_NOT_IN_BEAT();
+
     if (sDisableMgr->IsDisabledFor(DISABLE_TYPE_GAME_EVENT, eventId, nullptr) && !overwrite)
         return false;
 
@@ -193,6 +207,17 @@ bool GameEventMgr::StartEvent(uint16 eventId, bool overwrite)
 
 void GameEventMgr::StopEvent(uint16 eventId, bool overwrite)
 {
+    if (Map* map = BeatContext::DeferMap())
+    {
+        GameEventActionDefer rec;
+        rec.eventId = eventId;
+        rec.start = 0;
+        rec.overwrite = overwrite ? 1 : 0;
+        map->AppendDefer(DeferKind::GameEventAction, rec);
+        return;
+    }
+    ASSERT_NOT_IN_BEAT();
+
     GameEventData& data = _gameEvent[eventId];
     bool serverwide_evt = data.State != GAMEEVENT_NORMAL && data.State != GAMEEVENT_INTERNAL;
 

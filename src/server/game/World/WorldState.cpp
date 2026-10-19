@@ -16,6 +16,7 @@
  */
 
 #include "AreaDefines.h"
+#include "BeatContext.h"
 #include "CreatureAIImpl.h"
 #include "GameEventMgr.h"
 #include "Log.h"
@@ -161,6 +162,7 @@ void WorldState::LoadWorldStates()
 // Setting a worldstate will save it to DB
 void WorldState::setWorldState(uint32 index, uint64 timeValue)
 {
+    ASSERT_NOT_IN_BEAT();
     // Crossrealm nodes must not persist worldstates: their CharacterDatabase is
     // the routing proxy and the write would land in an arbitrary realm DB. The
     // in-memory value still has to be updated so read-modify-write users

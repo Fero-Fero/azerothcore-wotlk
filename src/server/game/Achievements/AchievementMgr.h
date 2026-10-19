@@ -24,6 +24,7 @@
 #include "DatabaseEnv.h"
 #include "ObjectGuid.h"
 #include <map>
+#include <shared_mutex>
 #include <string>
 
 typedef std::list<AchievementCriteriaEntry const*> AchievementCriteriaEntryList;
@@ -439,6 +440,8 @@ private:
 
     typedef std::unordered_map<uint32 /*achievementId*/, SystemTimePoint /*completionTime*/> AllCompletedAchievements;
     AllCompletedAchievements _allCompletedAchievements;
+    // Step 03/13: *mutex*. Written by SetRealmCompleted from a player task, read by every realm-first check.
+    mutable std::shared_mutex _allCompletedAchievementsLock;
 
     AchievementRewards _achievementRewards;
     AchievementRewardLocales _achievementRewardLocales;

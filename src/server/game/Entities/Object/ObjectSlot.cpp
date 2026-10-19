@@ -72,6 +72,30 @@ void ObjectSlotPair::EnsureAuraCapacity(uint32 count)
     _auraCapacity = capacity;
 }
 
+void ObjectSlotPair::EnsureMovementCapacity(uint32 bytes)
+{
+    if (bytes <= _movementCapacity)
+        return;
+
+    uint32 capacity = std::max<uint32>(_movementCapacity, 64);
+    while (capacity < bytes)
+        capacity *= 2;
+
+    auto storage = std::make_unique<uint8[]>(capacity * 2);
+
+    // Keep the readable slot's block valid across the grow. The write slot is about to be refilled.
+    for (uint32 i = 0; i < 2; ++i)
+    {
+        uint8* dst = storage.get() + i * capacity;
+        if (_slot[i].movementBlock && _slot[i].movementBlockSize)
+            std::copy_n(_slot[i].movementBlock, std::min<uint32>(_slot[i].movementBlockSize, _movementCapacity), dst);
+        _slot[i].movementBlock = dst;
+    }
+
+    _movementStorage = std::move(storage);
+    _movementCapacity = capacity;
+}
+
 SlotIndexAllocator* SlotIndexAllocator::instance()
 {
     static SlotIndexAllocator instance;
@@ -136,6 +160,62 @@ int32 SlotReader::TotalAuraModifier(AuraType type) const
                 total += a.amount[e];
     }
     return total;
+}
+
+bool SlotReader::HasAuraType(AuraType type) const
+{
+    for (uint32 i = 0; i < s.auraCount; ++i)
+    {
+        SlotAura const& a = s.auras[i];
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(a.spellId);
+        if (!info)
+            continue;
+
+        for (uint8 e = 0; e < MAX_SPELL_EFFECTS; ++e)
+            if ((a.effectMask & (1 << e)) && info->Effects[e].ApplyAuraName == type)
+                return true;
+    }
+    return false;
+}
+
+bool SlotReader::HasAuraTypeWithCaster(AuraType type, ObjectGuid caster) const
+{
+    for (uint32 i = 0; i < s.auraCount; ++i)
+    {
+        SlotAura const& a = s.auras[i];
+        if (a.casterGuid != caster)
+            continue;
+
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(a.spellId);
+        if (!info)
+            continue;
+
+        for (uint8 e = 0; e < MAX_SPELL_EFFECTS; ++e)
+            if ((a.effectMask & (1 << e)) && info->Effects[e].ApplyAuraName == type)
+                return true;
+    }
+    return false;
+}
+
+uint32 SlotReader::AuraStateForTarget(ObjectGuid target) const
+{
+    uint32 auraStates = U32(UNIT_FIELD_AURASTATE) & ~uint32(PER_CASTER_AURA_STATE_MASK);
+    for (uint32 i = 0; i < s.auraCount; ++i)
+    {
+        SlotAura const& a = s.auras[i];
+        if (a.casterGuid != target)
+            continue;
+
+        SpellInfo const* info = sSpellMgr->GetSpellInfo(a.spellId);
+        if (!info)
+            continue;
+
+        // Same registration rule as Unit::_ApplyAura into m_auraStateAuras.
+        if (AuraStateType state = info->GetAuraState())
+            if ((1 << (state - 1)) & PER_CASTER_AURA_STATE_MASK)
+                auraStates |= (1 << (state - 1));
+    }
+    return auraStates;
 }
 
 uint32 SlotReader::Health() const { return U32(UNIT_FIELD_HEALTH); }

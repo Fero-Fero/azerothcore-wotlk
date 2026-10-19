@@ -16,6 +16,7 @@
  */
 
 #include "Battleground.h"
+#include "BeatContext.h"
 #include "ArenaSpectator.h"
 #include "ArenaTeam.h"
 #include "BattlegroundMgr.h"
@@ -1402,6 +1403,7 @@ void Battleground::BuildPvPLogDataPacket(WorldPacket& data)
 
 bool Battleground::UpdatePlayerScore(Player* player, uint32 type, uint32 value, bool doAddHonor)
 {
+    ASSERT_NOT_IN_BEAT();
     auto const& itr = PlayerScores.find(player->GetGUID().GetCounter());
     if (itr == PlayerScores.end()) // player not found...
         return false;
@@ -1767,6 +1769,7 @@ void Battleground::HandleTriggerBuff(GameObject* gameObject)
 
 void Battleground::HandleKillPlayer(Player* victim, Player* killer)
 {
+    ASSERT_NOT_IN_BEAT();
     // Keep in mind that for arena this will have to be changed a bit
 
     // Add +1 deaths

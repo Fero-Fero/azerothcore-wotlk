@@ -1503,6 +1503,7 @@ bool Player::GetQuestRewardStatus(uint32 quest_id) const
 
 QuestStatus Player::GetQuestStatus(uint32 quest_id) const
 {
+    ASSERT_OWNED(this);
     if (quest_id)
     {
         QuestStatusMap::const_iterator itr = m_QuestStatus.find(quest_id);

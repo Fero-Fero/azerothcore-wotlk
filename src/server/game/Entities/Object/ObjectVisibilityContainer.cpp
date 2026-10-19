@@ -18,6 +18,8 @@
 #include "ObjectVisibilityContainer.h"
 #include "Object.h"
 #include "Player.h"
+#include "UnitRecordLog.h"
+#include "UnitRecords.h"
 
 /*
 * Some implementation notes:
@@ -37,6 +39,30 @@ ObjectVisibilityContainer::~ObjectVisibilityContainer()
     ASSERT(_visiblePlayersMap.empty());
     if (_visibleWorldObjectsMap)
         ASSERT((*_visibleWorldObjectsMap).empty());
+}
+
+VisiblePlayersMap& ObjectVisibilityContainer::GetVisiblePlayersMap()
+{
+    ASSERT_OWNED(_selfObject);
+    return _visiblePlayersMap;
+}
+
+VisiblePlayersMap const& ObjectVisibilityContainer::GetVisiblePlayersMap() const
+{
+    ASSERT_OWNED(_selfObject);
+    return _visiblePlayersMap;
+}
+
+VisibleWorldObjectsMap* ObjectVisibilityContainer::GetVisibleWorldObjectsMap()
+{
+    ASSERT_OWNED(_selfObject);
+    return _visibleWorldObjectsMap.get();
+}
+
+VisibleWorldObjectsMap const* ObjectVisibilityContainer::GetVisibleWorldObjectsMap() const
+{
+    ASSERT_OWNED(_selfObject);
+    return _visibleWorldObjectsMap.get();
 }
 
 void ObjectVisibilityContainer::InitForPlayer()
@@ -75,7 +101,7 @@ void ObjectVisibilityContainer::LinkWorldObjectVisibility(WorldObject* worldObje
         return;
 
     (*_visibleWorldObjectsMap).insert(std::make_pair(worldObject->GetGUID(), worldObject));
-    worldObject->GetObjectVisibilityContainer().DirectInsertVisiblePlayerReference(_selfObject->ToPlayer());
+    LinkTargetSide(worldObject);
 }
 
 void ObjectVisibilityContainer::UnlinkWorldObjectVisibility(WorldObject* worldObject)
@@ -84,15 +110,60 @@ void ObjectVisibilityContainer::UnlinkWorldObjectVisibility(WorldObject* worldOb
     if (!_visibleWorldObjectsMap)
         return;
 
-    worldObject->GetObjectVisibilityContainer().DirectRemoveVisiblePlayerReference(_selfObject->GetGUID());
+    UnlinkTargetSide(worldObject);
     (*_visibleWorldObjectsMap).erase(worldObject->GetGUID());
 }
 
 VisibleWorldObjectsMap::iterator ObjectVisibilityContainer::UnlinkVisibilityFromPlayer(WorldObject* worldObject, VisibleWorldObjectsMap::iterator itr)
 {
     ASSERT(_visibleWorldObjectsMap); // Ensure we aren't for some reason calling this as a non-player object
-    worldObject->GetObjectVisibilityContainer().DirectRemoveVisiblePlayerReference(_selfObject->GetGUID());
+    UnlinkTargetSide(worldObject);
     return (*_visibleWorldObjectsMap).erase(itr);
+}
+
+// Step 10: the target's half of a link. The record form (VisibilityLink / VisibilityUnlink to a foreign unit,
+// applied from its inbox next beat) is wired but not used yet: an object removed at the end of this tick
+// would be freed before the record lands, leaving the viewer's map pointing at it. The view phase runs with
+// no concurrent task until step 14, so the write is direct; step 12 orders the free after the inbox.
+namespace
+{
+    constexpr bool USE_VISIBILITY_LINK_RECORDS = false;
+}
+
+void ObjectVisibilityContainer::LinkTargetSide(WorldObject* worldObject)
+{
+    if (USE_VISIBILITY_LINK_RECORDS && worldObject->IsUnit() && worldObject->IsForeignToTask())
+    {
+        VisibilityLinkRecord record;
+        record.viewer = _selfObject->GetGUID();
+        sRecordLogs->Append(_selfObject->GetGUID(), worldObject, RecordKind::VisibilityLink, record);
+        return;
+    }
+
+    worldObject->GetObjectVisibilityContainer().DirectInsertVisiblePlayerReference(_selfObject->ToPlayer());
+}
+
+void ObjectVisibilityContainer::UnlinkTargetSide(WorldObject* worldObject)
+{
+    if (USE_VISIBILITY_LINK_RECORDS && worldObject->IsUnit() && worldObject->IsForeignToTask())
+    {
+        VisibilityUnlinkRecord record;
+        record.viewer = _selfObject->GetGUID();
+        sRecordLogs->Append(_selfObject->GetGUID(), worldObject, RecordKind::VisibilityUnlink, record);
+        return;
+    }
+
+    worldObject->GetObjectVisibilityContainer().DirectRemoveVisiblePlayerReference(_selfObject->GetGUID());
+}
+
+void ObjectVisibilityContainer::ApplyLinkFromViewer(Player* viewer)
+{
+    DirectInsertVisiblePlayerReference(viewer);
+}
+
+void ObjectVisibilityContainer::ApplyUnlinkFromViewer(ObjectGuid viewer)
+{
+    DirectRemoveVisiblePlayerReference(viewer);
 }
 
 VisiblePlayersMap::iterator ObjectVisibilityContainer::UnlinkVisibilityFromWorldObject(Player* player, VisiblePlayersMap::iterator itr)

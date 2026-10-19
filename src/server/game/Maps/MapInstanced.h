@@ -31,9 +31,9 @@ public:
     MapInstanced(uint32 id);
     ~MapInstanced() override {}
 
-    // functions overwrite Map versions
-    void Update(const uint32, const uint32, bool thread = true) override;
-    void DelayedUpdate(const uint32 diff) override;
+    // Step 12: run by the pool in S2 (between beats, no task running). Unloads and frees every instance
+    // whose unload timer elapsed.
+    void DestroyExpiredInstances(uint32 diff);
     //void RelocationNotify();
     void UnloadAll() override;
     EnterState CannotEnter(Player* player, bool loginCheck = false) override;

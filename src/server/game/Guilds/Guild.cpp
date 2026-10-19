@@ -16,6 +16,7 @@
  */
 
 #include "Guild.h"
+#include "BeatContext.h"
 #include "Bag.h"
 #include "CalendarMgr.h"
 #include "CharacterCache.h"
@@ -1165,6 +1166,10 @@ void Guild::Disband()
 
 void Guild::UpdateMemberData(Player* player, uint8 dataid, uint32 value)
 {
+    // Step 03 marks this *mutex*: it writes one member's own row (level, zone) from that player's task while
+    // the member map itself changes only between beats (AddMember/DeleteMember assert that). No lock is
+    // needed for that shape; the counter keeps the acquisition rate visible in .debug singletons (step 13).
+    BeatContext::CountSingletonLock(BeatContext::LOCK_GUILD_MEMBER);
     if (Member* member = GetMember(player->GetGUID()))
     {
         switch (dataid)
@@ -2235,6 +2240,7 @@ void Guild::MassInviteToEvent(WorldSession* session, uint32 minLevel, uint32 max
 // Members handling
 bool Guild::AddMember(ObjectGuid guid, uint8 rankId)
 {
+    ASSERT_NOT_IN_TASK();
     Player* player = ObjectAccessor::FindConnectedPlayer(guid);
     // Player cannot be in guild
     if (player)
@@ -2319,6 +2325,7 @@ bool Guild::AddMember(ObjectGuid guid, uint8 rankId)
 
 void Guild::DeleteMember(ObjectGuid guid, bool isDisbanding, bool isKicked, bool canDeleteGuild)
 {
+    ASSERT_NOT_IN_TASK();
     ObjectGuid::LowType lowguid = guid.GetCounter();
     Player* player = ObjectAccessor::FindConnectedPlayer(guid);
 

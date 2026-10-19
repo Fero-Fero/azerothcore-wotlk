@@ -16,6 +16,7 @@
  */
 
 #include "AuctionHouseMgr.h"
+#include "BeatContext.h"
 #include "AuctionHouseSearcher.h"
 #include "Common.h"
 #include "DBCStores.h"
@@ -416,6 +417,7 @@ void AuctionHouseMgr::LoadAuctions()
 
 void AuctionHouseMgr::AddAItem(Item* it)
 {
+    ASSERT_NOT_IN_TASK();
     ASSERT(it);
     ASSERT(_mAitems.find(it->GetGUID()) == _mAitems.end());
     _mAitems[it->GetGUID()] = it;
@@ -423,6 +425,7 @@ void AuctionHouseMgr::AddAItem(Item* it)
 
 bool AuctionHouseMgr::RemoveAItem(ObjectGuid itemGuid, bool deleteFromDB, CharacterDatabaseTransaction* trans /*= nullptr*/)
 {
+    ASSERT_NOT_IN_TASK();
     ItemMap::iterator i = _mAitems.find(itemGuid);
     if (i == _mAitems.end())
         return false;

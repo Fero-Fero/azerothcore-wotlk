@@ -18,6 +18,7 @@
 #include "Object.h"
 #include "Battlefield.h"
 #include "BattlefieldMgr.h"
+#include "BeatPool.h"
 #include "CellImpl.h"
 #include "Chat.h"
 #include "Creature.h"
@@ -94,6 +95,65 @@ Object::Object() : m_PackGUID(sizeof(uint64) + 1)
 WorldObject::~WorldObject()
 {
     sScriptMgr->OnWorldObjectDestroy(this);
+
+    // Freed while it still sits in a ring (logout, map unload): never popped as a dead pointer.
+    if (_scheduledBeat.load(std::memory_order_relaxed))
+        sBeatPool->Unschedule(this);
+}
+
+void WorldObject::JoinTaskGroup(WorldObject* root)
+{
+    // Nested groups resolve to the top (a charmer seated in a vehicle), bounded depth.
+    for (uint8 depth = 0; root->_taskRoot && depth < 3; ++depth)
+        root = root->_taskRoot;
+
+    if (root == this || _taskRoot == root)
+        return;
+
+    LeaveTaskGroup();
+
+    // Our own members move with us under the new root.
+    for (WorldObject* member : _taskMembers)
+    {
+        member->_taskRoot = root;
+        root->_taskMembers.push_back(member);
+    }
+    _taskMembers.clear();
+
+    _taskRoot = root;
+    root->_taskMembers.push_back(this);
+}
+
+void WorldObject::LeaveTaskGroup()
+{
+    if (!_taskRoot)
+        return;
+
+    auto& members = _taskRoot->_taskMembers;
+    members.erase(std::remove(members.begin(), members.end(), this), members.end());
+    _taskRoot = nullptr;
+
+    // Our own task again from the next beat.
+    if (IsInWorld())
+        sBeatPool->Schedule(this);
+}
+
+bool WorldObject::IsDueNextBeat()
+{
+    if (!IsTaskRoot())
+        return false;
+
+    auto due = [](WorldObject* o)
+    {
+        return o->IsPlayer() || o->HasInbox() || o->IsUpdateNeeded();
+    };
+
+    if (due(this))
+        return true;
+    for (WorldObject* member : _taskMembers)
+        if (due(member))
+            return true;
+    return false;
 }
 
 Object::~Object()
@@ -299,39 +359,51 @@ void Object::DestroyForPlayer(Player* target, bool onDeath) const
     target->SendDirectMessage(&data);
 }
 
-// Debug-only: a live-field read of an object that is not the running task's owner. The count is the size of
-// the step 13 foreign-access audit. Release builds pay nothing here.
+// Debug-only foreign-access audit (step 13). A live-field read or write of an object the running task does
+// not own asserts with a stack; the read count behind .debug foreignreads is kept alongside. The identity
+// fields (guid, type, entry) are immutable after create and read everywhere for identity: not audited.
+// Release builds pay nothing here.
 #ifdef ACORE_DEBUG
-#define COUNT_FOREIGN_READ() BeatContext::CountForeignRead(this)
+#define AUDIT_FIELD_READ(index) \
+    do \
+    { \
+        if ((index) >= OBJECT_FIELD_SCALE_X) \
+        { \
+            BeatContext::CountForeignRead(this); \
+            ASSERT_OWNED(this); \
+        } \
+    } while (0)
+#define AUDIT_FIELD_WRITE() ASSERT_OWNED(this)
 #else
-#define COUNT_FOREIGN_READ() ((void)0)
+#define AUDIT_FIELD_READ(index) ((void)0)
+#define AUDIT_FIELD_WRITE() ((void)0)
 #endif
 
 [[nodiscard]] int32 Object::GetInt32Value(uint16 index) const
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, false));
-    COUNT_FOREIGN_READ();
+    AUDIT_FIELD_READ(index);
     return m_int32Values[index];
 }
 
 [[nodiscard]] uint32 Object::GetUInt32Value(uint16 index) const
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, false));
-    COUNT_FOREIGN_READ();
+    AUDIT_FIELD_READ(index);
     return m_uint32Values[index];
 }
 
 [[nodiscard]] uint64 Object::GetUInt64Value(uint16 index) const
 {
     ASSERT(index + 1 < m_valuesCount || PrintIndexError(index, false));
-    COUNT_FOREIGN_READ();
+    AUDIT_FIELD_READ(index);
     return *((uint64*) &(m_uint32Values[index]));
 }
 
 [[nodiscard]] float Object::GetFloatValue(uint16 index) const
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, false));
-    COUNT_FOREIGN_READ();
+    AUDIT_FIELD_READ(index);
     return m_floatValues[index];
 }
 
@@ -339,7 +411,7 @@ void Object::DestroyForPlayer(Player* target, bool onDeath) const
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, false));
     ASSERT(offset < 4);
-    COUNT_FOREIGN_READ();
+    AUDIT_FIELD_READ(index);
     return *(((uint8*) &m_uint32Values[index]) + offset);
 }
 
@@ -347,14 +419,14 @@ void Object::DestroyForPlayer(Player* target, bool onDeath) const
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, false));
     ASSERT(offset < 2);
-    COUNT_FOREIGN_READ();
+    AUDIT_FIELD_READ(index);
     return *(((uint16*) &m_uint32Values[index]) + offset);
 }
 
 [[nodiscard]] ObjectGuid Object::GetGuidValue(uint16 index) const
 {
     ASSERT(index + 1 < m_valuesCount || PrintIndexError(index, false));
-    COUNT_FOREIGN_READ();
+    AUDIT_FIELD_READ(index);
     return *((ObjectGuid*) &(m_uint32Values[index]));
 }
 
@@ -514,6 +586,15 @@ void Object::BuildMovementUpdate(ByteBuffer* data, uint16 flags) const
 
 void Object::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target)
 {
+    // Pack the live mask once; the builders read it through the same view a slot provides.
+    thread_local std::vector<uint32> maskWords;
+    maskWords.assign((m_valuesCount + 31) / 32, 0);
+    _changesMask.CopyTo(maskWords.data());
+    BuildValuesUpdateFrom(updateType, data, target, UpdateValuesSource{ m_uint32Values, maskWords.data() });
+}
+
+void Object::BuildValuesUpdateFrom(uint8 updateType, ByteBuffer* data, Player* target, UpdateValuesSource const& src)
+{
     if (!target)
         return;
 
@@ -522,15 +603,15 @@ void Object::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* targe
     updateMask.SetCount(m_valuesCount);
 
     uint32* flags = nullptr;
-    uint32 visibleFlag = GetUpdateFieldData(target, flags);
+    uint32 visibleFlag = GetUpdateFieldData(target, flags, src);
 
     for (uint16 index = 0; index < m_valuesCount; ++index)
     {
-        if (_fieldNotifyFlags & flags[index] ||
-                ((updateType == UPDATETYPE_VALUES ? _changesMask.GetBit(index) : m_uint32Values[index]) && (flags[index] & visibleFlag)))
+        if ((_fieldNotifyFlags | src.notifyFlags) & flags[index] ||
+                ((updateType == UPDATETYPE_VALUES ? src.Changed(index) : src.values[index]) && (flags[index] & visibleFlag)))
         {
             updateMask.SetBit(index);
-            fieldBuffer << m_uint32Values[index];
+            fieldBuffer << src.values[index];
         }
     }
 
@@ -560,46 +641,41 @@ void Object::ClearUpdateMask(bool remove)
     }
 }
 
-void Object::BuildFieldsUpdate(Player* player, UpdateDataMapType& data_map)
-{
-    UpdateDataMapType::iterator iter = data_map.find(player);
-
-    if (iter == data_map.end())
-    {
-        std::pair<UpdateDataMapType::iterator, bool> p = data_map.insert(UpdateDataMapType::value_type(player, UpdateData()));
-        ASSERT(p.second);
-        iter = p.first;
-    }
-
-    BuildValuesUpdateBlockForPlayer(&iter->second, iter->first);
-}
-
-uint32 Object::GetUpdateFieldData(Player const* target, uint32*& flags) const
+uint32 Object::GetUpdateFieldData(Player const* target, uint32*& flags, UpdateValuesSource const& src) const
 {
     uint32 visibleFlag = UF_FLAG_PUBLIC;
 
     if (target == this)
         visibleFlag |= UF_FLAG_PRIVATE;
 
+    // Owner guids come from the source array, which is the live array on the owner's build and the published
+    // slot on a viewer's (step 13: no live field of a foreign object is read here).
+    auto guidAt = [&](uint16 index) { return ObjectGuid(uint64(src.values[index]) | (uint64(src.values[index + 1]) << 32)); };
+
     switch (GetTypeId())
     {
         case TYPEID_ITEM:
         case TYPEID_CONTAINER:
             flags = ItemUpdateFieldFlags;
-            if (((Item*)this)->GetOwnerGUID() == target->GetGUID())
+            if (guidAt(ITEM_FIELD_OWNER) == target->GetGUID())
                 visibleFlag |= UF_FLAG_OWNER | UF_FLAG_ITEM_OWNER;
             break;
         case TYPEID_UNIT:
         case TYPEID_PLAYER:
             {
-                Player* plr = ToUnit()->GetCharmerOrOwnerPlayerOrPlayerItself();
+                Player* plr = ToUnit()->GetCharmerOrOwnerPlayerOrPlayerItself(src);
                 flags = UnitUpdateFieldFlags;
-                if (ToUnit()->GetOwnerGUID() == target->GetGUID())
+                if (guidAt(UNIT_FIELD_SUMMONEDBY) == target->GetGUID())
                     visibleFlag |= UF_FLAG_OWNER;
 
-                if (HasDynamicFlag(UNIT_DYNFLAG_SPECIALINFO))
-                    if (ToUnit()->HasAuraTypeWithCaster(SPELL_AURA_EMPATHY, target->GetGUID()))
+                if (src.values[UNIT_DYNAMIC_FLAGS] & UNIT_DYNFLAG_SPECIALINFO)
+                {
+                    bool const empathy = src.slot
+                        ? SlotReader(*src.slot).HasAuraTypeWithCaster(SPELL_AURA_EMPATHY, target->GetGUID())
+                        : ToUnit()->HasAuraTypeWithCaster(SPELL_AURA_EMPATHY, target->GetGUID());
+                    if (empathy)
                         visibleFlag |= UF_FLAG_SPECIAL_INFO;
+                }
 
                 if (plr && plr->IsInSameRaidWith(target))
                     visibleFlag |= UF_FLAG_PARTY_MEMBER;
@@ -607,17 +683,17 @@ uint32 Object::GetUpdateFieldData(Player const* target, uint32*& flags) const
             }
         case TYPEID_GAMEOBJECT:
             flags = GameObjectUpdateFieldFlags;
-            if (ToGameObject()->GetOwnerGUID() == target->GetGUID())
+            if (guidAt(OBJECT_FIELD_CREATED_BY) == target->GetGUID())
                 visibleFlag |= UF_FLAG_OWNER;
             break;
         case TYPEID_DYNAMICOBJECT:
             flags = DynamicObjectUpdateFieldFlags;
-            if (((DynamicObject*)this)->GetCasterGUID() == target->GetGUID())
+            if (guidAt(DYNAMICOBJECT_CASTER) == target->GetGUID())
                 visibleFlag |= UF_FLAG_OWNER;
             break;
         case TYPEID_CORPSE:
             flags = CorpseUpdateFieldFlags;
-            if (ToCorpse()->GetOwnerGUID() == target->GetGUID())
+            if (guidAt(CORPSE_FIELD_OWNER) == target->GetGUID())
                 visibleFlag |= UF_FLAG_OWNER;
             break;
         case TYPEID_OBJECT:
@@ -655,6 +731,7 @@ bool Object::_LoadIntoDataField(std::string const& data, uint32 startOffset, uin
 void Object::SetInt32Value(uint16 index, int32 value)
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
+    AUDIT_FIELD_WRITE();
 
     if (m_int32Values[index] != value)
     {
@@ -668,6 +745,7 @@ void Object::SetInt32Value(uint16 index, int32 value)
 void Object::SetUInt32Value(uint16 index, uint32 value)
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
+    AUDIT_FIELD_WRITE();
 
     if (m_uint32Values[index] != value)
     {
@@ -681,6 +759,7 @@ void Object::SetUInt32Value(uint16 index, uint32 value)
 void Object::UpdateUInt32Value(uint16 index, uint32 value)
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
+    AUDIT_FIELD_WRITE();
 
     m_uint32Values[index] = value;
     _changesMask.SetBit(index);
@@ -689,6 +768,7 @@ void Object::UpdateUInt32Value(uint16 index, uint32 value)
 void Object::SetUInt64Value(uint16 index, uint64 value)
 {
     ASSERT(index + 1 < m_valuesCount || PrintIndexError(index, true));
+    AUDIT_FIELD_WRITE();
 
     if (*((uint64*) & (m_uint32Values[index])) != value)
     {
@@ -704,6 +784,7 @@ void Object::SetUInt64Value(uint16 index, uint64 value)
 bool Object::AddGuidValue(uint16 index, ObjectGuid value)
 {
     ASSERT(index + 1 < m_valuesCount || PrintIndexError(index, true));
+    AUDIT_FIELD_WRITE();
 
     if (value && !*((ObjectGuid*)&(m_uint32Values[index])))
     {
@@ -722,6 +803,7 @@ bool Object::AddGuidValue(uint16 index, ObjectGuid value)
 bool Object::RemoveGuidValue(uint16 index, ObjectGuid value)
 {
     ASSERT(index + 1 < m_valuesCount || PrintIndexError(index, true));
+    AUDIT_FIELD_WRITE();
 
     if (value && *((ObjectGuid*)&(m_uint32Values[index])) == value)
     {
@@ -741,6 +823,7 @@ bool Object::RemoveGuidValue(uint16 index, ObjectGuid value)
 void Object::SetGuidValue(uint16 index, ObjectGuid value)
 {
     ASSERT(index + 1 < m_valuesCount || PrintIndexError(index, true));
+    AUDIT_FIELD_WRITE();
 
     if (*((ObjectGuid*)&(m_uint32Values[index])) != value)
     {
@@ -755,6 +838,7 @@ void Object::SetGuidValue(uint16 index, ObjectGuid value)
 void Object::SetFloatValue(uint16 index, float value)
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
+    AUDIT_FIELD_WRITE();
 
     if (m_floatValues[index] != value)
     {
@@ -768,6 +852,7 @@ void Object::SetFloatValue(uint16 index, float value)
 void Object::SetByteValue(uint16 index, uint8 offset, uint8 value)
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
+    AUDIT_FIELD_WRITE();
 
     if (offset > 3)
     {
@@ -788,6 +873,7 @@ void Object::SetByteValue(uint16 index, uint8 offset, uint8 value)
 void Object::SetUInt16Value(uint16 index, uint8 offset, uint16 value)
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
+    AUDIT_FIELD_WRITE();
 
     if (offset > 1)
     {
@@ -856,6 +942,7 @@ void Object::ApplyModPositiveFloatValue(uint16 index, float  val, bool apply)
 void Object::SetFlag(uint16 index, uint32 newFlag)
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
+    AUDIT_FIELD_WRITE();
     uint32 oldval = m_uint32Values[index];
     uint32 newval = oldval | newFlag;
 
@@ -871,6 +958,7 @@ void Object::SetFlag(uint16 index, uint32 newFlag)
 void Object::RemoveFlag(uint16 index, uint32 oldFlag)
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
+    AUDIT_FIELD_WRITE();
     ASSERT(m_uint32Values);
 
     uint32 oldval = m_uint32Values[index];
@@ -904,7 +992,7 @@ void Object::ToggleFlag(uint16 index, uint32 flag)
         return false;
     }
 
-    COUNT_FOREIGN_READ();
+    AUDIT_FIELD_READ(index);
     return (m_uint32Values[index] & flag) != 0;
 }
 
@@ -923,6 +1011,7 @@ void Object::ApplyModFlag(uint16 index, uint32 flag, bool apply)
 void Object::SetByteFlag(uint16 index, uint8 offset, uint8 newFlag)
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
+    AUDIT_FIELD_WRITE();
 
     if (offset > 3)
     {
@@ -942,6 +1031,7 @@ void Object::SetByteFlag(uint16 index, uint8 offset, uint8 newFlag)
 void Object::RemoveByteFlag(uint16 index, uint8 offset, uint8 oldFlag)
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
+    AUDIT_FIELD_WRITE();
 
     if (offset > 3)
     {
@@ -962,6 +1052,7 @@ void Object::RemoveByteFlag(uint16 index, uint8 offset, uint8 oldFlag)
 {
     ASSERT(index < m_valuesCount || PrintIndexError(index, false));
     ASSERT(offset < 4);
+    AUDIT_FIELD_READ(index);
     return (((uint8*) &m_uint32Values[index])[offset] & flag) != 0;
 }
 
@@ -1249,6 +1340,17 @@ void WorldObject::_OnValuesInitialized()
     _slots.Init(m_valuesCount, IsUnit());
 }
 
+namespace
+{
+    template <class T_VALUES, class T_FLAGS, class FLAG_TYPE, uint8 N>
+    void CopyFlaggedValues(SlotFlaggedValues<N>& dst, FlaggedValuesArray32<T_VALUES, T_FLAGS, FLAG_TYPE, N> const& src)
+    {
+        dst.flags = src.GetFlags();
+        for (uint32 i = 0; i < N; ++i)
+            dst.values[i] = src.GetValue(FLAG_TYPE(i));
+    }
+}
+
 void WorldObject::PublishSlot()
 {
     if (!_slots.IsInitialized())
@@ -1263,19 +1365,49 @@ void WorldObject::PublishSlot()
     s.zoneId = _zoneId;
     s.areaId = _areaId;
     s.cellId = Acore::ComputeCellCoord(s.pos.GetPositionX(), s.pos.GetPositionY()).GetId();
+
+    // Visibility inputs (step 10). The WorldObject part here; Unit, Player, Creature and GameObject add theirs.
+    SlotVisibility& v = s.vis;
+    v = SlotVisibility();
+    CopyFlaggedValues(v.stealth, m_stealth);
+    CopyFlaggedValues(v.stealthDetect, m_stealthDetect);
+    CopyFlaggedValues(v.invisibility, m_invisibility);
+    CopyFlaggedValues(v.invisibilityDetect, m_invisibilityDetect);
+    CopyFlaggedValues(v.serverSideVisibility, m_serverSideVisibility);
+    CopyFlaggedValues(v.serverSideVisibilityDetect, m_serverSideVisibilityDetect);
+    if (_removing || IsNeverVisible())
+        v.flags |= SLOT_VIS_NEVER_VISIBLE;
+    if (IsInvisibleDueToDespawn())
+        v.flags |= SLOT_VIS_INVISIBLE_DUE_DESPAWN;
+    v.ownerGuid = GetOwnerGUID();
+
     FillSlot(s);
+
+    // Movement block for viewers' create blocks: per object, never UPDATEFLAG_SELF (step 10 §3).
+    uint16 flags = m_updateFlag;
+    if ((flags & UPDATEFLAG_STATIONARY_POSITION) && IsUnit() && ToUnit()->GetVictim())
+        flags |= UPDATEFLAG_HAS_TARGET;
+    thread_local ByteBuffer movement(256);
+    movement.clear();
+    BuildMovementUpdate(&movement, flags);
+    _slots.EnsureMovementCapacity(uint32(movement.size()));
+    std::memcpy(s.movementBlock, movement.contents(), movement.size());
+    s.movementBlockSize = uint16(movement.size());
+    s.updateFlag = flags;
+
     _slots.Commit(s.beat);
+
+    // The slot carries this beat's mask; viewers build their values packets from it in the view phase.
+    ClearUpdateMask(false);
 }
 
 void WorldObject::OnFirstRecordOfBeat(uint8 core)
 {
     _writtenBy.fetch_or(1ull << core, std::memory_order_release);
 
-    // Wake: a target that is not due gets a task next beat so the record is applied. Players are scanned
-    // from the map's player list every beat; everything else joins the updatable list (no-op if already in).
-    if (!IsPlayer() && !_removing && IsInWorld())
-        if (Map* map = FindMap())
-            map->AddObjectToPendingUpdateList(this);
+    // Wake: the target's task root gets a task next beat so the record is applied (step 12).
+    if (!_removing && IsInWorld())
+        sBeatPool->Wake(this);
 }
 
 void WorldObject::ApplyInbox()
@@ -1322,8 +1454,40 @@ void WorldObject::ApplyInbox()
 void WorldObject::ApplyRecords(std::vector<RecordHeader const*> const& records)
 {
     for (RecordHeader const* hdr : records)
-        LOG_DEBUG("maps.records", "{} dropped record {} from {}: no applier on this object type",
-            GetGUID().ToString(), RecordKindName(hdr->kind), hdr->source.ToString());
+        if (!ApplyCommonRecord(*hdr, reinterpret_cast<uint8 const*>(hdr) + RECORD_HEADER_SIZE))
+            LOG_DEBUG("maps.records", "{} dropped record {} from {}: no applier on this object type",
+                GetGUID().ToString(), RecordKindName(hdr->kind), hdr->source.ToString());
+}
+
+bool WorldObject::ApplyCommonRecord(RecordHeader const& header, uint8 const* payload)
+{
+    switch (header.kind)
+    {
+        case RecordKind::VisibilityLink:
+        {
+            // The viewer already holds us in its map; it is in this map unless it left in between (then its
+            // own cleanup removed the other half and nothing is owed).
+            auto const& rec = RecordPayload<VisibilityLinkRecord>(payload);
+            if (Player* viewer = ObjectAccessor::GetPlayer(*this, rec.viewer))
+                if (viewer->HaveAtClient(GetGUID()))
+                    GetObjectVisibilityContainer().ApplyLinkFromViewer(viewer);
+            return true;
+        }
+        case RecordKind::VisibilityUnlink:
+            GetObjectVisibilityContainer().ApplyUnlinkFromViewer(RecordPayload<VisibilityUnlinkRecord>(payload).viewer);
+            return true;
+        case RecordKind::VisibilityPoke:
+            if (Player* player = ToPlayer())
+            {
+                player->ApplyVisibilityPoke(RecordPayload<VisibilityPokeRecord>(payload).object);
+                return true;
+            }
+            return false;
+        case RecordKind::Wake:
+            return true;
+        default:
+            return false;
+    }
 }
 
 void WorldObject::PrepareRemovalOwn()
@@ -1355,6 +1519,9 @@ void WorldObject::AddToWorld()
 
     if (IsZoneWideVisible())
         GetMap()->AddWorldObjectToZoneWideVisibleMap(_zoneId, this);
+
+    // First slot: a viewer's scan may reach this object before its first Update (step 10).
+    PublishSlot();
 }
 
 void WorldObject::RemoveFromWorld()
@@ -1368,8 +1535,18 @@ void WorldObject::RemoveFromWorld()
 
     GetObjectVisibilityContainer().CleanVisibilityReferences();
 
-    // Step 12 moves the release to seal phase S2 so a record addressed this beat is not misdelivered.
-    sSlotIndexAllocator->Release(_slots.SlotIndex());
+    // Task group: a leaving root dissolves it (members are their own tasks again), a leaving member detaches.
+    while (!_taskMembers.empty())
+        _taskMembers.back()->LeaveTaskGroup();
+    if (_taskRoot)
+    {
+        auto& members = _taskRoot->_taskMembers;
+        members.erase(std::remove(members.begin(), members.end(), this), members.end());
+        _taskRoot = nullptr;
+    }
+
+    // The index goes back in seal phase S2 so a record addressed this beat is not misdelivered (step 12).
+    sBeatPool->_slotIndicesToReturn.push_back(_slots.SlotIndex());
     _slots.SetSlotIndex(ObjectSlotPair::NO_SLOT_INDEX);
 
     Object::RemoveFromWorld();
@@ -2277,6 +2454,262 @@ bool WorldObject::CanDetectStealthOf(WorldObject const* obj, bool checkAlert) co
     return true;
 }
 
+// Step 10: the viewer's CanSeeOrDetect over the target's published slot. Mirrors the live overload above;
+// what the slot carries (position, phase, stealth / invisibility / server-side arrays, the SLOT_VIS flags,
+// the guids) is read from it, the rest (AI CanBeSeen, visibility conditions, group membership, IsAlways*)
+// still goes through the handle.
+bool WorldObject::CanSeeOrDetect(ObjectSlot const& s, WorldObject const* obj, bool ignoreStealth, bool distanceCheck, bool checkAlert) const
+{
+    if (this == obj)
+        return true;
+
+    // CanNeverSee
+    if (!IsInWorld() || (s.vis.flags & SLOT_VIS_NEVER_VISIBLE) || GetMap() != obj->GetMap())
+        return false;
+    bool const samePhase = (GetPhaseMask() & s.phaseMask) != 0;
+    if (IsCreature() && obj->IsCreature())
+    {
+        if (!samePhase && ToUnit()->GetVehicleBase() != obj && GetGUID() != s.vis.vehicleBaseGuid)
+            return false;
+    }
+    else if (!samePhase)
+        return false;
+
+    if (obj->IsAlwaysVisibleFor(this) || CanAlwaysSee(obj))
+        return true;
+
+    Player const* thisPlayer = ToPlayer();
+
+    // Creature / gameobject scripts and visibility conditions
+    if (thisPlayer)
+    {
+        if (Creature const* cObj = obj->ToCreature())
+        {
+            if (cObj->IsAIEnabled && !cObj->AI()->CanBeSeen(thisPlayer))
+                return false;
+            if (!thisPlayer->CanSeeObjectByVisibilityConditions(obj))
+                return false;
+        }
+        else if (GameObject const* goObj = obj->ToGameObject())
+        {
+            if (!goObj->AI()->CanBeSeen(thisPlayer))
+                return false;
+            if (!thisPlayer->CanSeeObjectByVisibilityConditions(obj))
+                return false;
+        }
+    }
+
+    // pussywizard: arena spectator
+    if (s.vis.flags & SLOT_VIS_ARENA_SPECTATOR)
+        return false;
+
+    bool corpseVisibility = false;
+    if (distanceCheck)
+    {
+        bool corpseCheck = false;
+        Position const* sightPosition = this;
+        if (thisPlayer)
+        {
+            sightPosition = &thisPlayer->GetSightPosition();
+
+            if ((s.vis.flags & SLOT_VIS_SUMMONER_ONLY) && GetGUID() != s.vis.summonerGuid)
+                return false;
+
+            if (thisPlayer->isDead() && thisPlayer->GetHealth() > 0 && // Cheap way to check for ghost state
+                !(s.vis.serverSideVisibility.GetValue(SERVERSIDE_VISIBILITY_GHOST) & m_serverSideVisibility.GetValue(SERVERSIDE_VISIBILITY_GHOST) & GHOST_VISIBILITY_GHOST))
+            {
+                if (Corpse* corpse = thisPlayer->GetCorpse())
+                {
+                    corpseCheck = true;
+                    float const range = GetSightRange(obj);
+                    if (corpse->IsWithinDist(thisPlayer, range, false))
+                        if (corpse->GetExactDist2d(&s.pos) < range + corpse->GetObjectSize() + s.vis.combatReach)
+                            corpseVisibility = true;
+                }
+            }
+
+            if (obj->IsUnit())
+            {
+                // xinef: don't allow to detect vehicle accessory if you can't see vehicle base!
+                if (s.vis.vehicleBaseGuid && !thisPlayer->HaveAtClient(s.vis.vehicleBaseGuid))
+                    return false;
+
+                // pussywizard: during arena preparation, don't allow to detect pets if can't see its owner (spoils enemy arena frames)
+                if (obj->ToUnit()->IsPet() && s.vis.ownerGuid && GetMap()->IsBattleArena() && GetGUID() != s.vis.ownerGuid)
+                    if (BattlegroundMap* bgmap = GetMap()->ToBattlegroundMap())
+                        if (Battleground* bg = bgmap->GetBG())
+                            if (bg->GetStatus() < STATUS_IN_PROGRESS && !thisPlayer->HaveAtClient(s.vis.ownerGuid))
+                                return false;
+            }
+
+            if (thisPlayer->GetFarSightDistance() && !HasInArc(M_PI, &s.pos))
+                return false;
+        }
+
+        if (!corpseCheck)
+        {
+            float const size = obj->IsUnit() ? s.vis.combatReach : obj->GetObjectSize();
+            if (!sightPosition->IsInDist2d(&s.pos, GetSightRange(obj) + size))
+                return false;
+        }
+    }
+
+    // GM visibility off or hidden NPC
+    if (!s.vis.serverSideVisibility.GetValue(SERVERSIDE_VISIBILITY_GM))
+    {
+        // Stop checking other things for GMs
+        if (m_serverSideVisibilityDetect.GetValue(SERVERSIDE_VISIBILITY_GM))
+            return true;
+    }
+    else
+        return m_serverSideVisibilityDetect.GetValue(SERVERSIDE_VISIBILITY_GM) >= s.vis.serverSideVisibility.GetValue(SERVERSIDE_VISIBILITY_GM);
+
+    // Ghost players, Spirit Healers, and some other NPCs
+    if (!corpseVisibility && !(s.vis.serverSideVisibility.GetValue(SERVERSIDE_VISIBILITY_GHOST) & m_serverSideVisibilityDetect.GetValue(SERVERSIDE_VISIBILITY_GHOST)))
+    {
+        // Alive players can see dead players in some cases, but other objects can't do that
+        if (!thisPlayer)
+            return false;
+        Player const* objPlayer = obj->ToPlayer();
+        if (!objPlayer)
+            return false;
+        if (thisPlayer->GetTeamId() != TeamId(s.vis.teamId) || !thisPlayer->IsGroupVisibleFor(objPlayer))
+            return false;
+    }
+
+    if (s.vis.flags & SLOT_VIS_INVISIBLE_DUE_DESPAWN)
+        return false;
+
+    // pussywizard: arena spectator
+    if (thisPlayer && thisPlayer->IsSpectator() && GetMap()->IsBattleArena() && (s.vis.invisibility.flags || s.vis.stealth.flags))
+        return false;
+
+    // CanDetect
+    WorldObject const* seer = this;
+    if (Unit const* thisUnit = ToUnit())
+        if (Unit* controller = thisUnit->GetCharmerOrOwner())
+            seer = controller;
+
+    if (obj->IsAlwaysDetectableFor(seer) || GetEntry() == WORLD_TRIGGER)
+        return true;
+
+    if (ignoreStealth)
+        return true;
+
+    if (!seer->CanDetectInvisibilityOf(s, obj))
+        return false;
+
+    if (!seer->CanDetectStealthOf(s, obj, checkAlert))
+    {
+        // xinef: ignore units players have at client, this cant be cheated!
+        if (distanceCheck || !thisPlayer || !thisPlayer->HaveAtClient(obj))
+            return false;
+    }
+
+    return true;
+}
+
+bool WorldObject::CanDetectInvisibilityOf(ObjectSlot const& s, WorldObject const* obj) const
+{
+    uint32 const objFlags = s.vis.invisibility.flags;
+    uint32 mask = objFlags & m_invisibilityDetect.GetFlags();
+    mask |= objFlags & m_invisibility.GetFlags();
+    if (mask != objFlags)
+        return false;
+
+    if (ToUnit() && obj->IsUnit())
+    {
+        bool isPermInvisibleCreature = false;
+        if (Creature const* baseObj = ToCreature())
+            for (AuraEffect const* effect : baseObj->GetAuraEffectsByType(SPELL_AURA_MOD_INVISIBILITY))
+                if (SpellInfo const* spell = effect->GetSpellInfo())
+                    if (spell->GetMaxDuration() == -1)
+                        isPermInvisibleCreature = true;
+
+        if (!isPermInvisibleCreature)
+        {
+            uint32 objMask = m_invisibility.GetFlags() & s.vis.invisibilityDetect.flags;
+            objMask |= m_invisibility.GetFlags() & objFlags;
+            if (objMask != m_invisibility.GetFlags())
+                return false;
+        }
+    }
+
+    for (uint32 i = 0; i < TOTAL_INVISIBILITY_TYPES; ++i)
+    {
+        if (!(mask & (1 << i)))
+            continue;
+
+        if (m_invisibility.GetValue(InvisibilityType(i)) && s.vis.invisibility.GetValue(i))
+            continue;
+
+        if (m_invisibilityDetect.GetValue(InvisibilityType(i)) < s.vis.invisibility.GetValue(i))
+            return false;
+    }
+
+    return true;
+}
+
+bool WorldObject::CanDetectStealthOf(ObjectSlot const& s, WorldObject const* obj, bool checkAlert) const
+{
+    if (!s.vis.stealth.flags)
+        return true;
+
+    // dead players shouldnt be able to detect stealth on arenas
+    if (IsPlayer() && !ToPlayer()->IsAlive())
+        return false;
+
+    float const distance = GetExactDist(&s.pos);
+    float combatReach = 0.0f;
+    if (Unit const* unit = ToUnit())
+        combatReach = unit->GetCombatReach();
+
+    if (distance < combatReach)
+        return true;
+
+    if (!HasInArc(M_PI, &s.pos))
+        return false;
+
+    Unit const* unit = ToUnit();
+    for (uint32 i = 0; i < TOTAL_STEALTH_TYPES; ++i)
+    {
+        if (!(s.vis.stealth.flags & (1 << i)))
+            continue;
+
+        if (unit && unit->HasAuraTypeWithMiscvalue(SPELL_AURA_DETECT_STEALTH, i))
+            return true;
+
+        int32 detectionValue = 30;
+        detectionValue += int32(getLevelForTarget(obj) - 1) * 5;
+        detectionValue += m_stealthDetect.GetValue(StealthType(i));
+        if (obj->IsGameObject())
+        {
+            detectionValue += 30; // pussywizard: increase detection range for gameobjects (ie. traps)
+            if (s.vis.ownerGuid)
+                if (Unit const* owner = ObjectAccessor::GetUnit(*this, s.vis.ownerGuid))
+                    detectionValue -= int32(owner->getLevelForTarget(this) - 1) * 5;
+        }
+
+        detectionValue -= s.vis.stealth.GetValue(i);
+
+        float visibilityRange = float(detectionValue) * 0.3f + combatReach;
+
+        if (unit && unit->IsPlayer() && visibilityRange > MAX_PLAYER_STEALTH_DETECT_RANGE)
+            visibilityRange = MAX_PLAYER_STEALTH_DETECT_RANGE;
+
+        if (checkAlert)
+            visibilityRange += (visibilityRange * 0.08f) + 1.5f;
+
+        if (checkAlert && unit && unit->ToCreature() && visibilityRange >= unit->ToCreature()->GetAttackDistance(obj->ToUnit()) + unit->ToCreature()->m_CombatDistance)
+            return false;
+
+        if (distance > visibilityRange)
+            return false;
+    }
+
+    return true;
+}
+
 void WorldObject::SendPlayMusic(uint32 Music, bool OnlySelf)
 {
     WorldPacket data(SMSG_PLAY_MUSIC, 4);
@@ -2289,6 +2722,7 @@ void WorldObject::SendPlayMusic(uint32 Music, bool OnlySelf)
 
 void Object::ForceValuesUpdateAtIndex(uint32 i)
 {
+    AUDIT_FIELD_WRITE();
     _changesMask.SetBit(i);
     AddToObjectUpdateIfNeeded();
 }
@@ -3234,19 +3668,64 @@ void WorldObject::AddToNotify(uint16 f)
         }
 }
 
-void WorldObject::BuildUpdate(UpdateDataMapType& data_map)
+void WorldObject::BuildValuesUpdateFromSlot(ObjectSlot const& slot, UpdateData* data, Player* viewer, uint16 notifyFlags)
 {
-    // Build update for self
-    if (IsPlayer())
-        BuildFieldsUpdate(ToPlayer(), data_map);
+    ByteBuffer buf(500);
+    buf << uint8(UPDATETYPE_VALUES);
+    buf << GetPackGUID();
+    BuildValuesUpdateFrom(UPDATETYPE_VALUES, &buf, viewer, UpdateValuesSource{ slot.values, slot.changesMask, &slot, notifyFlags });
+    data->AddUpdateBlock(buf);
+}
 
-    // Build update for visible players
-    DoForAllVisiblePlayers([this, &data_map](Player* player)
+void WorldObject::BuildCreateUpdateBlockFromSlot(ObjectSlot const& slot, UpdateData* data, Player* viewer)
+{
+    if (!viewer)
+        return;
+
+    // A viewer's own create block needs UPDATEFLAG_SELF and its live movement: not a slot build.
+    if (viewer == this)
     {
-        BuildFieldsUpdate(player, data_map);
-    });
+        BuildCreateUpdateBlockForPlayer(data, viewer);
+        return;
+    }
 
-    ClearUpdateMask(false);
+    uint8 updatetype = UPDATETYPE_CREATE_OBJECT;
+    if (slot.updateFlag & UPDATEFLAG_STATIONARY_POSITION)
+    {
+        // UPDATETYPE_CREATE_OBJECT2 dynamic objects, corpses...
+        if (isType(TYPEMASK_DYNAMICOBJECT) || isType(TYPEMASK_CORPSE) || isType(TYPEMASK_PLAYER))
+            updatetype = UPDATETYPE_CREATE_OBJECT2;
+
+        // UPDATETYPE_CREATE_OBJECT2 for pets...
+        if (viewer->GetPetGUID() == GetGUID())
+            updatetype = UPDATETYPE_CREATE_OBJECT2;
+
+        // UPDATETYPE_CREATE_OBJECT2 for some gameobject types...
+        if (GameObject const* go = ToGameObject())
+        {
+            switch (go->GetGoType())
+            {
+                case GAMEOBJECT_TYPE_TRAP:
+                case GAMEOBJECT_TYPE_DUEL_ARBITER:
+                case GAMEOBJECT_TYPE_FLAGSTAND:
+                case GAMEOBJECT_TYPE_FLAGDROP:
+                    updatetype = UPDATETYPE_CREATE_OBJECT2;
+                    break;
+                default:
+                    if (slot.vis.ownerGuid)
+                        updatetype = UPDATETYPE_CREATE_OBJECT2;
+                    break;
+            }
+        }
+    }
+
+    ByteBuffer buf(500);
+    buf << uint8(updatetype);
+    buf << GetPackGUID();
+    buf << uint8(m_objectTypeId);
+    buf.append(slot.movementBlock, slot.movementBlockSize);
+    BuildValuesUpdateFrom(updatetype, &buf, viewer, UpdateValuesSource{ slot.values, slot.changesMask, &slot });
+    data->AddUpdateBlock(buf);
 }
 
 void WorldObject::GetCreaturesWithEntryInRange(std::list<Creature*>& creatureList, float radius, uint32 entry)
@@ -3258,12 +3737,15 @@ void WorldObject::GetCreaturesWithEntryInRange(std::list<Creature*>& creatureLis
 
 void WorldObject::AddToObjectUpdate()
 {
-    GetMap()->AddUpdateObject(this);
+    // Make sure this object publishes this tick so viewers see the change. Players and active objects
+    // always update; the rest join the updatable list (a defer inside a task, step 09).
+    if (!IsPlayer())
+        if (Map* map = FindMap())
+            map->AddObjectToPendingUpdateList(this);
 }
 
 void WorldObject::RemoveFromObjectUpdate()
 {
-    GetMap()->RemoveUpdateObject(this);
 }
 
 ObjectGuid WorldObject::GetTransGUID() const

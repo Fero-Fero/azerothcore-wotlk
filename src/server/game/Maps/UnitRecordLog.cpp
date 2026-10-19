@@ -45,6 +45,7 @@ char const* RecordKindName(RecordKind kind)
         case RecordKind::GameObjectUnlink:  return "GameObjectUnlink";
         case RecordKind::VisibilityLink:    return "VisibilityLink";
         case RecordKind::VisibilityUnlink:  return "VisibilityUnlink";
+        case RecordKind::VisibilityPoke:    return "VisibilityPoke";
         case RecordKind::Wake:              return "Wake";
         case RecordKind::Threat:            return "Threat";
         case RecordKind::DamageDealt:       return "DamageDealt";

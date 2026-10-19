@@ -16,6 +16,7 @@
  */
 
 #include "OutdoorPvP.h"
+#include "BeatContext.h"
 #include "CellImpl.h"
 #include "GridNotifiers.h"
 #include "Group.h"
@@ -497,6 +498,7 @@ void OPvPCapturePoint::SendObjectiveComplete(uint32 id, ObjectGuid guid)
 
 void OutdoorPvP::HandleKill(Player* killer, Unit* killed)
 {
+    ASSERT_NOT_IN_BEAT();
     ASSERT(killer);
 
     if (Group* group = killer->GetGroup())

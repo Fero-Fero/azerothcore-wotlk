@@ -306,6 +306,12 @@ UnitView Spell::CasterView() const
     return UnitView(m_originalCaster ? m_originalCaster : m_caster->ToUnit());
 }
 
+void Spell::SetTriggeredByAuraSpell(TriggeredByAuraSpellData const& data, bool interruptChannelOnFail)
+{
+    m_triggeredByAuraSpell = data;
+    m_recordedTriggerInterruptsChannel = interruptChannelOnFail && data.spellInfo && !data.spellInfo->IsPassive();
+}
+
 uint32 Spell::GetUnitTargetCountForEffect(SpellEffIndex effIndex) const
 {
     if (_landSide && !_launchSpell)
@@ -734,6 +740,33 @@ void Unit::CastFollowUp(FollowUpCast const& follow)
     if (follow.mode == FOLLOWUP_ADD_AURA)
     {
         AddAura(follow.spellId, target);
+        return;
+    }
+
+    // Step 08 §2: a cast a periodic tick asked for keeps its "triggered by aura" link as ids
+    if (follow.triggeredByAuraId)
+    {
+        SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(follow.spellId);
+        if (!spellInfo)
+            return;
+
+        SpellCastTargets targets;
+        targets.SetUnitTarget(target);
+
+        CustomSpellValues values;
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+            if (follow.bpMask & (1 << i))
+                values.AddSpellMod(SpellValueMod(SPELLVALUE_BASE_POINT0 + i), follow.bp[i]);
+        if (follow.auraDuration)
+            values.AddSpellMod(SPELLVALUE_AURA_DURATION, follow.auraDuration);
+
+        TriggeredByAuraSpellData byAura;
+        byAura.spellInfo = sSpellMgr->GetSpellInfo(follow.triggeredByAuraId);
+        byAura.effectIndex = follow.triggeredByAuraEffIndex;
+        byAura.tickNumber = follow.triggeredByAuraTick;
+
+        ObjectGuid originalCaster = follow.originalCaster ? follow.originalCaster : GetGUID();
+        CastSpell(targets, spellInfo, values.empty() ? nullptr : &values, TriggerCastFlags(follow.triggerFlags), byAura, false, originalCaster);
         return;
     }
 

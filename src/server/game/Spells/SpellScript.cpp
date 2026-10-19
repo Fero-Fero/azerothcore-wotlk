@@ -1058,6 +1058,11 @@ Unit* AuraScript::GetCaster() const
     return m_aura->GetCaster();
 }
 
+UnitView AuraScript::GetCasterView() const
+{
+    return UnitView(m_aura->GetCaster());
+}
+
 GameObject* AuraScript::GetGObjCaster() const
 {
     if (WorldObject* caster = m_aura->GetCaster())

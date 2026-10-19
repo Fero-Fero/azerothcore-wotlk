@@ -19,6 +19,7 @@
 #include "AccountMgr.h"
 #include "ArenaTeam.h"
 #include "ArenaTeamMgr.h"
+#include "BeatContext.h"
 #include "Battleground.h"
 #include "BattlegroundAB.h"
 #include "CellImpl.h"
@@ -2592,17 +2593,24 @@ bool AchievementGlobalMgr::IsAverageCriteria(AchievementCriteriaEntry const* cri
 
 bool AchievementGlobalMgr::IsRealmCompleted(AchievementEntry const* achievement) const
 {
-    auto itr = _allCompletedAchievements.find(achievement->ID);
-    if (itr == _allCompletedAchievements.end())
+    // Step 03 marks the realm-first store *mutex*: SetRealmCompleted comes from a player task. The value is
+    // copied out under the lock so the script hooks below (which may call SetRealmCompleted) run unlocked.
+    SystemTimePoint completed;
+    {
+        std::shared_lock<std::shared_mutex> guard(_allCompletedAchievementsLock);
+        auto itr = _allCompletedAchievements.find(achievement->ID);
+        if (itr == _allCompletedAchievements.end())
+            return false;
+        completed = itr->second;
+    }
+
+    if (completed == SystemTimePoint::min())
         return false;
 
-    if (itr->second == SystemTimePoint::min())
+    if (!sScriptMgr->IsRealmCompleted(this, achievement, completed))
         return false;
 
-    if (!sScriptMgr->IsRealmCompleted(this, achievement, itr->second))
-        return false;
-
-    if (itr->second == SystemTimePoint::max())
+    if (completed == SystemTimePoint::max())
         return true;
 
     // Allow completing the realm first kill for configurable time window after first person did it
@@ -2615,7 +2623,7 @@ bool AchievementGlobalMgr::IsRealmCompleted(AchievementEntry const* achievement)
         if (windowSeconds == 0s)
             return true;
 
-        return (GameTime::GetSystemTime() - itr->second) > windowSeconds;
+        return (GameTime::GetSystemTime() - completed) > windowSeconds;
     }
 
     sScriptMgr->SetRealmCompleted(achievement);
@@ -2628,6 +2636,8 @@ void AchievementGlobalMgr::SetRealmCompleted(AchievementEntry const* achievement
     if (IsRealmCompleted(achievement))
         return;
 
+    std::unique_lock<std::shared_mutex> guard(_allCompletedAchievementsLock);
+    BeatContext::CountSingletonLock(BeatContext::LOCK_ACHIEVEMENT_REALM_FIRST);
     _allCompletedAchievements[achievement->ID] = GameTime::GetSystemTime();
 }
 

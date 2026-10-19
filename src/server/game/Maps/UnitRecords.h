@@ -34,7 +34,7 @@ enum class RecordKind : uint8
     ThreatBackRef, CombatRef, CombatEnd,              // 06
     AuraRemove, Knockback,                            // 06
     ThreatRemove, MinionUnlink, GameObjectUnlink,     // 06: removal prepared on the dying unit's own task
-    VisibilityLink, VisibilityUnlink,                 // 10
+    VisibilityLink, VisibilityUnlink, VisibilityPoke, // 10
     Wake,                                             // 06: empty record, only forces a task
     Threat,                                           // 06: AddThreat against a foreign unit
     DamageDealt, HealDone, KillingBlow, KillCredit,   // 07 slice 5: attacker/healer/killer half of DealDamage/DealHeal/Kill
@@ -144,6 +144,24 @@ struct GameObjectUnlinkRecord
 {
     ObjectGuid goGuid;
     uint32 spellId;
+};
+
+// Step 10: a viewer entered / left this object's visible-players map (the target-side half of the link).
+struct VisibilityLinkRecord
+{
+    ObjectGuid viewer;
+};
+
+struct VisibilityUnlinkRecord
+{
+    ObjectGuid viewer;
+};
+
+// Step 10: an object asks a player to re-evaluate its visibility at the next view phase.
+// An empty guid asks for a full scan (shared-vision mover, forced update).
+struct VisibilityPokeRecord
+{
+    ObjectGuid object;
 };
 
 struct WakeRecord

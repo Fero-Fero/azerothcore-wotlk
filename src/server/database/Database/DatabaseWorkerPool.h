@@ -213,6 +213,15 @@ public:
 #endif
     }
 
+    //! Debug guard: a predicate that is true when the calling thread must not block on a sync connection
+    //! (the game sets it to "a unit task is running"). Every GetFreeConnection asserts it is false.
+    static void SetSyncQueryForbiddenGuard([[maybe_unused]] bool (*guard)())
+    {
+#ifdef ACORE_DEBUG
+        _syncQueryForbidden = guard;
+#endif
+    }
+
     [[nodiscard]] std::size_t QueueSize() const;
 
 private:
@@ -236,6 +245,7 @@ private:
     uint8 _async_threads, _synch_threads;
 #ifdef ACORE_DEBUG
     static inline thread_local bool _warnSyncQueries = false;
+    static inline bool (*_syncQueryForbidden)() = nullptr;
 #endif
 };
 

@@ -150,12 +150,86 @@ Two `Relink`s of one object in one tick collapse to the last one: `Relink` apply
 
 ## Checklist
 
-- [ ] All three `*Relocation` functions append `Relink`; move lists deleted.
-- [ ] `AddToMap` from a task is a defer; summon hooks fire at apply.
-- [ ] `AddObjectToRemoveList` from a task is `PrepareRemoval` + `RemoveFromMap{prepared}`; the two-sided `CleanupsBeforeDelete` body runs only for unprepared removals at the seal.
-- [ ] `MarkNearbyCellsOf`, script schedule, update-list edits, dyn-tree edits, zone counts, group roll, battleground, outdoor PvP, `WorldState`, cross-map teleport, duel end are defers.
-- [ ] `TaskGroupJoin`/`TaskGroupLeave` from vehicle seating and charm; first join applies the full `AddPassenger`/`SetCharmedBy` body at the seal.
-- [ ] `PoolEvent`, `InstanceBind`, `GameEventAction` global defers; `IsGlobalDefer` lists every cross-map kind.
-- [ ] `Spawn` defer from `ProcessRespawns`; no object construction in `ProcessRespawns` itself.
-- [ ] `Map::ApplyDefers` (per map) and `ApplyGlobalDefers` (once) run after the object updates, each in sequence order.
-- [ ] Debug counters for store/grid/list edits outside `ApplyDefers` read 0 after a play session.
+- [x] All three `*Relocation` functions append `Relink` (four: player, creature, game object, dynamic object); move lists kept for the off-task path (see Status).
+- [x] `AddToMap` from a task is a defer; summon hooks fire at apply.
+- [x] `AddObjectToRemoveList` from a task is `PrepareRemoval` + `RemoveFromMap{prepared}`; the two-sided `CleanupsBeforeDelete` body runs only for unprepared removals at the seal.
+- [x] `MarkNearbyCellsOf`, script schedule, update-list edits, dyn-tree edits, zone counts, group roll, battleground, outdoor PvP, cross-map teleport, duel end are defers. `WorldState` writes are not (open).
+- [x] `TaskGroupJoin`/`TaskGroupLeave` from vehicle seating and charm are appended; first-join-at-seal not done (open).
+- [x] `PoolEvent`, `InstanceBind`, `GameEventAction` global defers; `IsGlobalDefer` lists every cross-map kind.
+- [x] `Spawn` defer from `ProcessRespawns`; no object construction in `ProcessRespawns` itself.
+- [x] `Map::ApplyDefers` (per map) and `ApplyGlobalDefers` (once) run after the object updates, each in sequence order.
+- [ ] Debug counters for store/grid/list edits outside `ApplyDefers` read 0 after a play session (counters not added).
+
+## Status
+
+Compiles (worldserver, RelWithDebInfo, VS 2026). `codestyle-cpp.py` passes. Not played.
+
+### Done
+
+- `Maps/MapDefer.h`, `MapDefer.cpp`: `DeferKind` (the layout above, `Spawn` last), `IsGlobalDefer`, `DeferHeader`
+  (`kind`, `size`, `sequence`), one trivially copyable payload per kind, `DeferBuffer` — an append-only resident
+  byte log in the mould of `UnitRecordLog` (`Init`/`Reset`/`Spill`/`AppendRaw`/`DrainInto`). `DeferKindName` for
+  logging. The only pointer in any payload is `AddToMapDefer::obj` (sole owner until applied) and the immortal
+  `ScriptMapMap const*` / `ScriptInfo const*` of `ScriptScheduleDefer`.
+- `Map.h`: `DeferBuffer _defers` (one per map on this step), `template <typename T> AppendDefer(DeferKind, T const&)`,
+  `ApplyDefers()`, `ApplyGlobalDefers()`, one private `Apply*` per kind, `RelinkObjectNow`, `RemoveListedObject`,
+  `UpdatePoolDeferred`. `Insert/RemoveGameObjectModel` moved out of line. `template<> RemoveFromMap(Transport*, …)`
+  declared after the class so the apply path (which precedes the generic body in `Map.cpp`) never instantiates
+  the generic one for transports.
+- Routing is a runtime `BeatContext::InTask()` test at every writer, exactly as records are routed: inside a task
+  the write becomes a defer, outside it runs today's body inline. No site was duplicated.
+- `Map::Update`: `ApplyDefers(); ApplyGlobalDefers();` after `MoveAll*InMoveList` and before
+  `HandleDelayedVisibility`, and also on the `t_diff == 0` early return so nothing stays buffered across a skipped
+  tick. The start-of-tick `resetMarkedCells()` is gone; `ApplyDefers` resets the bitset only when a tick carried
+  `CellMark` defers, then sets the bits. Both drains `stable_sort` by `sequence`; global kinds are skipped by the
+  per-map drain and consumed by the global one, which then `Reset()`s the buffer.
+- Writer sites, in task: `AddToMap<T>` and the `Transport` overload (coord check first, defer after so an invalid
+  object is not leaked); `MarkNearbyCellsOf`; `UpdatePlayerZoneStats`; `UpdateNonPlayerObjects` recheck branch
+  (`UpdateListRemove` instead of swap-remove, `++i` always); `AddObjectToPendingUpdateList` /
+  `RemoveObjectFromMapUpdateList`; the four `*Relocation` functions (`Relocate` first, then `GridLoad` if the grid
+  changed plus `Relink`; `PlayerRelocation` skips `UpdateObjectVisibility` in a task); `AddObjectToRemoveList`
+  (`PrepareRemoval` then `RemoveFromMap{prepared = true}`); `Insert/RemoveGameObjectModel` (keyed by the
+  `BeatContext::root` guid); `ProcessCreatureRespawn` / `ProcessGameObjectRespawn` (checks run, then `Spawn`);
+  `InstanceMap::PermBindAllPlayers`; `MapScripts.cpp` `ScriptsStart` / `ScriptCommandStart`; `Player::TeleportTo`
+  cross-map (`MapChange`, returns `true`); `Player::DuelComplete`; `Player::BindToInstance`; `Creature` /
+  `GameObject` loot `EndRoll` (`GroupEndRoll`) and the four `sPoolMgr->UpdatePool` sites (`UpdatePoolDeferred`);
+  `Unit::Kill` instance bind, `OutdoorPvP::HandleKill`, `Battleground::HandleKillPlayer/Unit`;
+  `Unit::SetCharmedBy` / `RemoveCharmedBy` and `Vehicle::AddPassenger` / `RemovePassenger` append
+  `TaskGroupJoin` / `TaskGroupLeave` (bodies still inline); `GameEventMgr::StartEvent/StopEvent` route through
+  `BeatContext::root->FindMap()`.
+- Apply side: `ApplyRelink` reads the object's live position (two relinks of one object collapse to the last, the
+  payload's cell is used only for `DiffGrid`); `RelinkObjectNow` dispatches per concrete type because
+  `IsInGrid/RemoveFromGrid` live on `GridObject<T>`; `ApplyAddToMap` runs today's `AddToMap` body;
+  `ApplyRemoveFromMap` runs `RemoveListedObject` (the per-type body shared with `RemoveAllObjectsInRemoveList`),
+  calling `PrepareRemoval` first for an unprepared entry; `ApplySpawn` does the `new Creature/GameObject` + `LoadFromDB` + `AddToMap` that
+  `Process*Respawn` did; `ApplyDynTree*` uses `go->m_model`; `ApplyGroupEndRoll` resolves the group by guid and
+  the corpse by `GetWorldObject`; `ApplyBattlegroundEvent` / `ApplyOutdoorPvPEvent` resolve both units and call
+  the handler; `ApplyMapChange` calls `TeleportTo`; `ApplyDuelEnd` calls `DuelComplete`; `ApplyPoolEvent`
+  `sPoolMgr->UpdatePool`; `ApplyInstanceBind` goes through `sInstanceSaveMgr`; `ApplyGameEventAction`
+  `Start/StopEvent`. `TaskGroupJoin/Leave` apply is a no-op until step 12 defines `_taskRoot`.
+
+### Open
+
+- `sWorldState->Set*` writes are not routed (payload `WorldStateWriteDefer` exists, no writer and no apply).
+- `GroupBroadcast` payload reserved, unused — the looter packets in `Kill` still go out inline.
+- Vehicle / charm first join: the body still runs inline on the task; only the `TaskGroupJoin` is appended.
+  Moving the full `AddPassenger` / `SetCharmedBy` to the seal is step 12's task-group work.
+- The three move lists and `MoveAll*InMoveList` remain for the off-task path (`Relocation` called from the world
+  thread, map load, transports). They can go once every caller is a task (step 12).
+- `Spawn` is applied at the end of the same tick (`ApplyDefers`), not in the next beat's grid task; the one-beat
+  delay the plan describes arrives with step 12 S1a.
+- No debug counters for out-of-`ApplyDefers` edits.
+- `DeferBuffer` is per map; the per-core buffer, `DrainFor(map)` and the bucket index are step 14.
+
+### Behaviour
+
+- `marked_cells` is one tick late: a player's marks written during the walk apply at tick end, and
+  `Creature::IsUpdateNeeded` sees them on the next tick. Creatures near a player that just arrived idle one more
+  tick than today.
+- A relink, a summon's `AddToMap`, a respawn, a cross-map teleport, a duel end, an instance bind, a pool
+  respawn and a game event start/stop issued from a task take effect at the end of the tick rather than
+  immediately. Within a tick, the issuing object sees its new position (it wrote `Relocate` itself) but the grid
+  still lists it in the old cell until apply.
+- `PlayerRelocation` in a task no longer calls `UpdateObjectVisibility`; visibility catches up at the next
+  `HandleDelayedVisibility` / step 10 scan.
+- Off task (world thread, map load, `.gm` commands outside the walk) every site behaves as before.

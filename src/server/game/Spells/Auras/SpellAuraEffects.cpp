@@ -19,6 +19,7 @@
 #include "AreaDefines.h"
 #include "BattlefieldMgr.h"
 #include "Battleground.h"
+#include "BeatContext.h"
 #include "CellImpl.h"
 #include "CharmInfo.h"
 #include "Common.h"
@@ -34,8 +35,10 @@
 #include "ReputationMgr.h"
 #include "ScriptMgr.h"
 #include "Spell.h"
+#include "SpellHitRecord.h"
 #include "SpellMgr.h"
 #include "Unit.h"
+#include "UnitRecordLog.h"
 #include "Util.h"
 #include "Vehicle.h"
 #include "WorldPacket.h"
@@ -1191,7 +1194,13 @@ bool AuraEffect::HasSpellClassMask() const
 
 void AuraEffect::SendTickImmune(Unit* target, Unit* caster) const
 {
-    if (caster)
+    if (!caster)
+        return;
+
+    // Step 08 §2: the tick runs on the target's task; a foreign caster is not asked to broadcast
+    if (BeatContext::IsForeign(caster))
+        target->SendSpellDamageImmuneFrom(caster->GetGUID(), m_spellInfo->Id);
+    else
         caster->SendSpellDamageImmune(target, m_spellInfo->Id);
 }
 
@@ -1203,16 +1212,40 @@ void AuraEffect::PeriodicTick(AuraApplication* aurApp, Unit* caster) const
 
     Unit* target = aurApp->GetTarget();
 
+    // Step 08 §2: the tick runs on the target's task. A caster outside this task group is a handle for reads
+    // and may not be written; every caster write the handlers below would do goes into `landed` instead and is
+    // applied by the caster at the start of its next update (Unit::ApplyPeriodicLanded). Victim-side writes
+    // (damage, heal, logs, victim procs) stay here; DealDamage / DealHeal / ProcSkillsAndAuras route the
+    // caster halves they own themselves (step 07 slice 5).
+    bool const casterForeign = caster && BeatContext::IsForeign(caster);
+    PeriodicLandedRecord landed;
+    PeriodicLandedRecord* fb = casterForeign ? &landed : nullptr;
+    if (fb)
+    {
+        landed.target = target->GetGUID();
+        landed.caster = caster->GetGUID();
+        landed.spellId = GetId();
+        landed.effIndex = GetEffIndex();
+        landed.auraType = uint8(GetAuraType());
+        landed.stackAmount = GetBase()->GetStackAmount();
+        landed.tickNumber = GetTickNumber();
+    }
+
     // Update serverside orientation of tracking channeled auras on periodic update ticks
     // exclude players because can turn during channeling and shouldn't desync orientation client/server
     if (caster && !caster->IsPlayer() && m_spellInfo->IsChanneled() && m_spellInfo->HasAttribute(SPELL_ATTR1_TRACK_TARGET_IN_CHANNEL))
     {
-        ObjectGuid const channelGuid = caster->GetGuidValue(UNIT_FIELD_CHANNEL_OBJECT);
-        if (!channelGuid.IsEmpty() && channelGuid != caster->GetGUID())
+        if (fb)
+            fb->faceChannelTarget = 1;
+        else
         {
-            if (WorldObject const* objectTarget = ObjectAccessor::GetWorldObject(*caster, channelGuid))
+            ObjectGuid const channelGuid = caster->GetGuidValue(UNIT_FIELD_CHANNEL_OBJECT);
+            if (!channelGuid.IsEmpty() && channelGuid != caster->GetGUID())
             {
-                caster->SetInFront(objectTarget);
+                if (WorldObject const* objectTarget = ObjectAccessor::GetWorldObject(*caster, channelGuid))
+                {
+                    caster->SetInFront(objectTarget);
+                }
             }
         }
     }
@@ -1220,46 +1253,49 @@ void AuraEffect::PeriodicTick(AuraApplication* aurApp, Unit* caster) const
     switch (GetAuraType())
     {
         case SPELL_AURA_PERIODIC_DUMMY:
-            HandlePeriodicDummyAuraTick(target, caster);
+            HandlePeriodicDummyAuraTick(target, caster, fb);
             break;
         case SPELL_AURA_PERIODIC_TRIGGER_SPELL:
-            HandlePeriodicTriggerSpellAuraTick(target, caster);
+            HandlePeriodicTriggerSpellAuraTick(target, caster, fb);
             break;
         case SPELL_AURA_PERIODIC_TRIGGER_SPELL_FROM_CLIENT:
             // Don't actually do anything - client will trigger casts of these spells by itself
             break;
         case SPELL_AURA_PERIODIC_TRIGGER_SPELL_WITH_VALUE:
-            HandlePeriodicTriggerSpellWithValueAuraTick(target, caster);
+            HandlePeriodicTriggerSpellWithValueAuraTick(target, caster, fb);
             break;
         case SPELL_AURA_PERIODIC_DAMAGE:
         case SPELL_AURA_PERIODIC_DAMAGE_PERCENT:
-            HandlePeriodicDamageAurasTick(target, caster);
+            HandlePeriodicDamageAurasTick(target, caster, fb);
             break;
         case SPELL_AURA_PERIODIC_LEECH:
-            HandlePeriodicHealthLeechAuraTick(target, caster);
+            HandlePeriodicHealthLeechAuraTick(target, caster, fb);
             break;
         case SPELL_AURA_PERIODIC_HEALTH_FUNNEL:
-            HandlePeriodicHealthFunnelAuraTick(target, caster);
+            HandlePeriodicHealthFunnelAuraTick(target, caster, fb);
             break;
         case SPELL_AURA_PERIODIC_HEAL:
         case SPELL_AURA_OBS_MOD_HEALTH:
-            HandlePeriodicHealAurasTick(target, caster);
+            HandlePeriodicHealAurasTick(target, caster, fb);
             break;
         case SPELL_AURA_PERIODIC_MANA_LEECH:
-            HandlePeriodicManaLeechAuraTick(target, caster);
+            HandlePeriodicManaLeechAuraTick(target, caster, fb);
             break;
         case SPELL_AURA_OBS_MOD_POWER:
-            HandleObsModPowerAuraTick(target, caster);
+            HandleObsModPowerAuraTick(target, caster, fb);
             break;
         case SPELL_AURA_PERIODIC_ENERGIZE:
-            HandlePeriodicEnergizeAuraTick(target, caster);
+            HandlePeriodicEnergizeAuraTick(target, caster, fb);
             break;
         case SPELL_AURA_POWER_BURN:
-            HandlePeriodicPowerBurnAuraTick(target, caster);
+            HandlePeriodicPowerBurnAuraTick(target, caster, fb);
             break;
         default:
             break;
     }
+
+    if (fb && !fb->IsEmpty())
+        sRecordLogs->Append(target->GetGUID(), caster, RecordKind::PeriodicLanded, landed);
 }
 
 bool AuraEffect::CheckEffectProc(AuraApplication* aurApp, ProcEventInfo& eventInfo) const
@@ -6023,7 +6059,7 @@ void AuraEffect::HandlePreventResurrection(AuraApplication const* aurApp, uint8 
         aurApp->GetTarget()->SetByteFlag(PLAYER_FIELD_BYTES, 0, PLAYER_FIELD_BYTE_RELEASE_TIMER);
 }
 
-void AuraEffect::HandlePeriodicDummyAuraTick(Unit* target, Unit* caster) const
+void AuraEffect::HandlePeriodicDummyAuraTick(Unit* target, Unit* caster, PeriodicLandedRecord* fb) const
 {
     switch (GetSpellInfo()->SpellFamilyName)
     {
@@ -6032,7 +6068,15 @@ void AuraEffect::HandlePeriodicDummyAuraTick(Unit* target, Unit* caster) const
                 // Explosive Shot
                 if (GetSpellInfo()->SpellFamilyFlags[1] & 0x80000000)
                 {
-                    if (caster)
+                    if (fb)
+                    {
+                        if (FollowUpCast* f = fb->AddFollowUp(53352, target->GetGUID(), TRIGGERED_FULL_MASK))
+                        {
+                            f->bp[0] = m_amount;
+                            f->bpMask = 1;
+                        }
+                    }
+                    else if (caster)
                         caster->CastCustomSpell(53352, SPELLVALUE_BASE_POINT0, m_amount, target, true, nullptr, this);
                     break;
                 }
@@ -6080,7 +6124,7 @@ void AuraEffect::HandlePeriodicDummyAuraTick(Unit* target, Unit* caster) const
     }
 }
 
-void AuraEffect::HandlePeriodicTriggerSpellAuraTick(Unit* target, Unit* caster) const
+void AuraEffect::HandlePeriodicTriggerSpellAuraTick(Unit* target, Unit* caster, PeriodicLandedRecord* fb) const
 {
     // generic casting code with custom spells and target/caster customs
     uint32 triggerSpellId = GetSpellInfo()->Effects[GetEffIndex()].TriggerSpell;
@@ -6101,7 +6145,9 @@ void AuraEffect::HandlePeriodicTriggerSpellAuraTick(Unit* target, Unit* caster) 
                         // Thaumaturgy Channel
                         case 9712:
                             triggerSpellId = 21029;
-                            if (caster)
+                            if (fb)
+                                fb->AddFollowUp(triggerSpellId, caster->GetGUID(), TRIGGERED_FULL_MASK, false);
+                            else if (caster)
                                 caster->CastSpell(caster, triggerSpellId, true);
                             return;
                         // Brood Affliction: Bronze
@@ -6116,7 +6162,9 @@ void AuraEffect::HandlePeriodicTriggerSpellAuraTick(Unit* target, Unit* caster) 
                         case 24379:
                         case 23493:
                             {
-                                if (caster)
+                                if (fb)
+                                    fb->restoration = 1;
+                                else if (caster)
                                 {
                                     int32 heal = caster->CountPctFromMaxHealth(10);
                                     HealInfo healInfo(caster, target, heal, auraSpellInfo, auraSpellInfo->GetSchoolMask());
@@ -6142,7 +6190,13 @@ void AuraEffect::HandlePeriodicTriggerSpellAuraTick(Unit* target, Unit* caster) 
                             return;
                         // Frost Blast
                         case 27808:
-                            if (caster)
+                            if (fb)
+                            {
+                                fb->AddFollowUp(29879, target->GetGUID(), TRIGGERED_FULL_MASK);
+                                if (GetTickNumber() == 1)
+                                    fb->AddFollowUp(27808, target->GetGUID(), TRIGGERED_FULL_MASK, false);
+                            }
+                            else if (caster)
                             {
                                 caster->CastSpell(target, 29879, true, nullptr, this);
                                 if (GetTickNumber() == 1)
@@ -6162,6 +6216,7 @@ void AuraEffect::HandlePeriodicTriggerSpellAuraTick(Unit* target, Unit* caster) 
                         case 30427:
                             {
                                 // move loot to player inventory and despawn target
+                                // (step 08: AutoStoreLoot is a write to a possibly foreign player; remaining row)
                                 if (caster && caster->IsPlayer() &&
                                         target->IsCreature() &&
                                         target->ToCreature()->GetCreatureTemplate()->type == CREATURE_TYPE_GAS_CLOUD)
@@ -6246,8 +6301,27 @@ void AuraEffect::HandlePeriodicTriggerSpellAuraTick(Unit* target, Unit* caster) 
             // Beacon of Light
             case 53563:
                 {
-                    // area aura owner casts the spell
-                    GetBase()->GetUnitOwner()->CastSpell(target, triggeredSpellInfo, true, 0, this, GetBase()->GetUnitOwner()->GetGUID());
+                    // area aura owner casts the spell. Step 08 §3: on a clone the owner is another unit, and
+                    // step 08 §2: a foreign owner gets the cast as a PeriodicLanded follow-up.
+                    Unit* areaOwner = GetBase()->GetAreaOwnerUnit();
+                    if (!areaOwner)
+                        return;
+                    if (BeatContext::IsForeign(areaOwner))
+                    {
+                        PeriodicLandedRecord rec;
+                        rec.target = target->GetGUID();
+                        rec.caster = areaOwner->GetGUID();
+                        rec.spellId = GetId();
+                        rec.effIndex = GetEffIndex();
+                        rec.auraType = uint8(GetAuraType());
+                        rec.stackAmount = GetBase()->GetStackAmount();
+                        rec.tickNumber = GetTickNumber();
+                        if (FollowUpCast* f = rec.AddFollowUp(triggeredSpellInfo->Id, target->GetGUID(), TRIGGERED_FULL_MASK))
+                            f->originalCaster = areaOwner->GetGUID();
+                        sRecordLogs->Append(target->GetGUID(), areaOwner, RecordKind::PeriodicLanded, rec);
+                    }
+                    else
+                        areaOwner->CastSpell(target, triggeredSpellInfo, true, 0, this, areaOwner->GetGUID());
                     return;
                 }
             // Trial of the Crusader, Jaraxxus, Spinning Pain Spike
@@ -6290,7 +6364,9 @@ void AuraEffect::HandlePeriodicTriggerSpellAuraTick(Unit* target, Unit* caster) 
                 {
                     // All this spells trigger a spell that requires reagents; if the
                     // triggered spell is cast as "triggered", reagents are not consumed
-                    if (caster)
+                    if (fb)
+                        fb->AddFollowUp(triggerSpellId, target->GetGUID(), TRIGGERED_NONE, false);
+                    else if (caster)
                         caster->CastSpell(target, triggerSpellId, false);
                     return;
                 }
@@ -6302,48 +6378,72 @@ void AuraEffect::HandlePeriodicTriggerSpellAuraTick(Unit* target, Unit* caster) 
 
     if (triggeredSpellInfo)
     {
-        if (Unit* triggerCaster = triggeredSpellInfo->NeedsToBeTriggeredByCaster(m_spellInfo, GetEffIndex()) ? caster : target)
-        {
-            SpellCastTargets targets;
-            targets.SetUnitTarget(target);
-            if (triggeredSpellInfo->IsChannelCategorySpell() && m_channelData)
-            {
-                targets.SetDstChannel(m_channelData->spellDst);
-                targets.SetObjectTargetChannel(m_channelData->channelGUID);
-            }
+        // Xinef: do not skip reagent cost for entry casts
+        TriggerCastFlags triggerFlags = TRIGGERED_FULL_MASK;
+        if (GetSpellInfo()->Effects[GetEffIndex()].TargetA.GetCheckType() == TARGET_CHECK_ENTRY || GetSpellInfo()->Effects[GetEffIndex()].TargetB.GetCheckType() == TARGET_CHECK_ENTRY)
+            triggerFlags = TriggerCastFlags(TRIGGERED_FULL_MASK & ~TRIGGERED_IGNORE_POWER_AND_REAGENT_COST);
 
-            // Xinef: do not skip reagent cost for entry casts
-            TriggerCastFlags triggerFlags = TRIGGERED_FULL_MASK;
-            if (GetSpellInfo()->Effects[GetEffIndex()].TargetA.GetCheckType() == TARGET_CHECK_ENTRY || GetSpellInfo()->Effects[GetEffIndex()].TargetB.GetCheckType() == TARGET_CHECK_ENTRY)
-                triggerFlags = TriggerCastFlags(TRIGGERED_FULL_MASK & ~TRIGGERED_IGNORE_POWER_AND_REAGENT_COST);
-
-            triggerCaster->CastSpell(targets, triggeredSpellInfo, nullptr, triggerFlags, nullptr, this);
-            LOG_DEBUG("spells.aura", "AuraEffect::HandlePeriodicTriggerSpellAuraTick: Spell {} Trigger {}", GetId(), triggeredSpellInfo->Id);
-        }
+        TriggerPeriodicSpell(target, caster, fb, triggeredSpellInfo, triggerFlags, false, 0);
+        LOG_DEBUG("spells.aura", "AuraEffect::HandlePeriodicTriggerSpellAuraTick: Spell {} Trigger {}", GetId(), triggeredSpellInfo->Id);
     }
 }
 
-void AuraEffect::HandlePeriodicTriggerSpellWithValueAuraTick(Unit* target, Unit* caster) const
+// The generic trigger cast of a periodic trigger aura. Cast by the target when the trigger spell does not need
+// its caster, inline by the caster when the caster is on this task, and as the trigger slot of the
+// PeriodicLandedRecord otherwise (step 08 §2).
+void AuraEffect::TriggerPeriodicSpell(Unit* target, Unit* caster, PeriodicLandedRecord* fb, SpellInfo const* triggeredSpellInfo, TriggerCastFlags triggerFlags, bool hasBp0, int32 bp0) const
+{
+    bool const byCaster = triggeredSpellInfo->NeedsToBeTriggeredByCaster(m_spellInfo, GetEffIndex());
+    bool const channelData = triggeredSpellInfo->IsChannelCategorySpell() && m_channelData;
+
+    if (byCaster && fb)
+    {
+        if (fb->triggerSpellId)
+        {
+            LOG_DEBUG("spells.aura", "AuraEffect::TriggerPeriodicSpell: Spell {} asked for a second trigger {} on one tick, dropped", GetId(), triggeredSpellInfo->Id);
+            return;
+        }
+        fb->triggerSpellId = triggeredSpellInfo->Id;
+        fb->triggerTarget = target->GetGUID();
+        fb->triggerFlags = triggerFlags;
+        fb->triggerHasBp0 = hasBp0 ? 1 : 0;
+        fb->triggerBp0 = bp0;
+        fb->triggerAuraPeriodic = IsPeriodic() ? 1 : 0;
+        if (channelData)
+        {
+            fb->hasChannelData = 1;
+            fb->channelObject = m_channelData->channelGUID;
+            fb->channelDst.Set(m_channelData->spellDst);
+        }
+        return;
+    }
+
+    Unit* triggerCaster = byCaster ? caster : target;
+    if (!triggerCaster)
+        return;
+
+    SpellCastTargets targets;
+    targets.SetUnitTarget(target);
+    if (channelData)
+    {
+        targets.SetDstChannel(m_channelData->spellDst);
+        targets.SetObjectTargetChannel(m_channelData->channelGUID);
+    }
+
+    CustomSpellValues values;
+    if (hasBp0)
+        values.AddSpellMod(SPELLVALUE_BASE_POINT0, bp0);
+
+    triggerCaster->CastSpell(targets, triggeredSpellInfo, hasBp0 ? &values : nullptr, triggerFlags, nullptr, this);
+}
+
+void AuraEffect::HandlePeriodicTriggerSpellWithValueAuraTick(Unit* target, Unit* caster, PeriodicLandedRecord* fb) const
 {
     uint32 triggerSpellId = GetSpellInfo()->Effects[m_effIndex].TriggerSpell;
     if (SpellInfo const* triggeredSpellInfo = sSpellMgr->GetSpellInfo(triggerSpellId))
     {
-        if (Unit* triggerCaster = triggeredSpellInfo->NeedsToBeTriggeredByCaster(m_spellInfo, GetEffIndex()) ? caster : target)
-        {
-            SpellCastTargets targets;
-            targets.SetUnitTarget(target);
-            if (triggeredSpellInfo->IsChannelCategorySpell() && m_channelData)
-            {
-                targets.SetDstChannel(m_channelData->spellDst);
-                targets.SetObjectTargetChannel(m_channelData->channelGUID);
-            }
-
-            CustomSpellValues values;
-            values.AddSpellMod(SPELLVALUE_BASE_POINT0, GetAmount());
-
-            triggerCaster->CastSpell(targets, triggeredSpellInfo, &values, TRIGGERED_FULL_MASK, nullptr, this);
-            LOG_DEBUG("spells.aura", "AuraEffect::HandlePeriodicTriggerSpellWithValueAuraTick: Spell {} Trigger {}", GetId(), triggeredSpellInfo->Id);
-        }
+        TriggerPeriodicSpell(target, caster, fb, triggeredSpellInfo, TRIGGERED_FULL_MASK, true, GetAmount());
+        LOG_DEBUG("spells.aura", "AuraEffect::HandlePeriodicTriggerSpellWithValueAuraTick: Spell {} Trigger {}", GetId(), triggeredSpellInfo->Id);
     }
     else
     {
@@ -6357,8 +6457,10 @@ void AuraEffect::HandlePeriodicTriggerSpellWithValueAuraTick(Unit* target, Unit*
     }
 }
 
-void AuraEffect::HandlePeriodicDamageAurasTick(Unit* target, Unit* caster) const
+void AuraEffect::HandlePeriodicDamageAurasTick(Unit* target, Unit* caster, PeriodicLandedRecord* /*fb*/) const
 {
+    // Every write below is the target's (damage, log, victim procs); DealDamage and ProcSkillsAndAuras route
+    // the caster's halves themselves. The caster is read by handle for bonuses and hit result.
     if (!target->IsAlive())
         return;
 
@@ -6509,7 +6611,7 @@ void AuraEffect::HandlePeriodicDamageAurasTick(Unit* target, Unit* caster) const
     Unit::ProcSkillsAndAuras(caster, target, caster ? procAttacker : 0, procVictim, procEx, damage, BASE_ATTACK, GetSpellInfo(), nullptr, GetEffIndex(), nullptr, &dmgInfo);
 }
 
-void AuraEffect::HandlePeriodicHealthLeechAuraTick(Unit* target, Unit* caster) const
+void AuraEffect::HandlePeriodicHealthLeechAuraTick(Unit* target, Unit* caster, PeriodicLandedRecord* fb) const
 {
     if (!target->IsAlive())
         return;
@@ -6596,7 +6698,19 @@ void AuraEffect::HandlePeriodicHealthLeechAuraTick(Unit* target, Unit* caster) c
     LOG_DEBUG("spells.aura.effect", "PeriodicTick: {} health leech of {} for {} dmg inflicted by {} abs is {}",
                     GetCasterGUID().ToString(), target->GetGUID().ToString(), damage, GetId(), absorb);
     if (caster)
-        caster->SendSpellNonMeleeDamageLog(target, GetSpellInfo(), damage, GetSpellInfo()->GetSchoolMask(), absorb, resist, false, 0, crit);
+    {
+        // the log names the caster; a foreign caster is not asked to broadcast it (step 08 §2)
+        SpellNonMeleeDamage log(caster, target, GetSpellInfo(), GetSpellInfo()->GetSchoolMask());
+        log.damage = damage;
+        log.absorb = absorb;
+        log.resist = resist;
+        log.physicalLog = false;
+        log.blocked = 0;
+        log.HitInfo = 0;
+        if (crit)
+            log.HitInfo |= SPELL_HIT_TYPE_CRIT;
+        (fb ? target : caster)->SendSpellNonMeleeDamageLog(&log);
+    }
 
     int32 new_damage;
 
@@ -6606,6 +6720,13 @@ void AuraEffect::HandlePeriodicHealthLeechAuraTick(Unit* target, Unit* caster) c
 
     if (!caster || !caster->IsAlive())
         return;
+
+    // Step 08 §2: the caster heals itself at feedback (Unit::ApplyPeriodicLanded) from the raw leech amount
+    if (fb)
+    {
+        fb->leechBase = uint32(std::max(new_damage, 0));
+        return;
+    }
 
     float gainMultiplier = GetSpellInfo()->Effects[GetEffIndex()].CalcValueMultiplier(caster);
 
@@ -6619,7 +6740,7 @@ void AuraEffect::HandlePeriodicHealthLeechAuraTick(Unit* target, Unit* caster) c
     caster->GetThreatMgr().ForwardThreatForAssistingMe(caster, threat, GetSpellInfo());
 }
 
-void AuraEffect::HandlePeriodicHealthFunnelAuraTick(Unit* target, Unit* caster) const
+void AuraEffect::HandlePeriodicHealthFunnelAuraTick(Unit* target, Unit* caster, PeriodicLandedRecord* fb) const
 {
     if (!caster || !caster->IsAlive() || !target->IsAlive())
         return;
@@ -6637,7 +6758,12 @@ void AuraEffect::HandlePeriodicHealthFunnelAuraTick(Unit* target, Unit* caster) 
     if (!damage)
         return;
 
-    caster->ModifyHealth(-(int32)damage);
+    // Step 08 §2: the donator pays at feedback; the heal lands here. The donator's health was read by handle,
+    // so the cost may be clamped again on its side (ApplyPeriodicLanded) if it dropped meanwhile.
+    if (fb)
+        fb->funnelHealthCost = damage;
+    else
+        caster->ModifyHealth(-(int32)damage);
     LOG_DEBUG("spells.aura", "PeriodicTick: donator {} target {} damage {}.", caster->GetEntry(), target->GetEntry(), damage);
 
     float gainMultiplier = GetSpellInfo()->Effects[GetEffIndex()].CalcValueMultiplier(caster);
@@ -6645,10 +6771,12 @@ void AuraEffect::HandlePeriodicHealthFunnelAuraTick(Unit* target, Unit* caster) 
     damage = int32(damage * gainMultiplier);
 
     HealInfo healInfo(caster, target, damage, GetSpellInfo(), GetSpellInfo()->GetSchoolMask());
+    // the heal lands on the target; DealHeal routes the healer's half (HealDoneRecord). HealBySpell is still
+    // called through the caster handle for the hook argument and the SMSG_SPELLHEALLOG broadcast (remaining row).
     caster->HealBySpell(healInfo);
 }
 
-void AuraEffect::HandlePeriodicHealAurasTick(Unit* target, Unit* caster) const
+void AuraEffect::HandlePeriodicHealAurasTick(Unit* target, Unit* caster, PeriodicLandedRecord* fb) const
 {
     if (!target->IsAlive())
         return;
@@ -6771,11 +6899,17 @@ void AuraEffect::HandlePeriodicHealAurasTick(Unit* target, Unit* caster) const
             manaPerSecond = gain;
         }
 
-        uint32 absorb2 = 0;
-        Unit::DealDamageMods(caster, manaPerSecond, &absorb2);
+        // Step 08 §2: a self damage of the caster is applied by the caster (Unit::ApplyPeriodicLanded)
+        if (fb)
+            fb->selfDamage = manaPerSecond;
+        else
+        {
+            uint32 absorb2 = 0;
+            Unit::DealDamageMods(caster, manaPerSecond, &absorb2);
 
-        CleanDamage cleanDamage = CleanDamage(0, 0, BASE_ATTACK, MELEE_HIT_NORMAL);
-        Unit::DealDamage(caster, caster, manaPerSecond, &cleanDamage, SELF_DAMAGE, GetSpellInfo()->GetSchoolMask(), GetSpellInfo(), true);
+            CleanDamage cleanDamage = CleanDamage(0, 0, BASE_ATTACK, MELEE_HIT_NORMAL);
+            Unit::DealDamage(caster, caster, manaPerSecond, &cleanDamage, SELF_DAMAGE, GetSpellInfo()->GetSchoolMask(), GetSpellInfo(), true);
+        }
     }
 
     uint32 procAttacker = PROC_FLAG_DONE_PERIODIC;
@@ -6789,7 +6923,7 @@ void AuraEffect::HandlePeriodicHealAurasTick(Unit* target, Unit* caster) const
         Unit::ProcSkillsAndAuras(caster, target, caster ? procAttacker : 0, procVictim, procEx, heal, BASE_ATTACK, GetSpellInfo(), nullptr, GetEffIndex(), nullptr, nullptr, &healInfo);
 }
 
-void AuraEffect::HandlePeriodicManaLeechAuraTick(Unit* target, Unit* caster) const
+void AuraEffect::HandlePeriodicManaLeechAuraTick(Unit* target, Unit* caster, PeriodicLandedRecord* fb) const
 {
     Powers PowerType = Powers(GetMiscValue());
 
@@ -6837,7 +6971,16 @@ void AuraEffect::HandlePeriodicManaLeechAuraTick(Unit* target, Unit* caster) con
     int32 gainedAmount = 0;
     if (gainAmount)
     {
-        gainedAmount = caster->ModifyPower(PowerType, gainAmount);
+        if (fb)
+        {
+            // Step 08 §2: the caster gains at feedback and knows the real gain then; the threat the target
+            // owes the caster is taken on the asked amount (the gain is capped by the caster's max power).
+            fb->powerGain = gainAmount;
+            fb->powerType = uint8(PowerType);
+            gainedAmount = gainAmount;
+        }
+        else
+            gainedAmount = caster->ModifyPower(PowerType, gainAmount);
         target->AddThreat(caster, float(gainedAmount) * 0.5f, GetSpellInfo()->GetSchoolMask(), GetSpellInfo());
     }
 
@@ -6854,13 +6997,18 @@ void AuraEffect::HandlePeriodicManaLeechAuraTick(Unit* target, Unit* caster) con
         // Mana Feed - Drain Mana
         if (manaFeedVal > 0)
         {
-            int32 feedAmount = CalculatePct(gainedAmount, manaFeedVal);
-            caster->CastCustomSpell(caster, 32554, &feedAmount, nullptr, nullptr, true, nullptr, this);
+            if (fb)
+                fb->manaFeedPct = uint8(std::min(manaFeedVal, 255));
+            else
+            {
+                int32 feedAmount = CalculatePct(gainedAmount, manaFeedVal);
+                caster->CastCustomSpell(caster, 32554, &feedAmount, nullptr, nullptr, true, nullptr, this);
+            }
         }
     }
 }
 
-void AuraEffect::HandleObsModPowerAuraTick(Unit* target, Unit* caster) const
+void AuraEffect::HandleObsModPowerAuraTick(Unit* target, Unit* caster, PeriodicLandedRecord* /*fb*/) const
 {
     Powers PowerType;
     if (GetMiscValue() == POWER_ALL)
@@ -6894,7 +7042,7 @@ void AuraEffect::HandleObsModPowerAuraTick(Unit* target, Unit* caster) const
         target->GetThreatMgr().ForwardThreatForAssistingMe(caster, float(gain) * 0.5f, GetSpellInfo(), true);
 }
 
-void AuraEffect::HandlePeriodicEnergizeAuraTick(Unit* target, Unit* caster) const
+void AuraEffect::HandlePeriodicEnergizeAuraTick(Unit* target, Unit* caster, PeriodicLandedRecord* /*fb*/) const
 {
     Powers PowerType = Powers(GetMiscValue());
 
@@ -6928,7 +7076,7 @@ void AuraEffect::HandlePeriodicEnergizeAuraTick(Unit* target, Unit* caster) cons
         target->GetThreatMgr().ForwardThreatForAssistingMe(caster, float(gain) * 0.5f, GetSpellInfo(), true);
 }
 
-void AuraEffect::HandlePeriodicPowerBurnAuraTick(Unit* target, Unit* caster) const
+void AuraEffect::HandlePeriodicPowerBurnAuraTick(Unit* target, Unit* caster, PeriodicLandedRecord* fb) const
 {
     Powers PowerType = Powers(GetMiscValue());
 
@@ -6960,7 +7108,8 @@ void AuraEffect::HandlePeriodicPowerBurnAuraTick(Unit* target, Unit* caster) con
 
     Unit::DealDamageMods(damageInfo.target, damageInfo.damage, &damageInfo.absorb);
 
-    caster->SendSpellNonMeleeDamageLog(&damageInfo);
+    // the log names both units; a foreign caster is not asked to broadcast it (step 08 §2)
+    (fb ? target : caster)->SendSpellNonMeleeDamageLog(&damageInfo);
 
     // Set trigger flag
     uint32 procAttacker = PROC_FLAG_DONE_PERIODIC;
@@ -6968,6 +7117,7 @@ void AuraEffect::HandlePeriodicPowerBurnAuraTick(Unit* target, Unit* caster) con
     if (damageInfo.damage)
         procVictim |= PROC_FLAG_TAKEN_DAMAGE;
 
+    // DealSpellDamage only forwards to DealDamage, which routes the attacker half (DamageDealtRecord)
     caster->DealSpellDamage(&damageInfo, true);
 
     DamageInfo dmgInfo(damageInfo, DOT, BASE_ATTACK, SPELL_MISS_NONE);

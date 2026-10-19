@@ -17,6 +17,7 @@
 
 #include "MapMgr.h"
 #include "BeatContext.h"
+#include "BeatPool.h"
 #include "Chat.h"
 #include "DatabaseEnv.h"
 #include "GridDefines.h"
@@ -41,8 +42,7 @@
 
 MapMgr::MapMgr()
 {
-    i_timer[3].SetInterval(sWorld->getIntConfig(CONFIG_INTERVAL_MAPUPDATE));
-    mapUpdateStep = 0;
+    SetMapUpdateInterval(sWorld->getIntConfig(CONFIG_INTERVAL_MAPUPDATE));
     _nextInstanceId = 0;
 }
 
@@ -61,10 +61,13 @@ void MapMgr::Initialize()
     int num_threads(sWorld->getIntConfig(CONFIG_NUMTHREADS));
 
     // One record log per core: the world thread plus every map update worker.
-    sRecordLogs->Init(uint8(std::clamp(num_threads, 0, 63) + 1));
+    uint8 const cores = uint8(std::clamp(num_threads, 0, 63) + 1);
+    sRecordLogs->Init(cores);
     sRecordLogs->BeginBeat(BeatContext::beat.load(std::memory_order_relaxed));
 
-    // Start mtmaps if needed
+    // Step 12: the beat loop runs on the world thread at one core; step 14 gives the pool its workers. The
+    // updater threads only serve the grid preloads at startup.
+    sBeatPool->Init(1);
     if (num_threads > 0)
         m_updater.activate(num_threads);
 }
@@ -120,6 +123,7 @@ Map* MapMgr::FindBaseNonInstanceMap(uint32 mapId) const
 
 Map* MapMgr::CreateMap(uint32 id, Player* player)
 {
+    ASSERT_NOT_IN_TASK();
     Map* m = CreateBaseMap(id);
 
     if (m && m->Instanceable())
@@ -257,60 +261,39 @@ Map::EnterState MapMgr::PlayerCannotEnter(uint32 mapid, Player* player, bool log
 
 void MapMgr::Update(uint32 diff)
 {
-    for (uint8 i = 0; i < 4; ++i)
-        i_timer[i].Update(diff);
+    // pussywizard: lfg compatibles update, before the maps so it is processed from the very beginning
+    sLFGMgr->Update(diff, 1);
 
-    // pussywizard: lfg compatibles update, schedule before maps so it is processed from the very beginning
-    //if (mapUpdateStep == 0)
+    // Step 12: one beat for every map once the map update interval elapsed. No per-type rotation, no
+    // session-only ticks in between: a player's packets wait for its task like everything else.
+    _beatAccum += diff;
+    if (_beatAccum < _beatInterval)
+        return;
+
+    uint32 const beatDiff = _beatAccum;
+    _beatAccum = 0;
+    sBeatPool->RunBeat(beatDiff);
+}
+
+void MapMgr::CollectAllMaps(std::vector<Map*>& out)
+{
+    std::lock_guard<std::mutex> guard(Lock);
+
+    for (auto const& mapPair : i_maps)
     {
-        if (m_updater.activated())
-        {
-            m_updater.schedule_lfg_update(diff);
-        }
-        else
-        {
-            sLFGMgr->Update(diff, 1);
-        }
+        Map* map = mapPair.second;
+        out.push_back(map);
+        if (MapInstanced* mapInstanced = map->ToMapInstanced())
+            for (auto const& instancePair : mapInstanced->GetInstancedMaps())
+                out.push_back(instancePair.second);
     }
+}
 
-    MapMapType::iterator iter = i_maps.begin();
-    for (; iter != i_maps.end(); ++iter)
-    {
-        bool full = mapUpdateStep < 3 && ((mapUpdateStep == 0 && !iter->second->IsBattlegroundOrArena() && !iter->second->IsDungeon()) || (mapUpdateStep == 1 && iter->second->IsBattlegroundOrArena()) || (mapUpdateStep == 2 && iter->second->IsDungeon()));
-        if (m_updater.activated())
-            m_updater.schedule_update(*iter->second, uint32(full ? i_timer[mapUpdateStep].GetCurrent() : 0), diff);
-        else
-            iter->second->Update(uint32(full ? i_timer[mapUpdateStep].GetCurrent() : 0), diff);
-    }
-
-    if (m_updater.activated())
-        m_updater.wait();
-
-    if (mapUpdateStep < 3)
-    {
-        for (iter = i_maps.begin(); iter != i_maps.end(); ++iter)
-        {
-            bool full = ((mapUpdateStep == 0 && !iter->second->IsBattlegroundOrArena() && !iter->second->IsDungeon()) || (mapUpdateStep == 1 && iter->second->IsBattlegroundOrArena()) || (mapUpdateStep == 2 && iter->second->IsDungeon()));
-            if (full)
-                iter->second->DelayedUpdate(uint32(i_timer[mapUpdateStep].GetCurrent()));
-        }
-
-        i_timer[mapUpdateStep].SetCurrent(0);
-        ++mapUpdateStep;
-    }
-
-    if (mapUpdateStep == 3 && i_timer[3].Passed())
-    {
-        mapUpdateStep = 0;
-        i_timer[3].SetCurrent(0);
-    }
-
-    // The beat advances after the delayed removes freed this tick's objects: a handle resolved under the
-    // old beat number is never reused. The new beat's write logs are reset here; last beat's logs stay
-    // readable for the inboxes applied at the top of the next Map::Update.
-    BeatContext::FlushForeignReads();
-    uint32 const beat = BeatContext::beat.fetch_add(1, std::memory_order_relaxed) + 1;
-    sRecordLogs->BeginBeat(beat);
+void MapMgr::DestroyExpiredInstances(uint32 diff)
+{
+    for (auto const& mapPair : i_maps)
+        if (MapInstanced* mapInstanced = mapPair.second->ToMapInstanced())
+            mapInstanced->DestroyExpiredInstances(diff);
 }
 
 void MapMgr::DoDelayedMovesAndRemoves()
@@ -341,6 +324,7 @@ bool MapMgr::IsValidMAP(uint32 mapid, bool startUp)
 
 void MapMgr::UnloadAll()
 {
+    ASSERT_NOT_IN_TASK();
     for (MapMapType::iterator iter = i_maps.begin(); iter != i_maps.end();)
     {
         iter->second->UnloadAll();

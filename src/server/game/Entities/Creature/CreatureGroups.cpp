@@ -16,6 +16,8 @@
  */
 
 #include "CreatureGroups.h"
+#include "BeatContext.h"
+#include "UnitView.h"
 #include "Creature.h"
 #include "CreatureAI.h"
 #include "GameTime.h"
@@ -85,6 +87,7 @@ void FormationMgr::RemoveCreatureFromGroup(CreatureGroup* group, Creature* membe
 
 void FormationMgr::LoadCreatureFormations()
 {
+    ASSERT_NOT_IN_TASK();
     uint32 const oldMSTime = getMSTime();
     CreatureGroupMap.clear();
     CreatureGroupMembers.clear();
@@ -201,7 +204,7 @@ void CreatureGroup::RemoveMember(Creature* member)
 
 void CreatureGroup::MemberEngagingTarget(Creature* member, Unit* target)
 {
-    uint8 const groupAI = sFormationMgr->CreatureGroupMap[member->GetSpawnId()].groupAI;
+    uint8 const groupAI = sFormationMgr->GetGroupAI(member->GetSpawnId());
     if (member == m_leader)
     {
         if (!(groupAI & std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_MEMBER_ASSIST_LEADER)))
@@ -222,7 +225,7 @@ void CreatureGroup::MemberEngagingTarget(Creature* member, Unit* target)
             continue;
         }
 
-        if (pMember == member || !pMember->IsAlive() || pMember->GetVictim())
+        if (pMember == member || !UnitView(pMember).IsAlive() || pMember->GetVictim())
         {
             continue;
         }
@@ -241,7 +244,7 @@ void CreatureGroup::MemberEngagingTarget(Creature* member, Unit* target)
 
 Unit* CreatureGroup::GetNewTargetForMember(Creature* member)
 {
-    uint8 const groupAI = sFormationMgr->CreatureGroupMap[member->GetSpawnId()].groupAI;
+    uint8 const groupAI = sFormationMgr->GetGroupAI(member->GetSpawnId());
     if (!(groupAI & std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_ACQUIRE_NEW_TARGET_ON_EVADE)))
     {
         return nullptr;
@@ -267,7 +270,7 @@ Unit* CreatureGroup::GetNewTargetForMember(Creature* member)
             continue;
         }
 
-        if (pMember == member || !pMember->IsAlive() || !pMember->GetVictim())
+        if (pMember == member || !UnitView(pMember).IsAlive() || !pMember->GetVictim())
         {
             continue;
         }
@@ -288,7 +291,7 @@ Unit* CreatureGroup::GetNewTargetForMember(Creature* member)
 
 void CreatureGroup::MemberEvaded(Creature* member)
 {
-    uint8 const groupAI = sFormationMgr->CreatureGroupMap[member->GetSpawnId()].groupAI;
+    uint8 const groupAI = sFormationMgr->GetGroupAI(member->GetSpawnId());
     if (!(groupAI & std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_EVADE_MASK)))
     {
         return;
@@ -434,7 +437,9 @@ bool CreatureGroup::CanLeaderStartMoving() const
 {
     for (auto const& itr : m_members)
     {
-        if (itr.first && itr.first != m_leader && itr.first->IsAlive())
+        // Members are foreign units: the liveness read comes from the slot (step 13); IsEngaged and
+        // IsInEvadeMode are plain AI flags.
+        if (itr.first && itr.first != m_leader && UnitView(itr.first).IsAlive())
             if (itr.first->IsEngaged() || itr.first->IsInEvadeMode())
                 return false;
     }

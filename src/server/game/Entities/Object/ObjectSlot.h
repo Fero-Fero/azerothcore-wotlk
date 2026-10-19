@@ -22,6 +22,7 @@
 #include "Define.h"
 #include "ObjectGuid.h"
 #include "Position.h"
+#include "SharedDefines.h"
 #include "SpellAuraDefines.h"
 #include <atomic>
 #include <cstring>
@@ -50,6 +51,61 @@ enum SlotAuraFlags : uint8
     SLOT_AURA_SELF_CAST = 0x04         // caster == owner
 };
 
+// A FlaggedValuesArray32 as plain values (ObjectSlot.h cannot include Object.h).
+template <uint8 N>
+struct SlotFlaggedValues
+{
+    uint32 flags = 0;
+    int32 values[N] = {};
+
+    [[nodiscard]] bool HasFlag(uint32 i) const { return (flags & (1u << i)) != 0; }
+    [[nodiscard]] int32 GetValue(uint32 i) const { return values[i]; }
+};
+
+enum SlotVisibilityFlags : uint16
+{
+    SLOT_VIS_NEVER_VISIBLE          = 0x0001,   // WorldObject::IsNeverVisible()
+    SLOT_VIS_INVISIBLE_DUE_DESPAWN  = 0x0002,   // WorldObject::IsInvisibleDueToDespawn()
+    SLOT_VIS_ARENA_SPECTATOR        = 0x0004,   // Player::IsSpectator() on an arena map
+    SLOT_VIS_GAME_MASTER            = 0x0008,   // Player::IsGameMaster()
+    SLOT_VIS_GM_ACCOUNT             = 0x0010,   // WorldSession::IsGMAccount()
+    SLOT_VIS_SUMMONER_ONLY          = 0x0020,   // TempSummon::IsVisibleBySummonerOnly()
+    SLOT_VIS_TRANSPORT_OR_BUILDING  = 0x0040,   // GameObject: IsTransport() || IsDestructibleBuilding()
+    SLOT_VIS_GHOST                  = 0x0080,   // Player: isDead() && GetHealth() > 0
+    SLOT_VIS_HAS_STEALTH_AURA       = 0x0100,   // Unit::HasStealthAura()
+    SLOT_VIS_IN_FLIGHT              = 0x0200    // Unit::IsInFlight()
+};
+
+// One entry of ThreatManager::_redirectInfo (Misdirection, Tricks of the Trade) as the attacker's threat
+// target reads it (step 13: AddThreat on the victim's task must not read the attacker's threat manager).
+struct SlotThreatRedirect
+{
+    ObjectGuid guid;
+    uint32 pct = 0;
+};
+constexpr uint32 MAX_SLOT_THREAT_REDIRECTS = 4;
+
+// What CanSeeOrDetect reads from the target (step 10). Filled for every WorldObject; unit/player parts are
+// zero for the rest.
+struct SlotVisibility
+{
+    uint16 flags = 0;                                   // SlotVisibilityFlags
+    uint8 teamId = 0;                                   // Player::GetTeamId()
+    SlotFlaggedValues<TOTAL_STEALTH_TYPES> stealth;
+    SlotFlaggedValues<TOTAL_STEALTH_TYPES> stealthDetect;
+    SlotFlaggedValues<TOTAL_INVISIBILITY_TYPES> invisibility;
+    SlotFlaggedValues<TOTAL_INVISIBILITY_TYPES> invisibilityDetect;
+    SlotFlaggedValues<TOTAL_SERVERSIDE_VISIBILITY_TYPES> serverSideVisibility;
+    SlotFlaggedValues<TOTAL_SERVERSIDE_VISIBILITY_TYPES> serverSideVisibilityDetect;
+    ObjectGuid groupGuid;                               // Player::GetGroup() guid, for IsGroupVisibleFor
+    ObjectGuid summonerGuid;                            // TempSummon::GetSummonerGUID()
+    ObjectGuid vehicleBaseGuid;                         // Unit::GetVehicleBase() guid
+    ObjectGuid ownerGuid;                               // Unit/GameObject GetOwnerGUID()
+    ObjectGuid farsightGuid;                            // Player: PLAYER_FARSIGHT
+    float combatReach = 0.0f;                           // Unit::GetCombatReach()
+    uint8 level = 0;                                    // getLevelForTarget() without target adjustments
+};
+
 // The readable copy of one WorldObject. Published by the owner after its Update; read by everyone else.
 struct ObjectSlot
 {
@@ -76,10 +132,26 @@ struct ObjectSlot
     ObjectGuid charmerOrOwnerGuid;     // GetCharmerOrOwnerGUID()
     uint32 auraCount = 0;
     SlotAura* auras = nullptr;         // auraCount entries, capacity in the pair
+    uint8 threatRedirectCount = 0;     // ThreatManager::_redirectInfo, in order, capped
+    SlotThreatRedirect threatRedirects[MAX_SLOT_THREAT_REDIRECTS];
 
-    // Movement update block pre-serialised for viewers (step 10 fills it; empty until then)
+    // Visibility inputs for a viewer's CanSeeOrDetect (step 10)
+    SlotVisibility vis;
+
+    // Movement update block pre-serialised for viewers (step 10): BuildMovementUpdate with updateFlag,
+    // never UPDATEFLAG_SELF (a viewer builds its own create block live).
+    uint16 updateFlag = 0;             // the flags the block was serialised with
     uint16 movementBlockSize = 0;
-    uint8* movementBlock = nullptr;
+    uint8* movementBlock = nullptr;    // movementBlockSize bytes, capacity in the pair
+
+    [[nodiscard]] bool AnyChange() const
+    {
+        for (uint32 i = 0, n = (valuesCount + 31) / 32; i < n; ++i)
+            if (changesMask[i])
+                return true;
+        return false;
+    }
+    [[nodiscard]] bool Changed(uint16 index) const { return (changesMask[index >> 5] >> (index & 31)) & 1; }
 };
 
 // Two slots and a stamp. The owner writes the slot opposite to the stamped one, then advances the stamp.
@@ -109,6 +181,9 @@ public:
     void EnsureAuraCapacity(uint32 count);
     [[nodiscard]] uint32 AuraCapacity() const { return _auraCapacity; }
 
+    // Grows the movement block storage of both slots. Never shrinks. Called from PublishSlot only.
+    void EnsureMovementCapacity(uint32 bytes);
+
     // Dense per-process index for the record log's head arrays (step 06). NO_SLOT_INDEX until AddToWorld.
     [[nodiscard]] uint32 SlotIndex() const { return _slotIndex; }
     void SetSlotIndex(uint32 index) { _slotIndex = index; }
@@ -120,6 +195,8 @@ private:
     std::unique_ptr<uint32[]> _storage;        // values and masks for both slots
     std::unique_ptr<SlotAura[]> _auraStorage;  // aura arrays for both slots
     uint32 _auraCapacity = 0;
+    std::unique_ptr<uint8[]> _movementStorage; // movement blocks for both slots
+    uint32 _movementCapacity = 0;
 };
 
 // Hands out dense slot indices. Taken at add/remove only, which happen between beats or at the seal.
@@ -159,6 +236,12 @@ struct SlotReader
     [[nodiscard]] SlotAura const* FindAura(uint32 spellId, ObjectGuid caster = ObjectGuid::Empty) const;
     // Sum of amount[i] over slot auras whose effect i applies the given aura type.
     [[nodiscard]] int32 TotalAuraModifier(AuraType type) const;
+    // Unit::HasAuraType / HasAuraTypeWithCaster on the slot.
+    [[nodiscard]] bool HasAuraType(AuraType type) const;
+    [[nodiscard]] bool HasAuraTypeWithCaster(AuraType type, ObjectGuid caster) const;
+    // Unit::BuildAuraStateUpdateForTarget on the slot: UNIT_FIELD_AURASTATE with the per-caster states
+    // recomputed for the given viewer (step 13: a viewer's update build must not read the owner's aura maps).
+    [[nodiscard]] uint32 AuraStateForTarget(ObjectGuid target) const;
 
     [[nodiscard]] uint32 Health() const;
     [[nodiscard]] uint32 MaxHealth() const;

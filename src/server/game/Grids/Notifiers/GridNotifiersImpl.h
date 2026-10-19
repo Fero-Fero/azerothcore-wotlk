@@ -29,7 +29,7 @@ template<class T>
 inline void Acore::VisibleNotifier::Visit(std::vector<T>& m)
 {
     for (typename std::vector<T>::iterator iter = m.begin(); iter != m.end(); ++iter)
-        i_player.UpdateVisibilityOf((*iter), i_data, i_visibleNow);
+        i_player.ViewCollect(*iter, i_work);
 }
 
 template<class T>
@@ -40,7 +40,7 @@ inline void Acore::VisibleNotifier::Visit(GridRefMgr<T>& m)
         return;
 
     for (typename GridRefMgr<T>::iterator iter = m.begin(); iter != m.end(); ++iter)
-        i_player.UpdateVisibilityOf(iter->GetSource(), i_data, i_visibleNow);
+        i_player.ViewCollect(iter->GetSource(), i_work);
 }
 
 // SEARCHERS & LIST SEARCHERS & WORKERS

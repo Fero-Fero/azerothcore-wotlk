@@ -357,7 +357,6 @@ public:
     void ClearSoulboundTradeable(Player* currentOwner);
     bool CheckSoulboundTradeExpire();
 
-    void BuildUpdate(UpdateDataMapType& data_map) override;
     void AddToObjectUpdate() override;
     void RemoveFromObjectUpdate() override;
 

@@ -254,6 +254,9 @@ private:
     std::unordered_map<uint32, std::unordered_map<ObjectGuid, uint32>> _redirectRegistry;
 
 public:
+    // For Unit::FillSlot (step 13): foreign AddThreat reads the attacker's redirects from its slot.
+    [[nodiscard]] std::vector<std::pair<ObjectGuid, uint32>> const& GetRedirectInfo() const { return _redirectInfo; }
+
     ThreatManager(ThreatManager const&) = delete;
     ThreatManager& operator=(ThreatManager const&) = delete;
 

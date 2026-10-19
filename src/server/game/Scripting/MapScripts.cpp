@@ -15,6 +15,7 @@
  * with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "BeatContext.h"
 #include "CellImpl.h"
 #include "GameTime.h"
 #include "GridNotifiers.h"
@@ -30,6 +31,17 @@
 /// Put scripts in the execution queue
 void Map::ScriptsStart(ScriptMapMap const& scripts, uint32 id, Object* source, Object* target)
 {
+    if (BeatContext::InTask())
+    {
+        ScriptScheduleDefer rec;
+        rec.scripts = &scripts;
+        rec.id = id;
+        rec.source = source ? source->GetGUID() : ObjectGuid::Empty;
+        rec.target = target ? target->GetGUID() : ObjectGuid::Empty;
+        AppendDefer(DeferKind::ScriptSchedule, rec);
+        return;
+    }
+
     ///- Find the script map
     ScriptMapMap::const_iterator s = scripts.find(id);
     if (s == scripts.end())
@@ -68,6 +80,17 @@ void Map::ScriptsStart(ScriptMapMap const& scripts, uint32 id, Object* source, O
 
 void Map::ScriptCommandStart(ScriptInfo const& script, uint32 delay, Object* source, Object* target)
 {
+    if (BeatContext::InTask())
+    {
+        ScriptScheduleDefer rec;
+        rec.script = &script;
+        rec.delay = delay;
+        rec.source = source ? source->GetGUID() : ObjectGuid::Empty;
+        rec.target = target ? target->GetGUID() : ObjectGuid::Empty;
+        AppendDefer(DeferKind::ScriptSchedule, rec);
+        return;
+    }
+
     // NOTE: script record _must_ exist until command executed
 
     // prepare static data

@@ -1160,23 +1160,17 @@ bool Item::IsBindedNotWith(Player const* player) const
     return true;
 }
 
-void Item::BuildUpdate(UpdateDataMapType& data_map)
-{
-    if (Player* owner = GetOwner())
-        BuildFieldsUpdate(owner, data_map);
-    ClearUpdateMask(false);
-}
-
 void Item::AddToObjectUpdate()
 {
+    // Item fields are seen by the owner only; the owner sends them from its own view phase (step 10).
     if (Player* owner = GetOwner())
-        owner->GetMap()->AddUpdateObject(this);
+        owner->AddChangedItem(this);
 }
 
 void Item::RemoveFromObjectUpdate()
 {
     if (Player* owner = GetOwner())
-        owner->GetMap()->RemoveUpdateObject(this);
+        owner->RemoveChangedItem(this);
 }
 
 void Item::SaveRefundDataToDB()

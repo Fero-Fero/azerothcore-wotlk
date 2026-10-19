@@ -16,6 +16,7 @@
  */
 
 #include "Battlefield.h"
+#include "BeatContext.h"
 #include "BattlefieldMgr.h"
 #include "ScriptMgr.h"
 #include "CellImpl.h"
@@ -88,6 +89,7 @@ void Battlefield::RemovePlayerFromTracking(ObjectGuid playerGuid, bool removeFro
 
 void Battlefield::HandlePlayerEnterZone(Player* player, uint32 /*zone*/)
 {
+    ASSERT_NOT_IN_BEAT();
     RemovePlayerFromTracking(player->GetGUID());
 
     // Allow scripts to adjust the player's effective team or appearance before
@@ -128,6 +130,7 @@ void Battlefield::HandlePlayerEnterZone(Player* player, uint32 /*zone*/)
 
 void Battlefield::HandlePlayerLeaveZone(Player* player, uint32 /*zone*/)
 {
+    ASSERT_NOT_IN_BEAT();
     // Logout still runs full leave-war cleanup, but marks the player for grace-window auto-rejoin.
     bool const isLogout = player->GetSession() && player->GetSession()->PlayerLogout();
 

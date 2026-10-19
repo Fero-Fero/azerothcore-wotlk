@@ -106,7 +106,24 @@ enum SpellCastResult : uint8;
 
 struct PositionFullTerrainStatus;
 
-typedef std::unordered_map<Player*, UpdateData> UpdateDataMapType;
+// Field values and change mask an update block is built from: the owner's live arrays, or a published slot
+// when a viewer builds on its own task (step 10). The mask is packed one bit per field (UpdateMask::CopyTo).
+struct UpdateValuesSource
+{
+    uint32 const* values;
+    uint32 const* changesMask;
+    // The published slot a viewer builds from; nullptr for the owner's live build. Everything a build needs
+    // beyond the field array (auras, owner guids) comes from here so no live member of a foreign object is read.
+    ObjectSlot const* slot = nullptr;
+    // Extra UF_FLAG_* forced into the block for this build only, the slot-side equivalent of the owner's
+    // SetFieldNotifyFlag/RemoveFieldNotifyFlag pair (a viewer must not write a foreign object's notify flags).
+    uint16 notifyFlags = 0;
+
+    [[nodiscard]] bool IsLive() const { return slot == nullptr; }
+
+    [[nodiscard]] bool Changed(uint16 index) const { return (changesMask[index >> 5] >> (index & 31)) & 1; }
+    [[nodiscard]] float F(uint16 index) const { float f; std::memcpy(&f, &values[index], sizeof(float)); return f; }
+};
 
 static constexpr Milliseconds HEARTBEAT_INTERVAL = 5s + 200ms;
 
@@ -198,8 +215,6 @@ public:
 
     [[nodiscard]] virtual bool hasQuest(uint32 /* quest_id */) const { return false; }
     [[nodiscard]] virtual bool hasInvolvedQuest(uint32 /* quest_id */) const { return false; }
-    virtual void BuildUpdate(UpdateDataMapType&) {}
-    void BuildFieldsUpdate(Player*, UpdateDataMapType&);
 
     void SetFieldNotifyFlag(uint16 flag) { _fieldNotifyFlags |= flag; }
     void RemoveFieldNotifyFlag(uint16 flag) { _fieldNotifyFlags &= ~flag; }
@@ -257,10 +272,14 @@ protected:
     [[nodiscard]] std::string _ConcatFields(uint16 startIndex, uint16 size) const;
     bool _LoadIntoDataField(std::string const& data, uint32 startOffset, uint32 count);
 
-    uint32 GetUpdateFieldData(Player const* target, uint32*& flags) const;
+    uint32 GetUpdateFieldData(Player const* target, uint32*& flags, UpdateValuesSource const& src) const;
 
     void BuildMovementUpdate(ByteBuffer* data, uint16 flags) const;
-    virtual void BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target);
+    // Live values and the live mask.
+    void BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target);
+    // The values builder proper. `src` is either the live fields or a published slot (step 10); the per-type
+    // overrides read every field value through it and keep only viewer-dependent decisions on the handle.
+    virtual void BuildValuesUpdateFrom(uint8 updateType, ByteBuffer* data, Player* target, UpdateValuesSource const& src);
 
     uint16 m_objectType;
 
@@ -280,6 +299,8 @@ protected:
 
     uint16 _fieldNotifyFlags;
 
+    // A field changed while in world. A WorldObject makes sure it updates (and so publishes) this tick; an
+    // Item joins its owner's changed-item list. Viewers pull the values from the slot (step 10).
     virtual void AddToObjectUpdate() = 0;
     virtual void RemoveFromObjectUpdate() = 0;
     void AddToObjectUpdateIfNeeded();
@@ -498,6 +519,15 @@ public:
     // Ungrouped objects are their own root. Step 12 points a passenger or a charmed unit at the group root.
     [[nodiscard]] WorldObject* TaskRoot() { return _taskRoot ? _taskRoot : this; }
     [[nodiscard]] WorldObject const* TaskRoot() const { return _taskRoot ? _taskRoot : this; }
+    [[nodiscard]] bool IsTaskRoot() const { return !_taskRoot; }
+    [[nodiscard]] std::vector<WorldObject*> const& TaskMembers() const { return _taskMembers; }
+    // Step 12 task groups, written only at the seal (TaskGroupJoin / TaskGroupLeave defers) and at removal.
+    void JoinTaskGroup(WorldObject* root);
+    void LeaveTaskGroup();
+    // A root whose task ran this beat republishes itself when: a player; IsUpdateNeeded; a pending record;
+    // or any member says so. A member is never due on its own.
+    [[nodiscard]] bool IsDueNextBeat();
+    [[nodiscard]] uint32 LastTaskNs() const { return _lastTaskNs; }
 
     // Copies the readable state into the write slot and advances the stamp. Called once after each Update.
     void PublishSlot();
@@ -660,6 +690,11 @@ public:
 
     //bool CanSeeOrDetect(WorldObject const* obj, bool ignoreStealth = false, bool distanceCheck = false) const;
     bool CanSeeOrDetect(WorldObject const* obj, bool ignoreStealth = false, bool distanceCheck = false, bool checkAlert = false) const;
+    // Step 10: the same decision with the target's state read from its published slot. Script hooks
+    // (AI CanBeSeen, visibility conditions) still go through the handle.
+    bool CanSeeOrDetect(ObjectSlot const& slot, WorldObject const* obj, bool ignoreStealth = false, bool distanceCheck = false, bool checkAlert = false) const;
+    bool CanDetectInvisibilityOf(ObjectSlot const& slot, WorldObject const* obj) const;
+    bool CanDetectStealthOf(ObjectSlot const& slot, WorldObject const* obj, bool checkAlert = false) const;
 
     FlaggedValuesArray32<int32, uint32, StealthType, TOTAL_STEALTH_TYPES> m_stealth;
     FlaggedValuesArray32<int32, uint32, StealthType, TOTAL_STEALTH_TYPES> m_stealthDetect;
@@ -703,7 +738,10 @@ public:
 
     virtual void UpdateObjectVisibility(bool forced = true, bool fromUpdate = false);
     virtual void UpdateObjectVisibilityOnCreate() { UpdateObjectVisibility(true); }
-    void BuildUpdate(UpdateDataMapType& data_map) override;
+
+    // Step 10: a viewer builds this object's blocks from a published slot on its own task.
+    void BuildValuesUpdateFromSlot(ObjectSlot const& slot, UpdateData* data, Player* viewer, uint16 notifyFlags = 0);
+    void BuildCreateUpdateBlockFromSlot(ObjectSlot const& slot, UpdateData* data, Player* viewer);
     void GetCreaturesWithEntryInRange(std::list<Creature*>& creatureList, float radius, uint32 entry);
 
     void SetPositionDataUpdate();
@@ -864,8 +902,11 @@ protected:
     virtual void FillSlot(ObjectSlot& /*slot*/) { }
     ObjectSlotPair _slots;
 
-    // Applies the sorted records of one beat. The base drops them: only Unit has record kinds on this step.
+    // Applies the sorted records of one beat. The base handles the kinds every WorldObject receives
+    // (visibility links, step 10) and drops the rest.
     virtual void ApplyRecords(std::vector<RecordHeader const*> const& records);
+    // Kinds any WorldObject can receive. Returns false when the kind is not one of them.
+    bool ApplyCommonRecord(RecordHeader const& header, uint8 const* payload);
 
     // Set by PrepareRemoval. Never cleared: the object is a dead handle until the seal frees it.
     bool _removing{false};
@@ -906,14 +947,21 @@ private:
 
     // Written only at the seal (step 12). nullptr means this object is its own task root.
     WorldObject* _taskRoot{nullptr};
+    // Non-empty on a root with members (a vehicle's seated units, a charmer's charmed unit).
+    std::vector<WorldObject*> _taskMembers;
     // Grid the S1a router tagged this object for. -1 unless it is in that grid's pending list.
     int32 _pendingInGrid{-1};
+    // Beat this root is scheduled for (BeatPool::Schedule CAS); 0 when not in any ring.
+    std::atomic<uint32> _scheduledBeat{0};
+    // Duration of this root's last task body, for the heavy ring.
+    uint32 _lastTaskNs{0};
 
     // Bit per core that appended a record to this object in the current beat. Written only by
     // OnFirstRecordOfBeat (fetch_or) and ApplyInbox (exchange to 0).
     std::atomic<uint64> _writtenBy{0};
 
     friend struct BeatContext;
+    friend class BeatPool;
 };
 
 namespace Acore

@@ -60,6 +60,10 @@ struct FollowUpCast
     uint8 by = FEEDBACK_BY_CASTER;          // FeedbackActor
     int32 auraDuration = 0;                 // SPELLVALUE_AURA_DURATION when != 0 (ADD_TARGET_TRIGGER duration sync)
     ObjectGuid originalCaster;
+    // Step 08 §2: a cast a periodic tick asked for carries the ticking aura as ids (Spell::m_triggeredByAuraSpell)
+    uint32 triggeredByAuraId = 0;
+    int8 triggeredByAuraEffIndex = -1;
+    uint32 triggeredByAuraTick = 0;
 };
 
 // One SPELL_AURA_ADD_TARGET_TRIGGER entry of Spell::m_hitTriggerSpells, as ids.
@@ -210,11 +214,88 @@ struct DeferredSpellHitRecord
     SpellHitRecord hit;
 };
 
+// Step 08 §2: the caster half of a periodic tick. The aura is owned by the target, which ticks it on its own
+// task; everything the tick handlers wrote on the caster (self heal of a leech, health funnel cost, drained
+// power, assist threat, trigger casts) travels back in one of these per tick and is applied by
+// Unit::ApplyPeriodicLanded. Victim-side writes (damage, heal, logs, victim procs) stay inline on the target;
+// DealDamage / DealHeal / ProcSkillsAndAuras already route their own caster halves (step 07 slice 5).
+constexpr uint8 MAX_PERIODIC_FOLLOWUPS = 2;
+
+struct PeriodicLandedRecord
+{
+    ObjectGuid target;                      // tick target (the aura owner)
+    ObjectGuid caster;                      // the aura's caster, the record's recipient
+    uint32 spellId = 0;
+    uint8 effIndex = 0;
+    uint8 auraType = 0;                     // AuraType
+    uint8 stackAmount = 1;
+    uint8 faceChannelTarget = 0;            // SPELL_ATTR1_TRACK_TARGET_IN_CHANNEL creature caster: SetInFront(channel object)
+    uint32 tickNumber = 0;
+
+    // SPELL_AURA_PERIODIC_LEECH: the caster heals itself for leechBase * CalcValueMultiplier with its own done
+    // and taken bonus, then forwards half the gain as assist threat
+    uint32 leechBase = 0;
+    // SPELL_AURA_PERIODIC_HEALTH_FUNNEL: the caster pays this much health (ModifyHealth)
+    uint32 funnelHealthCost = 0;
+    // SPELL_AURA_PERIODIC_HEAL with SPELL_ATTR2_NO_TARGET_PER_SECOND_COST: DealDamage(self, SELF_DAMAGE)
+    uint32 selfDamage = 0;
+    // SPELL_AURA_PERIODIC_MANA_LEECH gain, Aura::Update ManaPerSecond cost (negative)
+    int32 powerGain = 0;
+    uint8 powerType = 0;                    // Powers
+    uint8 manaFeedPct = 0;                  // Drain Mana + Mana Feed: cast 32554 with this percent of the gained power
+    uint8 restoration = 0;                  // 24379 / 23493: heal self 10% max health, energize 10% max mana
+    uint8 triggerHasBp0 = 0;
+    // Aura::Update ManaPerSecond with POWER_HEALTH: ModifyHealth(healthDelta)
+    int32 healthDelta = 0;
+    // ForwardThreatForAssistingMe on the caster's own threat manager (leech heal)
+    float assistThreat = 0.0f;
+
+    // The periodic trigger cast when NeedsToBeTriggeredByCaster: performed by the caster at feedback with
+    // m_triggeredByAuraSpell rebuilt from spellId / effIndex / tickNumber.
+    uint32 triggerSpellId = 0;
+    ObjectGuid triggerTarget;
+    uint32 triggerFlags = 0;                // TriggerCastFlags
+    int32 triggerBp0 = 0;
+    uint8 hasChannelData = 0;
+    uint8 triggerAuraPeriodic = 0;          // Spell::prepare interrupts the channel of a player caster on a failed cast
+    ObjectGuid channelObject;
+    SpellDestRecord channelDst;
+
+    FollowUpCast follow[MAX_PERIODIC_FOLLOWUPS];
+    uint8 followCount = 0;
+
+    [[nodiscard]] bool IsEmpty() const
+    {
+        return !faceChannelTarget && !leechBase && !funnelHealthCost && !selfDamage && !powerGain && !restoration
+            && !healthDelta && assistThreat == 0.0f && !triggerSpellId && !followCount;
+    }
+
+    // byAura: the inline code passed `this` (the ticking AuraEffect) as triggeredByAura
+    FollowUpCast* AddFollowUp(uint32 followSpellId, ObjectGuid const& followTarget, uint32 followTriggerFlags, bool byAura = true)
+    {
+        if (followCount >= MAX_PERIODIC_FOLLOWUPS)
+            return nullptr;
+        FollowUpCast& f = follow[followCount++];
+        f = FollowUpCast();
+        f.spellId = followSpellId;
+        f.target = followTarget;
+        f.triggerFlags = followTriggerFlags;
+        if (byAura)
+        {
+            f.triggeredByAuraId = spellId;
+            f.triggeredByAuraEffIndex = int8(effIndex);
+            f.triggeredByAuraTick = tickNumber;
+        }
+        return &f;
+    }
+};
+
 static_assert(std::is_trivially_copyable_v<SpellDestRecord>, "record payloads are plain values");
 static_assert(std::is_trivially_copyable_v<SpellValue>, "SpellValue is embedded by value in SpellHitRecord");
 static_assert(std::is_trivially_copyable_v<FollowUpCast>, "record payloads are plain values");
 static_assert(std::is_trivially_copyable_v<SpellHitRecord>, "record payloads are plain values");
 static_assert(std::is_trivially_copyable_v<SpellLandedRecord>, "record payloads are plain values");
 static_assert(std::is_trivially_copyable_v<DeferredSpellHitRecord>, "record payloads are plain values");
+static_assert(std::is_trivially_copyable_v<PeriodicLandedRecord>, "record payloads are plain values");
 
 #endif

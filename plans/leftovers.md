@@ -1,0 +1,12 @@
+plan §12 slice 4 is designed to be driven by compiler errors: rename m_caster on the land path to a type the handlers can't write through, make SpellScript::GetCaster() return a UnitView, change the CreatureAI::SpellHit / AuraEffect::CalculateAmount parameter types, then build. The error list is the audit — each line becomes a view read, a Feedback() follow-up, or a Deferred row. Without compiling I can't get that list, and editing ~120 handler sites by guesswork would mostly produce wrong edits. So I did the parts that don't depend on compiler output (the GetCasterView / target-count API and the nine scripts) and left the rename for a session where building is allowed.
+
+One deliberate deviation, flagged in Status: the link/unlink records are wired but disabled (USE_VISIBILITY_LINK_RECORDS = false). An object removed at the end of this tick would be freed before the record applied next beat, leaving the viewer's map with a dead pointer. The target-side write stays direct (safe while the view phase has no concurrent task); step 12's seal ordering is the point to flip it.
+
+Things most likely to need a compile fix when you build: the lambda-free structured bindings in CollectRest, visible.begin(b) local-bucket iteration in ViewBuild, and TeamId(s.vis.teamId) in the slot CanSeeOrDetect.
+
+ModuleDatabasePool is unguarded; the assert will also fire for sync queries from session packets handled inside the player's task, which is the intended debug crash (we should probably try to avoid a crash here)
+
+Left open (listed in the plan's Status): S1a grid items, frees collected for S2, Spawn defers from ProcessRespawns, dyn-tree rebalance cap, .server info comparison. Note that inBeat is now actually true during U1–S1b, so latent MayAccess asserts from step 09 may show up in a debug build.
+
+
+plan 13 was done statically (no build or play-test). The ASSERT_OWNED layer is now on every field getter, so the first debug boot will surface the open rows of the plan 13 exit table before anything else: conditions evaluation inside CanSeeSpellClickOn/CanSeeVendor on a foreign creature (talk to any NPC), CreatureGroup::LeaderStartedMoving writing member motion masters (any formation patrol), and sScriptMgr->OnPatchValuesUpdate receiving the live unit. The debug SendPacket statistic became thread_local; .debug singletons resets its counters on read. Items are owned by their owner's task (MayAccess resolves the owner guid through FindConnectedPlayer), bank/mail items with no connected owner are free.

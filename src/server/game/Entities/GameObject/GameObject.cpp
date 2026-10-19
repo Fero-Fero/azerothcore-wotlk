@@ -16,6 +16,7 @@
  */
 
 #include "AccountMgr.h"
+#include "BeatContext.h"
 #include "ObjectAccessor.h"
 #include "Unit.h"
 #include "UnitRecordLog.h"
@@ -708,7 +709,7 @@ void GameObject::Update(uint32 diff)
                         // respawn timer
                         uint32 poolid = m_spawnId ? sPoolMgr->IsPartOfAPool<GameObject>(m_spawnId) : 0;
                         if (poolid)
-                            sPoolMgr->UpdatePool<GameObject>(GetMap()->GetPoolData(), poolid, m_spawnId);
+                            GetMap()->UpdatePoolDeferred(TYPEID_GAMEOBJECT, poolid, m_spawnId);
                         else
                             GetMap()->AddToMap(this);
                     }
@@ -808,7 +809,17 @@ void GameObject::Update(uint32 diff)
                             {
                                 Group* group = sGroupMgr->GetGroupByGUID(lootingGroupLowGUID);
                                 if (group)
-                                    group->EndRoll(&loot);
+                                {
+                                    if (BeatContext::InTask())
+                                    {
+                                        GroupEndRollDefer rec;
+                                        rec.groupGuid = group->GetGUID();
+                                        rec.corpseGuid = GetGUID();
+                                        GetMap()->AppendDefer(DeferKind::GroupEndRoll, rec);
+                                    }
+                                    else
+                                        group->EndRoll(&loot);
+                                }
                                 m_groupLootTimer = 0;
                                 lootingGroupLowGUID = 0;
                             }
@@ -1016,9 +1027,7 @@ void GameObject::DespawnOrUnsummon(Milliseconds delay /*= 0ms*/, Seconds forceRe
             // Keep the current pooled gameobject reserved until its respawn timer expires.
             // GameObject::Update() will update the pool when the object is ready to respawn.
             if (poolid && !m_respawnTime)
-            {
-                sPoolMgr->UpdatePool<GameObject>(GetMap()->GetPoolData(), poolid, m_spawnId);
-            }
+                GetMap()->UpdatePoolDeferred(TYPEID_GAMEOBJECT, poolid, m_spawnId);
         }
     }
 }
@@ -1041,7 +1050,7 @@ void GameObject::Delete()
 
     uint32 poolid = m_spawnId ? sPoolMgr->IsPartOfAPool<GameObject>(m_spawnId) : 0;
     if (poolid)
-        sPoolMgr->UpdatePool<GameObject>(GetMap()->GetPoolData(), poolid, m_spawnId);
+        GetMap()->UpdatePoolDeferred(TYPEID_GAMEOBJECT, poolid, m_spawnId);
     else
         AddObjectToRemoveList();
 }
@@ -1320,6 +1329,16 @@ bool GameObject::IsAlwaysVisibleFor(WorldObject const* seer) const
     }
 
     return false;
+}
+
+void GameObject::FillSlot(ObjectSlot& slot)
+{
+    // Visibility inputs (step 10)
+    SlotVisibility& v = slot.vis;
+    if (IsTransport() || IsDestructibleBuilding())
+        v.flags |= SLOT_VIS_TRANSPORT_OR_BUILDING;
+    // Stealth detection against a trap uses the owner's level; the viewer-side formula reads it from here.
+    v.level = getLevelForTarget(this);
 }
 
 bool GameObject::IsInvisibleDueToDespawn() const
@@ -2776,7 +2795,7 @@ GameObject* GameObject::GetLinkedTrap()
     return ObjectAccessor::GetGameObject(*this, m_linkedTrap);
 }
 
-void GameObject::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target)
+void GameObject::BuildValuesUpdateFrom(uint8 updateType, ByteBuffer* data, Player* target, UpdateValuesSource const& src)
 {
     if (!target)
         return;
@@ -2791,13 +2810,13 @@ void GameObject::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* t
 
     uint32* flags = GameObjectUpdateFieldFlags;
     uint32 visibleFlag = UF_FLAG_PUBLIC;
-    if (GetOwnerGUID() == target->GetGUID())
+    if (ObjectGuid(src.values[OBJECT_FIELD_CREATED_BY] | (uint64(src.values[OBJECT_FIELD_CREATED_BY + 1]) << 32)) == target->GetGUID())
         visibleFlag |= UF_FLAG_OWNER;
 
     for (uint16 index = 0; index < m_valuesCount; ++index)
     {
-        if (_fieldNotifyFlags & flags[index] ||
-                ((updateType == UPDATETYPE_VALUES ? _changesMask.GetBit(index) : m_uint32Values[index]) && (flags[index] & visibleFlag)) ||
+        if ((_fieldNotifyFlags | src.notifyFlags) & flags[index] ||
+                ((updateType == UPDATETYPE_VALUES ? src.Changed(index) : src.values[index]) && (flags[index] & visibleFlag)) ||
                 (index == GAMEOBJECT_FLAGS && forcedFlags))
         {
             updateMask.SetBit(index);
@@ -2832,7 +2851,7 @@ void GameObject::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* t
                         if (StaticTransport const* t = ToStaticTransport())
                             if (t->GetPauseTime())
                             {
-                                if (GetGoState() == GO_STATE_READY)
+                                if (GOState(src.values[GAMEOBJECT_BYTES_1] & 0xFF) == GO_STATE_READY)
                                 {
                                     if (t->GetPathProgress() >= t->GetPauseTime()) // if not, send 100% progress
                                         pathProgress = int16(float(t->GetPathProgress() - t->GetPauseTime()) / float(t->GetPeriod() - t->GetPauseTime()) * 65535.0f);
@@ -2858,7 +2877,7 @@ void GameObject::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* t
             }
             else if (index == GAMEOBJECT_FLAGS)
             {
-                uint32 goFlags = m_uint32Values[GAMEOBJECT_FLAGS];
+                uint32 goFlags = src.values[GAMEOBJECT_FLAGS];
                 if (GetGoType() == GAMEOBJECT_TYPE_CHEST && GetGOInfo() && GetGOInfo()->chest.groupLootRules && !IsLootAllowedFor(target))
                 {
                     goFlags |= GO_FLAG_LOCKED | GO_FLAG_NOT_SELECTABLE;
@@ -2867,7 +2886,7 @@ void GameObject::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* t
                 fieldBuffer << goFlags;
             }
             else
-                fieldBuffer << m_uint32Values[index];                // other cases
+                fieldBuffer << src.values[index];                    // other cases
         }
     }
 

@@ -1493,7 +1493,8 @@ bool WorldSession::recoveryItem(Item* pItem)
         stmt->SetData(1, pItem->GetTemplate()->ItemId);
         stmt->SetData(2, pItem->GetCount());
 
-        CharacterDatabase.Query(stmt);
+        // Result discarded; enqueued so the player's task does not wait for the round trip (step 11).
+        CharacterDatabase.Execute(stmt);
 
         return true;
     }

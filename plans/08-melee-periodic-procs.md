@@ -115,8 +115,116 @@ Dynamic-object persistent area auras (`DynObjAura`): the dynobj is a task; `Fill
 
 ## Checklist
 
-- [ ] `AttackerStateUpdate` emits `MeleeHitRecord`; land does absorb/resist/block, health, victim procs, `SendAttackStateUpdate`; feedback does rage, actor procs, extra attacks, `AtTargetAttacked`, kill.
-- [ ] `PeriodicTick` takes `UnitView`; no `caster->Deal*`/`Send*`/`Energize*`/`Heal*` inside a tick handler.
-- [ ] Area auras: owner holds a guid set; targets hold clones; apply/remove are records.
-- [ ] `AuraScript::GetCaster()` is a view on foreign-caster hooks.
-- [ ] Foreign-read counter is 0 for a melee-plus-DoT fight.
+- [x] `AttackerStateUpdate` emits `MeleeHitRecord`; land does absorb/resist/block, health, victim procs, `SendAttackStateUpdate`; feedback does rage, actor procs, extra attacks, `AtTargetAttacked`, kill.
+- [~] `PeriodicTick` takes `UnitView`; no `caster->Deal*`/`Send*`/`Energize*`/`Heal*` inside a tick handler. (Handle kept for reads; every caster write routed, see §7. Remaining: `HealBySpell` through the caster handle on Health Funnel, Extract Gas loot.)
+- [x] Area auras: owner holds a guid set; targets hold clones; apply/remove are records.
+- [~] `AuraScript::GetCaster()` is a view on foreign-caster hooks. (`GetCasterView()` added alongside; the return type change and the AI hook signatures are compile-driven and not done, see §7.)
+- [ ] Foreign-read counter is 0 for a melee-plus-DoT fight. (Not measured; no build. Known handle reads listed in §7.)
+
+## 7. Status
+
+Implemented without a build (per repo rule); everything below is written against the step 07 slice-5 routing
+pattern (`BeatContext::IsForeign(x)` decides between the inline write and a record) and should be compiled and
+run through the slice checks of §5 before the next step.
+
+### Slice 1 — melee
+
+- `CombatRecords.h`: `MeleeHitRecord` (attacker guid, attack type, outcome, HitInfo, TargetState, clean damage,
+  blocked, proc flags, per-school damage after armor / crit / block, daze inputs) and `MeleeLandedRecord`
+  (rage-on-avoid, daze, `CastItemCombatSpell`, damage shield).
+- `Unit::CalculateMeleeDamage(..., bool victimSide = true)`: the victim-side tail (victim AI hook, resilience,
+  absorb, resist, HitInfo absorb/resist bits) was extracted into `static Unit::CalcMeleeAbsorbResist`. With
+  `victimSide = false` the launch stops before it. `CalcDamageInfo` gained `attackerCanDaze` /
+  `attackerMeleeSkill` so the victim rolls daze without reading the attacker.
+- `Unit::AttackerStateUpdate`: when the victim is foreign, `BuildMeleeHitRecord` + `RecordKind::MeleeHit` to
+  the victim and return. Otherwise `LandMeleeHit` (the old tail: `DealDamageMods`, sparring flag,
+  `SendAttackStateUpdate`, `DealMeleeDamage`, `ProcSkillsAndAuras`, debug log) runs inline.
+- `Unit::ApplyMeleeHit` (victim): rebuilds `CalcDamageInfo` from the record, runs the victim AI hook on the
+  armor-reduced amount, `CalcMeleeAbsorbResist`, then `LandMeleeHit`. `SendAttackStateUpdate` is called on
+  the victim (the packet names both units by guid, so the broadcast origin is the only change).
+- `Unit::DealMeleeDamage`: `attackerForeign = IsForeign(this)`; rage on avoid, daze, `CastItemCombatSpell`,
+  `DealDamageShieldDamage` go into a `MeleeLandedRecord` appended to the attacker when any is set;
+  `Unit::ApplyMeleeLanded` applies them. Health, parry haste and emotes stay inline (victim writes);
+  `DealDamage` / `ProcSkillsAndAuras` route their own attacker halves (step 07).
+- Extra attacks (`HandleProcExtraAttackFor` → `AttackerStateUpdate`) take the same path, so they land the beat
+  after the proc as §1 intended.
+- Dancing Rune Weapon (`spell_dk.cpp`) still calls `CalculateMeleeDamage` / `SendAttackStateUpdate` /
+  `DealMeleeDamage` inline with the default `victimSide = true`; unchanged.
+
+### Slice 2 — periodic
+
+- `SpellHitRecord.h`: `PeriodicLandedRecord` (target, caster, spell / effect / tick / stack, channel facing,
+  leech base, health funnel cost, self damage, power gain / per-second cost, Mana Feed percent, Restoration,
+  one generic trigger-cast slot with channel data, up to two `FollowUpCast`s). `FollowUpCast` gained the
+  triggering aura as ids (`triggeredByAuraId` / `EffIndex` / `Tick`).
+- `AuraEffect::PeriodicTick` computes `casterForeign` and hands a `PeriodicLandedRecord*` (`fb`, null when the
+  caster is on this task) to all eleven tick handlers; the record is appended to the caster if non-empty.
+  The caster stays a `Unit*` handle for reads (plan said `UnitView`; the handlers read far more of the caster
+  than the view exposes — `SpellDamageBonusDone`, `SpellHitResult`, `CalcArmorReducedDamage`, `GetVictim`,
+  `GetAuraEffect` — so the handle was kept and only the writes were routed).
+- Routed caster writes: channel-target facing; Explosive Shot `CastCustomSpell`; Thaumaturgy, Frost Blast,
+  Summon Templar/Duke/Royal casts; Restoration 24379/23493 self heal + energize; the generic
+  `NeedsToBeTriggeredByCaster` trigger cast (`TriggerPeriodicSpell`); Beacon of Light's cast by the area aura
+  owner (clone-aware via `Aura::GetAreaOwnerUnit`, routed to a foreign owner as a `PeriodicLanded` follow-up);
+  leech self heal + assist threat (caster computes its own done/taken bonus at feedback from the raw amount);
+  Health Funnel donator cost (re-clamped on the caster's live health at feedback); heal-aura
+  `SPELL_ATTR2_NO_TARGET_PER_SECOND_COST` self damage; Drain Mana gain + Mana Feed; `Aura::Update`
+  ManaPerSecond / ManaPerSecondPerLevel cost (`Aura::EmitCasterPerSecondCost`).
+- Packets: `SendTickImmune` and the leech / power-burn `SendSpellNonMeleeDamageLog` are broadcast from the
+  target when the caster is foreign (`Unit::SendSpellDamageImmuneFrom`); packet content is unchanged.
+- `Spell::SetTriggeredByAuraSpell(TriggeredByAuraSpellData const&, bool interruptChannelOnFail)` and a
+  `Unit::CastSpell(targets, spellInfo, values, flags, TriggeredByAuraSpellData const&, bool, originalCaster)`
+  overload rebuild `m_triggeredByAuraSpell` from ids at feedback; `Spell::prepare` keeps the "failed periodic
+  trigger of a player ends the channel" rule for them (`InterruptSpell(CURRENT_CHANNELED_SPELL)` instead of
+  `SetDuration(0)` on an aura it cannot see). `Unit::CastFollowUp` uses it when a follow-up carries aura ids.
+- `Unit::ApplyPeriodicLanded` applies the record in handler order.
+- Remaining handle writes in tick handlers (documented, not routed): Health Funnel's `caster->HealBySpell` on
+  the target (kept for the `ModifyHealReceived` hook argument and the `SMSG_SPELLHEALLOG` origin; the health
+  write itself goes through `DealHeal`, which routes); Extract Gas 30427 `AutoStoreLoot` into the caster
+  player's inventory. `Aura::UpdateOwner`'s transient `SetSpellModTakingSpell` on the caster's mod owner is
+  also still a handle write around the tick.
+- Behaviour notes: Drain Mana threat uses the asked amount, not the capped gain, when the caster is foreign;
+  the mana-leech / funnel "can the caster pay" decisions are reads of the caster handle, re-clamped on apply.
+
+### Slice 3 — area auras
+
+- `Spells/Auras/AreaAuraRecords.h`: `AreaAuraApplyRecord` (spell, area owner, caster, cast item,
+  `AuraLaunchData` with the member's effect mask) and `AreaAuraRemoveRecord`. `AREA_CLONE_TIMEOUT_MS = 1500`.
+- `Aura` gained `m_isAreaClone`, `m_areaOwnerGuid`, `m_areaCloneSinceRefreshMs`, `m_areaCloneTargets`;
+  `IsAreaClone`, `GetAreaOwnerGUID`, `MarkAreaClone` (also zeroes `m_timeCla`), `TouchAreaClone`,
+  `GetAreaOwnerUnit`, `BuildAreaAuraApplyRecord`, `EmitAreaAuraRemove`, `RouteForeignAreaTargets`.
+- `Aura::UpdateTargetMap` → `RouteForeignAreaTargets` right after `FillTargetMap`: every foreign non-owner
+  target is removed from the inline map and, after the owner-side checks the register loop would do by reading
+  the target (immunities, `CanBeAppliedOn`, dynobj flight / `ONLY_ONE_AREA_AURA`), gets an
+  `AreaAuraApplyRecord`; members in last interval's set that are not wanted now get an `AreaAuraRemoveRecord`.
+  Outside a task nothing is foreign and a leftover set is released. `_Remove` sends a remove to every member.
+- `UnitAura::FillTargetMap`: a clone targets its owner only. `Aura::Update`: a clone not refreshed within the
+  timeout removes itself. `Aura::CanBeSaved`: clones are never saved.
+- `Unit::ApplyAreaAuraApply`: finds the clone by (spell, caster, area owner); refresh touches the watchdog and
+  copies duration / amounts (`ChangeAmount`), an effect-mask change rebuilds it; create goes through
+  `Aura::Create(..., &launch)` with `m_creatingAreaClone` set so `Unit::_AddAura` runs the member-side checks
+  the inline register loop did (`IsHighestExclusiveAura`, `CanStackWith` against applied auras) and removes the
+  clone instead of evicting the member's auras. `Unit::ApplyAreaAuraRemove` removes it.
+- Persistent (dynobj) area auras: the caster's done bonus for periodic damage / leech / heal is folded into
+  the launch amount on the owner side (the clone is a unit aura, whose tick applies only the taken bonus), so
+  a clone's tick equals the inline dynobj tick up to the resolution of the owner's refresh.
+- Behaviour notes: charges and stacks are per clone (clone stack is 1; the owner's amount already has its
+  stack folded in); owner-side amount / duration changes reach members on the next interval; scripts walking
+  `GetApplicationMap()` of the owner's aura do not see clone members; a target that becomes foreign while
+  holding an inline application is unapplied inline once (a foreign write at the transition) and re-reached by
+  record on the same interval; the paladin "dominant aura" stripping only runs between inline applications.
+
+### Slice 4 — `AuraScript` / AI hooks
+
+- `AuraScript::GetCasterView()` added (`UnitView` over `GetCaster()`).
+- Not done: changing `AuraScript::GetCaster()`'s return type, `CreatureAI::SpellHit(UnitView, ...)`,
+  `AttackedBy(UnitView)`, `DamageTaken(UnitView, ...)`. These are compile-driven across `src/server/scripts`
+  and were left for a build-enabled pass, as step 07 slice 4 was.
+
+### Known handle reads on the melee + DoT path (the §Checklist counter)
+
+Launch: `RollMeleeOutcomeAgainst` and `MeleeDamageBonusTaken` read the victim; `CalcArmorReducedDamage`
+reads victim armor. Land: `CanApplyResilience` / `IsImmunedToDamage` read the attacker; the daze roll reads the
+attacker's position (`HasInArc`); `DealDamageShieldDamage` at feedback reads the victim's shield auras and
+`SpellHitResult`. DoT tick: `SpellDamageBonusDone` (dynobj), `SpellHitResult`, `SpellCriticalDamageBonus`,
+`CalcArmorReducedDamage(caster, ...)`, `IsControlledByPlayer` read the caster. None of these write.

@@ -17,6 +17,7 @@
 
 #include "Player.h"
 #include "AccountMgr.h"
+#include "BeatContext.h"
 #include "AchievementMgr.h"
 #include "AreaDefines.h"
 #include "ArenaSpectator.h"
@@ -429,6 +430,21 @@ Player::Player(WorldSession* session): Unit(), m_mover(this), _cinematicMgr(*thi
 void Player::FillSlot(ObjectSlot& slot)
 {
     Unit::FillSlot(slot);
+
+    // Visibility inputs (step 10)
+    SlotVisibility& v = slot.vis;
+    v.teamId = uint8(GetTeamId());
+    if (Group const* group = GetGroup())
+        v.groupGuid = group->GetGUID();
+    v.farsightGuid = GetGuidValue(PLAYER_FARSIGHT);
+    if (IsGameMaster())
+        v.flags |= SLOT_VIS_GAME_MASTER;
+    if (GetSession() && GetSession()->IsGMAccount())
+        v.flags |= SLOT_VIS_GM_ACCOUNT;
+    if (IsSpectator() && FindMap() && FindMap()->IsBattleArena())
+        v.flags |= SLOT_VIS_ARENA_SPECTATOR;
+    if (isDead() && GetHealth() > 0)
+        v.flags |= SLOT_VIS_GHOST;
 }
 
 Player::~Player()
@@ -1405,6 +1421,22 @@ void Player::SendTeleportAckPacket()
 
 bool Player::TeleportTo(uint32 mapid, float x, float y, float z, float orientation, uint32 options /*= 0*/, Unit* target /*= nullptr*/, bool newInstance /*= false*/)
 {
+    if (BeatContext::InTask() && mapid != GetMapId())
+    {
+        MapChangeDefer rec;
+        rec.player = GetGUID();
+        rec.mapId = mapid;
+        rec.x = x;
+        rec.y = y;
+        rec.z = z;
+        rec.o = orientation;
+        rec.options = options;
+        rec.target = target ? target->GetGUID() : ObjectGuid::Empty;
+        rec.newInstance = newInstance ? 1 : 0;
+        GetMap()->AppendDefer(DeferKind::MapChange, rec);
+        return true;
+    }
+
     if (!MapMgr::IsValidMapCoord(mapid, x, y, z, orientation))
     {
         LOG_ERROR("entities.player", "TeleportTo: invalid map ({}) or invalid coordinates (X: {}, Y: {}, Z: {}, O: {}) given when teleporting player ({}, name: {}, map: {}, X: {}, Y: {}, Z: {}, O: {}).",
@@ -6613,6 +6645,16 @@ void Player::DuelComplete(DuelCompleteType type)
     // duel not requested
     if (!duel)
         return;
+
+    if (BeatContext::InTask())
+    {
+        DuelEndDefer rec;
+        rec.player = GetGUID();
+        rec.opponent = duel->Opponent ? duel->Opponent->GetGUID() : ObjectGuid::Empty;
+        rec.type = uint8(type);
+        GetMap()->AppendDefer(DeferKind::DuelEnd, rec);
+        return;
+    }
 
     // Check if DuelComplete() has been called already up in the stack and in that case don't do anything else here
     if (duel->State == DUEL_STATE_COMPLETED)
@@ -14636,7 +14678,12 @@ bool Player::CanResummonPet(uint32 spellid)
 
 bool Player::CanSeeSpellClickOn(Creature const* c) const
 {
-    if (!c->HasNpcFlag(UNIT_NPC_FLAG_SPELLCLICK))
+    return CanSeeSpellClickOn(c, c->GetNpcFlags());
+}
+
+bool Player::CanSeeSpellClickOn(Creature const* c, NPCFlags npcFlags) const
+{
+    if (!(npcFlags & UNIT_NPC_FLAG_SPELLCLICK))
         return false;
 
     SpellClickInfoMapBounds clickPair = sObjectMgr->GetSpellClickInfoMapBounds(c->GetEntry());
@@ -14736,7 +14783,12 @@ bool Player::AnyVendorOptionAvailable(uint32 menuId, Creature const* creature) c
 
 bool Player::CanSeeVendor(Creature const* creature) const
 {
-    if (!creature->HasNpcFlag(UNIT_NPC_FLAG_VENDOR))
+    return CanSeeVendor(creature, creature->GetNpcFlags());
+}
+
+bool Player::CanSeeVendor(Creature const* creature, NPCFlags npcFlags) const
+{
+    if (!(npcFlags & UNIT_NPC_FLAG_VENDOR))
         return true;
 
     ConditionList conditions = sConditionMgr->GetConditionsForNpcVendorEvent(creature->GetEntry(), 0);
@@ -14752,7 +14804,12 @@ bool Player::CanSeeVendor(Creature const* creature) const
 
 bool Player::CanSeeTrainer(Creature const* creature) const
 {
-    if (!creature->HasNpcFlag(UNIT_NPC_FLAG_TRAINER))
+    return CanSeeTrainer(creature, creature->GetNpcFlags());
+}
+
+bool Player::CanSeeTrainer(Creature const* creature, NPCFlags npcFlags) const
+{
+    if (!(npcFlags & UNIT_NPC_FLAG_TRAINER))
         return true;
 
     if (auto trainer = sObjectMgr->GetTrainer(creature->GetEntry()))

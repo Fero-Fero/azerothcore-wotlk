@@ -136,8 +136,9 @@ void FormationMovementGenerator::LaunchMovement(Creature* owner, Unit* target)
         // Pick up leader's spline velocity
         velocity = target->movespline->Velocity();
 
-        // Calculate travel distance to get a 1650ms result
-        float travelDist = velocity * 1.65f;
+        // Calculate travel distance to get a 1650ms result. The leader is a foreign unit whose spline may be
+        // mid-write; a torn velocity of 0 must not turn the divide below into inf (step 13).
+        float travelDist = std::max(velocity * 1.65f, 0.01f);
         target->MovePositionToFirstCollision(dest, travelDist, relativeAngle);
         target->MovePositionToFirstCollision(dest, _range, _angle + relativeAngle);
 

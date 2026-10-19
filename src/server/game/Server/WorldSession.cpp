@@ -304,7 +304,11 @@ ObjectGuid::LowType WorldSession::GetGuidLow() const
     return GetPlayer() ? GetPlayer()->GetGUID().GetCounter() : 0;
 }
 
-/// Send a packet to the client
+/// Send a packet to the client.
+/// Thread-safe from any task (step 13): WorldSocket::SendPacket only enqueues on the socket's own locked
+/// queue (_bufferQueue, an MPSC queue drained by the network thread). No session or player field is read
+/// here, so a group or guild broadcast from a foreign task may call it; ASSERT_OWNED does not apply. The
+/// debug statistic below is kept per thread for the same reason.
 void WorldSession::SendPacket(WorldPacket const* packet)
 {
     sScriptMgr->OnPacketSent(this, *packet);
@@ -314,14 +318,14 @@ void WorldSession::SendPacket(WorldPacket const* packet)
 
 #if defined(ACORE_DEBUG)
     // Code for network use statistic
-    static uint64 sendPacketCount = 0;
-    static uint64 sendPacketBytes = 0;
+    static thread_local uint64 sendPacketCount = 0;
+    static thread_local uint64 sendPacketBytes = 0;
 
-    static time_t firstTime = GameTime::GetGameTime().count();
-    static time_t lastTime = firstTime;                     // next 60 secs start time
+    static thread_local time_t firstTime = GameTime::GetGameTime().count();
+    static thread_local time_t lastTime = firstTime;        // next 60 secs start time
 
-    static uint64 sendLastPacketCount = 0;
-    static uint64 sendLastPacketBytes = 0;
+    static thread_local uint64 sendLastPacketCount = 0;
+    static thread_local uint64 sendLastPacketBytes = 0;
 
     time_t cur_time = GameTime::GetGameTime().count();
 
@@ -354,6 +358,11 @@ void WorldSession::SendPacket(WorldPacket const* packet)
     }
 
     m_Socket->SendPacket(*packet);
+}
+
+void WorldSession::SendPacketFromAnyThread(WorldPacket const* packet)
+{
+    SendPacket(packet);
 }
 
 /// Add an incoming packet to the queue

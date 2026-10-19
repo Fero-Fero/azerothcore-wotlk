@@ -17,7 +17,9 @@
 
 #include "Unit.h"
 #include "UnitRecordLog.h"
+#include "UnitView.h"
 #include "AbstractFollower.h"
+#include "AreaAuraRecords.h"
 #include "BeatContext.h"
 #include "AreaDefines.h"
 #include "ArenaSpectator.h"
@@ -46,6 +48,7 @@
 #include "Group.h"
 #include "KillRewarder.h"
 #include "Log.h"
+#include "Map.h"
 #include "MapMgr.h"
 #include "MoveSpline.h"
 #include "MoveSplineInit.h"
@@ -524,6 +527,32 @@ void Unit::FillSlot(ObjectSlot& s)
     s.victimGuid = m_attacking ? m_attacking->GetGUID() : ObjectGuid::Empty;
     s.charmerOrOwnerGuid = GetCharmerOrOwnerGUID();
 
+    s.threatRedirectCount = 0;
+    for (auto const& [guid, pct] : m_threatManager.GetRedirectInfo())
+    {
+        if (s.threatRedirectCount == MAX_SLOT_THREAT_REDIRECTS)
+            break;
+        s.threatRedirects[s.threatRedirectCount++] = SlotThreatRedirect{ guid, pct };
+    }
+
+    // Visibility inputs (step 10)
+    SlotVisibility& v = s.vis;
+    if (HasStealthAura())
+        v.flags |= SLOT_VIS_HAS_STEALTH_AURA;
+    if (IsInFlight())
+        v.flags |= SLOT_VIS_IN_FLIGHT;
+    if (Unit const* vehicleBase = GetVehicleBase())
+        v.vehicleBaseGuid = vehicleBase->GetGUID();
+    if (Creature const* creature = ToCreature())
+        if (TempSummon const* summon = creature->ToTempSummon())
+        {
+            v.summonerGuid = summon->GetSummonerGUID();
+            if (summon->IsVisibleBySummonerOnly())
+                v.flags |= SLOT_VIS_SUMMONER_ONLY;
+        }
+    v.combatReach = GetCombatReach();
+    v.level = GetLevel();
+
     _slots.EnsureAuraCapacity(uint32(m_appliedAuras.size()));
     uint32 n = 0;
     for (auto const& [spellId, app] : m_appliedAuras)
@@ -569,8 +598,9 @@ void Unit::Update(uint32 p_time)
             if (m_delayed_unit_relocation_timer <= p_time)
             {
                 m_delayed_unit_relocation_timer = 0;
-                //ExecuteDelayedUnitRelocationEvent();
-                FindMap()->i_objectsForDelayedVisibility.insert(this);
+                // Step 10: on the unit's own task. A player only requests its view-phase scan; a creature
+                // runs the AI half of its relocation notifier.
+                ExecuteDelayedUnitRelocationEvent();
             }
             else
                 m_delayed_unit_relocation_timer -= p_time;
@@ -1499,6 +1529,30 @@ SpellCastResult Unit::CastSpell(SpellCastTargets const& targets, SpellInfo const
     return spell->prepare(&targets, triggeredByAura);
 }
 
+// Step 08 §2: a cast asked for by a periodic tick of an aura this unit does not hold (it ticks on its target's
+// task). The ticking aura is given as ids, which is all Spell::m_triggeredByAuraSpell keeps of it.
+SpellCastResult Unit::CastSpell(SpellCastTargets const& targets, SpellInfo const* spellInfo, CustomSpellValues const* value, TriggerCastFlags triggerFlags, TriggeredByAuraSpellData const& triggeredByAura, bool interruptChannelOnFail, ObjectGuid originalCaster)
+{
+    if (!spellInfo)
+    {
+        LOG_ERROR("entities.unit", "CastSpell: unknown spell by caster {}", GetGUID().ToString());
+        return SPELL_FAILED_SPELL_UNAVAILABLE;
+    }
+
+    Spell* spell = new Spell(this, spellInfo, triggerFlags, originalCaster);
+
+    if (value)
+    {
+        for (CustomSpellValues::const_iterator itr = value->begin(); itr != value->end(); ++itr)
+        {
+            spell->SetSpellValue(itr->first, itr->second);
+        }
+    }
+
+    spell->SetTriggeredByAuraSpell(triggeredByAura, interruptChannelOnFail);
+    return spell->prepare(&targets, nullptr);
+}
+
 SpellCastResult Unit::CastSpell(Unit* victim, uint32 spellId, bool triggered, Item* castItem, AuraEffect const* triggeredByAura, ObjectGuid originalCaster)
 {
     return CastSpell(victim, spellId, triggered ? TRIGGERED_FULL_MASK : TRIGGERED_NONE, castItem, triggeredByAura, originalCaster);
@@ -1746,7 +1800,7 @@ void Unit::DealSpellDamage(SpellNonMeleeDamage* damageInfo, bool durabilityLoss,
 }
 
 // @todo for melee need create structure as in
-void Unit::CalculateMeleeDamage(Unit* victim, CalcDamageInfo* damageInfo, WeaponAttackType attackType, const bool sittingVictim)
+void Unit::CalculateMeleeDamage(Unit* victim, CalcDamageInfo* damageInfo, WeaponAttackType attackType, const bool sittingVictim, bool victimSide)
 {
     damageInfo->attacker         = this;
     damageInfo->target           = victim;
@@ -1768,6 +1822,8 @@ void Unit::CalculateMeleeDamage(Unit* victim, CalcDamageInfo* damageInfo, Weapon
     damageInfo->procAttacker     = PROC_FLAG_NONE;
     damageInfo->procVictim       = PROC_FLAG_NONE;
     damageInfo->hitOutCome       = MELEE_HIT_EVADE;
+    damageInfo->attackerCanDaze  = !IsPlayer() && !ToCreature()->IsControlledByPlayer();
+    damageInfo->attackerMeleeSkill = GetUnitMeleeSkill();
 
     if (!victim)
         return;
@@ -1844,7 +1900,9 @@ void Unit::CalculateMeleeDamage(Unit* victim, CalcDamageInfo* damageInfo, Weapon
         // Script Hook For CalculateMeleeDamage -- Allow scripts to change the Damage pre class mitigation calculations
         sScriptMgr->ModifyMeleeDamage(damageInfo->target, damageInfo->attacker, damage);
 
-        if (victim->GetAI())
+        // Step 08 §1: the victim's AI is a victim-side write; for a recorded hit the victim runs it at land
+        // (Unit::ApplyMeleeHit), on the armor-reduced amount.
+        if (victimSide && victim->GetAI())
         {
             victim->GetAI()->OnCalculateMeleeDamageReceived(damage, this);
         }
@@ -2020,6 +2078,18 @@ void Unit::CalculateMeleeDamage(Unit* victim, CalcDamageInfo* damageInfo, Weapon
     if (!(damageInfo->HitInfo & HITINFO_MISS))
         damageInfo->HitInfo |= HITINFO_AFFECTS_VICTIM;
 
+    // Step 08 §1: resilience, absorb and resist read and write the victim; a recorded hit runs them at land
+    if (victimSide)
+        Unit::CalcMeleeAbsorbResist(damageInfo);
+}
+
+void Unit::CalcMeleeAbsorbResist(CalcDamageInfo* damageInfo)
+{
+    Unit* attacker = damageInfo->attacker;
+    Unit* victim = damageInfo->target;
+    if (!attacker || !victim)
+        return;
+
     uint32 tmpHitInfo[MAX_ITEM_PROTO_DAMAGES] = { };
 
     for (uint8 i = 0; i < MAX_ITEM_PROTO_DAMAGES; ++i)
@@ -2027,7 +2097,7 @@ void Unit::CalculateMeleeDamage(Unit* victim, CalcDamageInfo* damageInfo, Weapon
         int32 dmg = damageInfo->damages[i].damage;
         int32 cleanDamage = damageInfo->cleanDamage;
         // attackType is checked already for BASE_ATTACK or OFF_ATTACK so it can't be RANGED_ATTACK here
-        if (CanApplyResilience())
+        if (attacker->CanApplyResilience())
         {
             int32 resilienceReduction = damageInfo->damages[i].damage;
             Unit::ApplyResilience(victim, nullptr, &resilienceReduction, (damageInfo->hitOutCome == MELEE_HIT_CRIT), CR_CRIT_TAKEN_MELEE);
@@ -2155,16 +2225,41 @@ void Unit::DealMeleeDamage(CalcDamageInfo* damageInfo, bool durabilityLoss)
         Unit::DealDamage(this, victim, damageInfo->damages[i].damage, &cleanDamage, DIRECT_DAMAGE, SpellSchoolMask(damageInfo->damages[i].damageSchoolMask), nullptr, durabilityLoss);
     }
 
+    // Step 08 §1: from here on every write is the attacker's. When the victim lands a recorded hit on its own
+    // task the attacker is foreign; the writes travel back as one MeleeLandedRecord (Unit::ApplyMeleeLanded).
+    bool const attackerForeign = BeatContext::IsForeign(this);
+    MeleeLandedRecord landed;
+    landed.victim = victim->GetGUID();
+    landed.attackType = uint8(damageInfo->attackType);
+    landed.hitOutCome = uint8(damageInfo->hitOutCome);
+    landed.targetState = damageInfo->TargetState;
+    landed.cleanDamage = damageInfo->cleanDamage;
+    landed.procVictim = damageInfo->procVictim;
+    landed.damage = damageInfo->damages[0].damage + damageInfo->damages[1].damage;
+    landed.absorb = damageInfo->damages[0].absorb + damageInfo->damages[1].absorb;
+    landed.resist = damageInfo->damages[0].resist + damageInfo->damages[1].resist;
+    landed.blocked = damageInfo->blocked_amount;
+    {
+        DamageInfo dmgInfo(*damageInfo);
+        landed.hitMask = dmgInfo.GetHitMask();
+    }
+
     // gain rage if attack is fully blocked, dodged or parried
-    if (HasActivePowerType(POWER_RAGE) && (damageInfo->TargetState == VICTIMSTATE_BLOCKS || damageInfo->TargetState == VICTIMSTATE_DODGE || damageInfo->TargetState == VICTIMSTATE_PARRY))
+    // (HasActivePowerType is a read of the attacker; the record carries the avoid and the attacker decides)
+    if (damageInfo->TargetState == VICTIMSTATE_BLOCKS || damageInfo->TargetState == VICTIMSTATE_DODGE || damageInfo->TargetState == VICTIMSTATE_PARRY)
     {
         switch (damageInfo->attackType)
         {
             case BASE_ATTACK:
             case OFF_ATTACK:
             {
-                uint32 weaponSpeedHitFactor = GetRageWeaponSpeedHitFactor(damageInfo->attackType);
-                RewardRage(damageInfo->cleanDamage, weaponSpeedHitFactor, true);
+                if (attackerForeign)
+                    landed.rageFromAvoid = 1;
+                else if (HasActivePowerType(POWER_RAGE))
+                {
+                    uint32 weaponSpeedHitFactor = GetRageWeaponSpeedHitFactor(damageInfo->attackType);
+                    RewardRage(damageInfo->cleanDamage, weaponSpeedHitFactor, true);
+                }
                 break;
             }
             default:
@@ -2174,7 +2269,7 @@ void Unit::DealMeleeDamage(CalcDamageInfo* damageInfo, bool durabilityLoss)
 
     // If this is a creature and it attacks from behind it has a probability to daze it's victim
     if ((damageInfo->damages[0].damage + damageInfo->damages[1].damage) && ((damageInfo->hitOutCome == MELEE_HIT_CRIT || damageInfo->hitOutCome == MELEE_HIT_CRUSHING || damageInfo->hitOutCome == MELEE_HIT_NORMAL || damageInfo->hitOutCome == MELEE_HIT_GLANCING) &&
-                               !IsPlayer() && !ToCreature()->IsControlledByPlayer() && !victim->HasInArc(M_PI, this)
+                               damageInfo->attackerCanDaze && !victim->HasInArc(M_PI, this)
                                && (victim->IsPlayer() || (!victim->ToCreature()->isWorldBoss() && !victim->IsVehicle()))))
     {
         // -probability is between 0% and 40%
@@ -2187,7 +2282,7 @@ void Unit::DealMeleeDamage(CalcDamageInfo* damageInfo, bool durabilityLoss)
 
         uint32 VictimDefense = victim->GetDefenseSkillValue();
         uint32 VictimAuraDefense = -victim->GetTotalAuraModifier(SPELL_AURA_MOD_ATTACKER_MELEE_CRIT_CHANCE) * 25;
-        uint32 AttackerMeleeSkill = GetUnitMeleeSkill();
+        uint32 AttackerMeleeSkill = damageInfo->attackerMeleeSkill;
 
         // xinef: fix daze mechanics
         Probability -= ((float)VictimDefense + (float)VictimAuraDefense - AttackerMeleeSkill) * 0.1428f;
@@ -2198,18 +2293,33 @@ void Unit::DealMeleeDamage(CalcDamageInfo* damageInfo, bool durabilityLoss)
         // Daze application
         if (sWorld->getBoolConfig(CONFIG_ENABLE_DAZE))
             if (roll_chance_f(std::max(0.0f, Probability)))
-                CastSpell(victim, 1604, true);
+            {
+                if (attackerForeign)
+                    landed.daze = 1;
+                else
+                    CastSpell(victim, 1604, true);
+            }
     }
 
     if (IsPlayer())
     {
-        DamageInfo dmgInfo(*damageInfo);
-        ToPlayer()->CastItemCombatSpell(victim, damageInfo->attackType, damageInfo->procVictim, dmgInfo.GetHitMask());
+        if (attackerForeign)
+            landed.castItemCombatSpell = 1;
+        else
+            ToPlayer()->CastItemCombatSpell(victim, damageInfo->attackType, damageInfo->procVictim, landed.hitMask);
     }
 
     // Do effect if any damage done to target
     if (damageInfo->damages[0].damage + damageInfo->damages[1].damage)
-        DealDamageShieldDamage(victim);
+    {
+        if (attackerForeign)
+            landed.damageShield = 1;
+        else
+            DealDamageShieldDamage(victim);
+    }
+
+    if (attackerForeign && landed.Any())
+        sRecordLogs->Append(victim->GetGUID(), this, RecordKind::MeleeLanded, landed);
 }
 
 void Unit::DealDamageShieldDamage(Unit* victim)
@@ -2905,37 +3015,152 @@ void Unit::AttackerStateUpdate(Unit* victim, WeaponAttackType attType /*= BASE_A
     {
         // attack can be redirected to another target
         victim = GetMeleeHitRedirectTarget(victim);
+
+        // Step 08 §1: launch on the attacker's task (roll, attacker bonuses, armor), land on the victim's.
+        // A victim outside this task group gets a MeleeHitRecord and lands it at the start of its next update
+        // (Unit::ApplyMeleeHit); everything below the launch runs there with the attacker as a handle.
+        bool const victimForeign = BeatContext::IsForeign(victim);
         CalcDamageInfo damageInfo;
-        CalculateMeleeDamage(victim, &damageInfo, attType, sittingVictim);
-
-        // Send log damage message to client
-        for (uint8 i = 0; i < MAX_ITEM_PROTO_DAMAGES; ++i)
-        {
-            Unit::DealDamageMods(victim, damageInfo.damages[i].damage, &damageInfo.damages[i].absorb);
-        }
-
-        // Related to sparring system. Allow attack animations even if there are no damages
-        if (victim->CanSparringWith(damageInfo.attacker))
-            damageInfo.HitInfo |= HITINFO_FAKE_DAMAGE;
-
-        SendAttackStateUpdate(&damageInfo);
-
+        CalculateMeleeDamage(victim, &damageInfo, attType, sittingVictim, !victimForeign);
         _lastDamagedTargetGuid = victim->GetGUID();
 
-        DealMeleeDamage(&damageInfo, true);
+        if (victimForeign)
+        {
+            MeleeHitRecord hit;
+            BuildMeleeHitRecord(damageInfo, extra, hit);
+            sRecordLogs->Append(GetGUID(), victim, RecordKind::MeleeHit, hit);
+            return;
+        }
 
-        DamageInfo dmgInfo(damageInfo);
-        Unit::ProcSkillsAndAuras(damageInfo.attacker, damageInfo.target, damageInfo.procAttacker, damageInfo.procVictim, dmgInfo.GetHitMask(), dmgInfo.GetDamage(),
-            damageInfo.attackType, nullptr, nullptr, -1, nullptr, &dmgInfo);
-
-        if (IsPlayer())
-            LOG_DEBUG("entities.unit", "AttackerStateUpdate: (Player) {} attacked {} for {} dmg, absorbed {}, blocked {}, resisted {}.",
-                                 GetGUID().ToString(), victim->GetGUID().ToString(), dmgInfo.GetDamage(), dmgInfo.GetAbsorb(), dmgInfo.GetBlock(), dmgInfo.GetResist());
-        else
-            LOG_DEBUG("entities.unit", "AttackerStateUpdate: (NPC) {} attacked {} for {} dmg, absorbed {}, blocked {}, resisted {}.",
-                                 GetGUID().ToString(), victim->GetGUID().ToString(), dmgInfo.GetDamage(), dmgInfo.GetAbsorb(), dmgInfo.GetBlock(), dmgInfo.GetResist());
-
+        LandMeleeHit(&damageInfo);
     }
+}
+
+void Unit::BuildMeleeHitRecord(CalcDamageInfo const& damageInfo, bool extra, MeleeHitRecord& out) const
+{
+    out.attacker = GetGUID();
+    out.attackType = uint8(damageInfo.attackType);
+    out.extra = extra ? 1 : 0;
+    out.hitOutCome = uint8(damageInfo.hitOutCome);
+    out.durabilityLoss = 1;
+    out.targetState = damageInfo.TargetState;
+    out.hitInfo = damageInfo.HitInfo;
+    out.cleanDamage = damageInfo.cleanDamage;
+    out.blockedAmount = damageInfo.blocked_amount;
+    out.procAttacker = damageInfo.procAttacker;
+    out.procVictim = damageInfo.procVictim;
+    out.attackerCanDaze = damageInfo.attackerCanDaze ? 1 : 0;
+    out.attackerMeleeSkill = damageInfo.attackerMeleeSkill;
+    for (uint8 i = 0; i < MAX_ITEM_PROTO_DAMAGES && i < MELEE_RECORD_DAMAGES; ++i)
+    {
+        out.damages[i].damageSchoolMask = damageInfo.damages[i].damageSchoolMask;
+        out.damages[i].damage = damageInfo.damages[i].damage;
+    }
+}
+
+// Land step of an auto-attack: runs on the victim's task. damageInfo->attacker is `this` on the inline path and
+// a (possibly foreign) handle on the recorded one; the attacker's own writes route themselves (DealDamage,
+// DealMeleeDamage, ProcSkillsAndAuras).
+void Unit::LandMeleeHit(CalcDamageInfo* damageInfo)
+{
+    Unit* attacker = damageInfo->attacker;
+    Unit* victim = damageInfo->target;
+
+    // Send log damage message to client
+    for (uint8 i = 0; i < MAX_ITEM_PROTO_DAMAGES; ++i)
+    {
+        Unit::DealDamageMods(victim, damageInfo->damages[i].damage, &damageInfo->damages[i].absorb);
+    }
+
+    // Related to sparring system. Allow attack animations even if there are no damages
+    if (victim->CanSparringWith(attacker))
+        damageInfo->HitInfo |= HITINFO_FAKE_DAMAGE;
+
+    // broadcast from the unit whose task this is; the packet names the attacker by guid
+    victim->SendAttackStateUpdate(damageInfo);
+
+    attacker->DealMeleeDamage(damageInfo, true);
+
+    DamageInfo dmgInfo(*damageInfo);
+    Unit::ProcSkillsAndAuras(attacker, victim, damageInfo->procAttacker, damageInfo->procVictim, dmgInfo.GetHitMask(), dmgInfo.GetDamage(),
+        damageInfo->attackType, nullptr, nullptr, -1, nullptr, &dmgInfo);
+
+    if (attacker->IsPlayer())
+        LOG_DEBUG("entities.unit", "AttackerStateUpdate: (Player) {} attacked {} for {} dmg, absorbed {}, blocked {}, resisted {}.",
+                             attacker->GetGUID().ToString(), victim->GetGUID().ToString(), dmgInfo.GetDamage(), dmgInfo.GetAbsorb(), dmgInfo.GetBlock(), dmgInfo.GetResist());
+    else
+        LOG_DEBUG("entities.unit", "AttackerStateUpdate: (NPC) {} attacked {} for {} dmg, absorbed {}, blocked {}, resisted {}.",
+                             attacker->GetGUID().ToString(), victim->GetGUID().ToString(), dmgInfo.GetDamage(), dmgInfo.GetAbsorb(), dmgInfo.GetBlock(), dmgInfo.GetResist());
+}
+
+void Unit::ApplyMeleeHit(MeleeHitRecord const& hit)
+{
+    Unit* attacker = ObjectAccessor::GetUnit(*this, hit.attacker);
+    if (!attacker)
+    {
+        LOG_DEBUG("entities.unit", "ApplyMeleeHit: attacker {} of {} is gone, hit dropped", hit.attacker.ToString(), GetGUID().ToString());
+        return;
+    }
+
+    if (!IsAlive() || !IsInWorld())
+        return;
+
+    CalcDamageInfo damageInfo;
+    damageInfo.attacker = attacker;
+    damageInfo.target = this;
+    for (uint8 i = 0; i < MAX_ITEM_PROTO_DAMAGES; ++i)
+    {
+        damageInfo.damages[i].damageSchoolMask = i < MELEE_RECORD_DAMAGES ? hit.damages[i].damageSchoolMask : SPELL_SCHOOL_MASK_NORMAL;
+        damageInfo.damages[i].damage = i < MELEE_RECORD_DAMAGES ? hit.damages[i].damage : 0;
+        damageInfo.damages[i].absorb = 0;
+        damageInfo.damages[i].resist = 0;
+    }
+    damageInfo.blocked_amount = hit.blockedAmount;
+    damageInfo.HitInfo = hit.hitInfo;
+    damageInfo.TargetState = hit.targetState;
+    damageInfo.attackType = WeaponAttackType(hit.attackType);
+    damageInfo.procAttacker = hit.procAttacker;
+    damageInfo.procVictim = hit.procVictim;
+    damageInfo.cleanDamage = hit.cleanDamage;
+    damageInfo.hitOutCome = MeleeHitOutcome(hit.hitOutCome);
+    damageInfo.attackerCanDaze = hit.attackerCanDaze != 0;
+    damageInfo.attackerMeleeSkill = hit.attackerMeleeSkill;
+
+    // victim-side part of the launch (see CalculateMeleeDamage): the victim's AI sees the armor-reduced amount
+    if (damageInfo.TargetState != VICTIMSTATE_IS_IMMUNE && damageInfo.hitOutCome != MELEE_HIT_EVADE)
+    {
+        if (UnitAI* ai = GetAI())
+            for (uint8 i = 0; i < MAX_ITEM_PROTO_DAMAGES; ++i)
+                if (damageInfo.damages[i].damage)
+                    ai->OnCalculateMeleeDamageReceived(damageInfo.damages[i].damage, attacker);
+
+        Unit::CalcMeleeAbsorbResist(&damageInfo);
+    }
+
+    LandMeleeHit(&damageInfo);
+}
+
+void Unit::ApplyMeleeLanded(MeleeLandedRecord const& landed)
+{
+    Unit* victim = ObjectAccessor::GetUnit(*this, landed.victim);
+
+    if (landed.rageFromAvoid && HasActivePowerType(POWER_RAGE))
+    {
+        uint32 weaponSpeedHitFactor = GetRageWeaponSpeedHitFactor(WeaponAttackType(landed.attackType));
+        RewardRage(landed.cleanDamage, weaponSpeedHitFactor, true);
+    }
+
+    if (!victim)
+        return;
+
+    if (landed.daze)
+        CastSpell(victim, 1604, true);
+
+    if (landed.castItemCombatSpell && IsPlayer())
+        ToPlayer()->CastItemCombatSpell(victim, WeaponAttackType(landed.attackType), landed.procVictim, landed.hitMask);
+
+    if (landed.damageShield)
+        DealDamageShieldDamage(victim);
 }
 
 bool Unit::GetMeleeAttackPoint(Unit* attacker, Position& pos)
@@ -4532,7 +4757,26 @@ void Unit::_AddAura(UnitAura* aura, Unit* caster)
     ASSERT(!m_cleanupDone);
     m_ownedAuras.insert(AuraMap::value_type(aura->GetId(), aura));
 
-    _RemoveNoStackAurasDueToAura(aura, true);
+    if (m_creatingAreaClone)
+    {
+        // Step 08 §3: a clone of a foreign area aura is what the register loop of Aura::UpdateTargetMap would
+        // have applied; like it, the clone yields to what this unit already has and never evicts an aura.
+        bool stacks = IsHighestExclusiveAura(aura, true);
+        if (stacks)
+            for (AuraApplicationMap::const_iterator itr = m_appliedAuras.begin(); itr != m_appliedAuras.end(); ++itr)
+                if (!aura->CanStackWith(itr->second->GetBase()))
+                {
+                    stacks = false;
+                    break;
+                }
+        if (!stacks)
+        {
+            aura->Remove();
+            return;
+        }
+    }
+    else
+        _RemoveNoStackAurasDueToAura(aura, true);
 
     if (aura->IsRemoved())
         return;
@@ -4865,6 +5109,7 @@ void Unit::RemoveOwnedAura(Aura* aura, AuraRemoveMode removeMode)
 
 Aura* Unit::GetOwnedAura(uint32 spellId, ObjectGuid casterGUID, ObjectGuid itemCasterGUID, uint8 reqEffMask, Aura* except) const
 {
+    ASSERT_OWNED(this);
     AuraMapBounds range = m_ownedAuras.equal_range(spellId);
     for (AuraMap::const_iterator itr = range.first; itr != range.second; ++itr)
     {
@@ -5701,6 +5946,7 @@ AuraEffect* Unit::GetAuraEffectDummy(uint32 spellid) const
 
 AuraApplication* Unit::GetAuraApplication(uint32 spellId, ObjectGuid casterGUID, ObjectGuid itemCasterGUID, uint8 reqEffMask, AuraApplication* except) const
 {
+    ASSERT_OWNED(this);
     AuraApplicationMapBounds range = m_appliedAuras.equal_range(spellId);
     for (; range.first != range.second; ++range.first)
     {
@@ -6801,6 +7047,202 @@ void Unit::ApplyProcActor(ProcActorRecord const& proc)
         SetCantProc(false);
 }
 
+// Step 08 §2: the caster half of a periodic tick of an aura this unit cast on `landed.target`, which ticked it
+// on its own task. Everything the tick handlers would have written on the caster lands here.
+void Unit::ApplyPeriodicLanded(PeriodicLandedRecord const& landed)
+{
+    if (!IsInWorld())
+        return;
+
+    SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(landed.spellId);
+    if (!spellInfo)
+        return;
+
+    Unit* target = landed.target == GetGUID() ? this : ObjectAccessor::GetUnit(*this, landed.target);
+
+    if (landed.faceChannelTarget && !IsPlayer())
+    {
+        ObjectGuid const channelGuid = GetGuidValue(UNIT_FIELD_CHANNEL_OBJECT);
+        if (!channelGuid.IsEmpty() && channelGuid != GetGUID())
+            if (WorldObject const* objectTarget = ObjectAccessor::GetWorldObject(*this, channelGuid))
+                SetInFront(objectTarget);
+    }
+
+    // Aura::Update ManaPerSecond: the owner decided by a read of this unit; clamp again on the live value
+    if (landed.healthDelta < 0)
+    {
+        int32 cost = -landed.healthDelta;
+        if (int32(GetHealth()) > cost)
+            ModifyHealth(-cost);
+    }
+    if (landed.powerGain < 0)
+    {
+        Powers powerType = Powers(landed.powerType);
+        int32 cost = -landed.powerGain;
+        if (int32(GetPower(powerType)) >= cost)
+            ModifyPower(powerType, -cost);
+    }
+
+    // SPELL_AURA_PERIODIC_HEALTH_FUNNEL donator cost
+    if (landed.funnelHealthCost)
+    {
+        uint32 cost = landed.funnelHealthCost;
+        if (GetHealth() <= cost)
+            cost = GetHealth() ? GetHealth() - 1 : 0;
+        if (cost)
+            ModifyHealth(-int32(cost));
+    }
+
+    // SPELL_AURA_PERIODIC_HEAL with SPELL_ATTR2_NO_TARGET_PER_SECOND_COST
+    if (landed.selfDamage)
+    {
+        uint32 damage = landed.selfDamage;
+        uint32 absorb = 0;
+        Unit::DealDamageMods(this, damage, &absorb);
+        CleanDamage cleanDamage = CleanDamage(0, 0, BASE_ATTACK, MELEE_HIT_NORMAL);
+        Unit::DealDamage(this, this, damage, &cleanDamage, SELF_DAMAGE, spellInfo->GetSchoolMask(), spellInfo, true);
+    }
+
+    // SPELL_AURA_PERIODIC_LEECH self heal, with this unit's done and taken bonus, and the assist threat
+    if (landed.leechBase && IsAlive())
+    {
+        float gainMultiplier = spellInfo->Effects[landed.effIndex].CalcValueMultiplier(this);
+        uint32 heal = uint32(SpellHealingBonusDone(this, spellInfo, uint32(landed.leechBase * gainMultiplier), DOT, landed.effIndex, 0.0f, landed.stackAmount));
+        heal = uint32(SpellHealingBonusTaken(this, spellInfo, heal, DOT, landed.stackAmount));
+
+        HealInfo healInfo(this, this, heal, spellInfo, spellInfo->GetSchoolMask());
+        float threat = float(HealBySpell(healInfo)) * 0.5f;
+        if (IsClass(CLASS_PALADIN))
+            threat *= 0.5f;
+        GetThreatMgr().ForwardThreatForAssistingMe(this, threat, spellInfo);
+    }
+
+    // SPELL_AURA_PERIODIC_MANA_LEECH gain and Mana Feed
+    int32 gainedAmount = 0;
+    if (landed.powerGain > 0)
+        gainedAmount = ModifyPower(Powers(landed.powerType), landed.powerGain);
+    if (landed.manaFeedPct && gainedAmount > 0)
+    {
+        int32 feedAmount = CalculatePct(gainedAmount, int32(landed.manaFeedPct));
+        CastCustomSpell(this, 32554, &feedAmount, nullptr, nullptr, true);
+    }
+
+    // Restoration (24379 / 23493)
+    if (landed.restoration && target)
+    {
+        int32 heal = CountPctFromMaxHealth(10);
+        HealInfo healInfo(this, target, heal, spellInfo, spellInfo->GetSchoolMask());
+        HealBySpell(healInfo);
+
+        if (int32 mana = GetMaxPower(POWER_MANA))
+        {
+            mana /= 10;
+            EnergizeBySpell(this, 23493, mana, POWER_MANA);
+        }
+    }
+
+    // the generic trigger cast of a periodic trigger aura
+    if (landed.triggerSpellId)
+    {
+        SpellInfo const* triggeredSpellInfo = sSpellMgr->GetSpellInfo(landed.triggerSpellId);
+        Unit* triggerTarget = landed.triggerTarget == GetGUID() ? this : ObjectAccessor::GetUnit(*this, landed.triggerTarget);
+        if (triggeredSpellInfo && triggerTarget)
+        {
+            SpellCastTargets targets;
+            targets.SetUnitTarget(triggerTarget);
+            if (landed.hasChannelData)
+            {
+                targets.SetDstChannel(landed.channelDst.Get());
+                targets.SetObjectTargetChannel(landed.channelObject);
+            }
+
+            CustomSpellValues values;
+            if (landed.triggerHasBp0)
+                values.AddSpellMod(SPELLVALUE_BASE_POINT0, landed.triggerBp0);
+
+            TriggeredByAuraSpellData byAura;
+            byAura.spellInfo = spellInfo;
+            byAura.effectIndex = int8(landed.effIndex);
+            byAura.tickNumber = landed.tickNumber;
+
+            CastSpell(targets, triggeredSpellInfo, landed.triggerHasBp0 ? &values : nullptr, TriggerCastFlags(landed.triggerFlags), byAura, landed.triggerAuraPeriodic != 0, GetGUID());
+            LOG_DEBUG("spells.aura", "Unit::ApplyPeriodicLanded: Spell {} Trigger {}", landed.spellId, triggeredSpellInfo->Id);
+        }
+    }
+
+    for (uint8 i = 0; i < landed.followCount && i < MAX_PERIODIC_FOLLOWUPS; ++i)
+        CastFollowUp(landed.follow[i]);
+}
+
+Aura* Unit::FindAreaAuraClone(uint32 spellId, ObjectGuid casterGuid, ObjectGuid areaOwnerGuid) const
+{
+    AuraMapBounds range = m_ownedAuras.equal_range(spellId);
+    for (AuraMap::const_iterator itr = range.first; itr != range.second; ++itr)
+    {
+        Aura* aura = itr->second;
+        if (aura->IsAreaClone() && aura->GetCasterGUID() == casterGuid && aura->GetAreaOwnerGUID() == areaOwnerGuid && !aura->IsRemoved())
+            return aura;
+    }
+    return nullptr;
+}
+
+// Step 08 §3: the spreading aura's owner put this unit in its area this interval. First record creates the
+// clone from the launch numbers, later ones refresh it (watchdog, duration, amounts, effect mask).
+void Unit::ApplyAreaAuraApply(AreaAuraApplyRecord const& apply)
+{
+    if (!IsInWorld() || IsDuringRemoveFromWorld())
+        return;
+
+    SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(apply.spellId);
+    if (!spellInfo || !apply.launch.effMask)
+        return;
+
+    if (Aura* clone = FindAreaAuraClone(apply.spellId, apply.caster, apply.areaOwner))
+    {
+        if (clone->GetEffectMask() != apply.launch.effMask)
+        {
+            // the member's immunities changed: rebuilt below, as the inline path re-adds the application
+            clone->Remove(AURA_REMOVE_BY_DEFAULT);
+        }
+        else
+        {
+            clone->TouchAreaClone();
+            clone->SetMaxDuration(apply.launch.maxDuration);
+            clone->SetDuration(apply.launch.duration);
+            for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                if (AuraEffect* eff = clone->GetEffect(i))
+                    if (eff->GetAmount() != apply.launch.amount[i])
+                        eff->ChangeAmount(apply.launch.amount[i], false);
+            return;
+        }
+    }
+
+    if (IsImmunedToSpell(spellInfo, static_cast<Unit const*>(nullptr)))
+        return;
+
+    int32 baseAmount[MAX_SPELL_EFFECTS];
+    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        baseAmount[i] = apply.launch.baseAmount[i];
+
+    // the clone yields to what this unit already has (Unit::_AddAura) instead of evicting it
+    m_creatingAreaClone = true;
+    Aura* clone = Aura::Create(spellInfo, apply.launch.effMask, this, nullptr, baseAmount, nullptr, apply.caster, apply.castItemGuid, &apply.launch);
+    m_creatingAreaClone = false;
+    if (!clone)
+        return;
+
+    clone->MarkAreaClone(apply.areaOwner);
+    clone->ApplyForTargets();
+    if (!clone->IsRemoved())
+        LOG_DEBUG("spells.aura", "ApplyAreaAuraApply: {} holds a clone of area aura {} of {}", GetGUID().ToString(), apply.spellId, apply.areaOwner.ToString());
+}
+
+void Unit::ApplyAreaAuraRemove(AreaAuraRemoveRecord const& remove)
+{
+    if (Aura* clone = FindAreaAuraClone(remove.spellId, remove.caster, remove.areaOwner))
+        clone->Remove(AuraRemoveMode(remove.removeMode));
+}
+
 void Unit::ApplyDamageDealt(DamageDealtRecord const& dealt)
 {
     if (!IsInWorld())
@@ -6812,7 +7254,10 @@ void Unit::ApplyDamageDealt(DamageDealtRecord const& dealt)
     WeaponAttackType const attackType = WeaponAttackType(dealt.attackType);
 
     if (dealt.aiHook && IsAIEnabled && victim)
-        GetAI()->DamageDealt(victim, dealt.damage, damagetype, SpellSchoolMask(dealt.schoolMask));
+    {
+        uint32 damage = dealt.damage;   // the hook's out-parameter; the damage has already been dealt
+        GetAI()->DamageDealt(victim, damage, damagetype, SpellSchoolMask(dealt.schoolMask));
+    }
 
     if (dealt.damageShield && victim && spellProto)
         DealDamageShieldDamage(victim);
@@ -6852,7 +7297,10 @@ void Unit::ApplyHealDone(HealDoneRecord const& healed)
     Unit* target = ObjectAccessor::GetUnit(*this, healed.target);
 
     if (healed.aiHook && IsAIEnabled && target)
-        GetAI()->HealDone(target, healed.heal);
+    {
+        uint32 heal = healed.heal;   // the hook's out-parameter; the heal has already been dealt
+        GetAI()->HealDone(target, heal);
+    }
 
     if (healed.bgScore)
         if (Player* player = ToPlayer())
@@ -6961,6 +7409,17 @@ void Unit::SendSpellDamageImmune(Unit* target, uint32 spellId)
     WorldPacket data(SMSG_SPELLORDAMAGE_IMMUNE, 8 + 8 + 4 + 1);
     data << GetGUID();
     data << target->GetGUID();
+    data << uint32(spellId);
+    data << uint8(0); // bool - log format: 0-default, 1-debug
+    SendMessageToSet(&data, true);
+}
+
+// Step 08 §2: the same packet, broadcast from the immune target on behalf of a caster on another task
+void Unit::SendSpellDamageImmuneFrom(ObjectGuid casterGuid, uint32 spellId)
+{
+    WorldPacket data(SMSG_SPELLORDAMAGE_IMMUNE, 8 + 8 + 4 + 1);
+    data << casterGuid;
+    data << GetGUID();
     data << uint32(spellId);
     data << uint8(0); // bool - log format: 0-default, 1-debug
     SendMessageToSet(&data, true);
@@ -7604,6 +8063,22 @@ void Unit::EngageWithTarget(Unit* who)
 {
     if (!who)
         return;
+
+    // Asked to engage from another unit's task (formation assist, DoZoneInCombat, scripts): a zero Threat
+    // record. ApplyThreat runs AddThreat on this unit's own task, which is the threat-list or the combat-only
+    // path by CanHaveThreatList there (step 13).
+    if (IsForeignToTask())
+    {
+        ThreatRecord record;
+        record.attackerGuid = who->GetGUID();
+        record.amount = 0.0f;
+        record.spellId = 0;
+        record.ignoreModifiers = 1;
+        record.ignoreRedirects = 1;
+        sRecordLogs->Append(BeatContext::owner->GetGUID(), this, RecordKind::Threat, record);
+        return;
+    }
+
     if (CanHaveThreatList())
         m_threatManager.AddThreat(who, 0.0f, nullptr, true, true);
     else
@@ -7802,6 +8277,18 @@ Unit* Unit::GetCharmer() const
 Player* Unit::GetCharmerOrOwnerPlayerOrPlayerItself() const
 {
     ObjectGuid guid = GetCharmerOrOwnerGUID();
+    if (guid.IsPlayer())
+        return ObjectAccessor::GetPlayer(*this, guid);
+
+    return const_cast<Unit*>(this)->ToPlayer();
+}
+
+Player* Unit::GetCharmerOrOwnerPlayerOrPlayerItself(UpdateValuesSource const& src) const
+{
+    if (src.IsLive())
+        return GetCharmerOrOwnerPlayerOrPlayerItself();
+
+    ObjectGuid const guid = src.slot->charmerOrOwnerGuid;
     if (guid.IsPlayer())
         return ObjectAccessor::GetPlayer(*this, guid);
 
@@ -11745,6 +12232,7 @@ float Unit::ApplyEffectModifiers(SpellInfo const* spellProto, uint8 effect_index
 // function uses real base points (typically value - 1)
 DiminishingLevels Unit::GetDiminishing(DiminishingGroup group)
 {
+    ASSERT_OWNED(this);
     for (Diminishing::iterator i = m_Diminishing.begin(); i != m_Diminishing.end(); ++i)
     {
         if (i->DRGroup != group)
@@ -12712,6 +13200,21 @@ void Unit::ApplyRecord(RecordHeader const& header, uint8 const* payload)
         case RecordKind::ProcActor:
             ApplyProcActor(RecordPayload<ProcActorRecord>(payload));
             break;
+        case RecordKind::MeleeHit:
+            ApplyMeleeHit(RecordPayload<MeleeHitRecord>(payload));
+            break;
+        case RecordKind::MeleeLanded:
+            ApplyMeleeLanded(RecordPayload<MeleeLandedRecord>(payload));
+            break;
+        case RecordKind::PeriodicLanded:
+            ApplyPeriodicLanded(RecordPayload<PeriodicLandedRecord>(payload));
+            break;
+        case RecordKind::AreaAuraApply:
+            ApplyAreaAuraApply(RecordPayload<AreaAuraApplyRecord>(payload));
+            break;
+        case RecordKind::AreaAuraRemove:
+            ApplyAreaAuraRemove(RecordPayload<AreaAuraRemoveRecord>(payload));
+            break;
         case RecordKind::ThreatBackRef:
             GetThreatMgr().ApplyThreatBackRef(RecordPayload<ThreatBackRefRecord>(payload).victimGuid);
             break;
@@ -12754,11 +13257,10 @@ void Unit::ApplyRecord(RecordHeader const& header, uint8 const* payload)
         case RecordKind::GameObjectUnlink:
             ApplyGameObjectUnlink(RecordPayload<GameObjectUnlinkRecord>(payload));
             break;
-        case RecordKind::Wake:
-            break;
         default:
-            LOG_DEBUG("maps.records", "{} dropped record {} from {}: no applier on this step",
-                GetGUID().ToString(), RecordKindName(header.kind), header.source.ToString());
+            if (!ApplyCommonRecord(header, payload))
+                LOG_DEBUG("maps.records", "{} dropped record {} from {}: no applier on this step",
+                    GetGUID().ToString(), RecordKindName(header.kind), header.source.ToString());
             break;
     }
 }
@@ -14560,7 +15062,18 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
             if (instanceMap->IsDungeon() && player)
                 if (instanceMap->IsRaidOrHeroicDungeon())
                     if (creature->HasFlagsExtra(CREATURE_FLAG_EXTRA_INSTANCE_BIND))
-                        instanceMap->ToInstanceMap()->PermBindAllPlayers();
+                    {
+                        if (BeatContext::InTask())
+                        {
+                            InstanceBindDefer rec;
+                            rec.mapId = instanceMap->GetId();
+                            rec.instanceId = instanceMap->GetInstanceId();
+                            rec.permanent = 1;
+                            instanceMap->AppendDefer(DeferKind::InstanceBind, rec);
+                        }
+                        else
+                            instanceMap->ToInstanceMap()->PermBindAllPlayers();
+                    }
         }
     }
 
@@ -14569,7 +15082,17 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
     if (player && killer != victim)
     {
         if (OutdoorPvP* pvp = player->GetOutdoorPvP())
-            pvp->HandleKill(player, victim);
+        {
+            if (BeatContext::InTask())
+            {
+                OutdoorPvPEventDefer rec;
+                rec.killer = player->GetGUID();
+                rec.victim = victim->GetGUID();
+                player->GetMap()->AppendDefer(DeferKind::OutdoorPvPEvent, rec);
+            }
+            else
+                pvp->HandleKill(player, victim);
+        }
 
         if (Battlefield* bf = sBattlefieldMgr->GetBattlefieldToZoneId(player->GetZoneId()))
             bf->HandleKill(player, victim);
@@ -14583,7 +15106,16 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
     if (player)
         if (Battleground* bg = player->GetBattleground())
         {
-            if (victim->IsPlayer())
+            if (BeatContext::InTask())
+            {
+                BattlegroundEventDefer rec;
+                rec.bgInstanceId = bg->GetInstanceID();
+                rec.kind = victim->IsPlayer() ? 0 : 1;
+                rec.killer = player->GetGUID();
+                rec.victim = victim->GetGUID();
+                player->GetMap()->AppendDefer(DeferKind::BattlegroundEvent, rec);
+            }
+            else if (victim->IsPlayer())
                 bg->HandleKillPlayer(victim->ToPlayer(), player);
             else
                 bg->HandleKillUnit(victim->ToCreature(), player);
@@ -15126,6 +15658,16 @@ bool Unit::SetCharmedBy(Unit* charmer, CharmType type, AuraApplication const* au
     if (IsPlayer())
         sScriptMgr->OnPlayerBeingCharmed(ToPlayer(), charmer, _oldFactionId, charmer->GetFaction());
 
+    if (BeatContext::InTask() && FindMap())
+    {
+        TaskGroupJoinDefer rec;
+        rec.root = charmer->GetGUID();
+        rec.member = GetGUID();
+        rec.seatId = -1;
+        rec.charm = 1;
+        GetMap()->AppendDefer(DeferKind::TaskGroupJoin, rec);
+    }
+
     return true;
 }
 
@@ -15282,6 +15824,14 @@ void Unit::RemoveCharmedBy(Unit* charmer)
     // xinef: Always delete charm info (restores react state)
     if (IsPlayer() || (IsCreature() && !ToCreature()->IsGuardian()))
         DeleteCharmInfo();
+
+    if (BeatContext::InTask() && FindMap())
+    {
+        TaskGroupLeaveDefer rec;
+        rec.member = GetGUID();
+        rec.charm = 1;
+        GetMap()->AppendDefer(DeferKind::TaskGroupLeave, rec);
+    }
 }
 
 void Unit::RestoreFaction()
@@ -16664,78 +17214,17 @@ void Unit::ExecuteDelayedUnitRelocationEvent()
     if (!this->IsInWorld() || this->IsDuringRemoveFromWorld())
         return;
 
+    // Step 10: players seeing through this unit scan from it in their own view phase (the scan applies the
+    // minimum-move check on the viewpoint, as before).
     if (this->HasSharedVision())
-        for (SharedVisionList::const_iterator itr = this->GetSharedVisionList().begin(); itr != this->GetSharedVisionList().end(); ++itr)
-            if (Player* player = (*itr))
-            {
-                if (player->IsOnVehicle(this) || !player->IsInWorld() || player->IsDuringRemoveFromWorld()) // players on vehicles have their own event executed (due to passenger relocation)
-                    continue;
-                WorldObject* viewPoint = player;
-                if (player->m_seer && player->m_seer->IsInWorld())
-                    viewPoint = player->m_seer;
-                if (!viewPoint->IsPositionValid() || !player->IsPositionValid())
-                    continue;
-
-                if (Unit* active = viewPoint->ToUnit())
-                {
-                    //if (active->IsVehicle()) // always check original unit here, last notify position is not relocated
-                    //  active = player;
-
-                    float dx = active->m_last_notify_position.GetPositionX() - active->GetPositionX();
-                    float dy = active->m_last_notify_position.GetPositionY() - active->GetPositionY();
-                    float dz = active->m_last_notify_position.GetPositionZ() - active->GetPositionZ();
-                    float distsq = dx * dx + dy * dy + dz * dz;
-                    float mindistsq = DynamicVisibilityMgr::GetReqMoveDistSq(active->FindMap()->GetEntry()->map_type);
-                    if (distsq < mindistsq)
-                        continue;
-
-                    // this will be relocated below sharedvision!
-                    //active->m_last_notify_position.Relocate(active->GetPositionX(), active->GetPositionY(), active->GetPositionZ());
-                }
-
-                Acore::PlayerRelocationNotifier notifier(*player);
-                Cell::VisitObjects(viewPoint, notifier, player->GetSightRange());
-                Cell::VisitFarVisibleObjects(viewPoint, notifier, VISIBILITY_DISTANCE_GIGANTIC);
-                notifier.SendToSelf();
-            }
+        for (Player* player : this->GetSharedVisionList())
+            if (player && !player->IsOnVehicle(this) && player->IsInWorld() && !player->IsDuringRemoveFromWorld()) // players on vehicles have their own event executed (due to passenger relocation)
+                player->PokeViewScan(this);
 
     if (Player* player = this->ToPlayer())
     {
-        WorldObject* viewPoint = player;
-        if (player->m_seer && player->m_seer->IsInWorld())
-            viewPoint = player->m_seer;
-
-        if (viewPoint->GetMapId() != player->GetMapId() || !viewPoint->IsPositionValid() || !player->IsPositionValid())
-            return;
-
-        if (Unit* active = viewPoint->ToUnit())
-        {
-            if (active->IsVehicle())
-                active = player;
-
-            if (!player->GetFarSightDistance())
-            {
-                float dx     = active->m_last_notify_position.GetPositionX() - active->GetPositionX();
-                float dy     = active->m_last_notify_position.GetPositionY() - active->GetPositionY();
-                float dz     = active->m_last_notify_position.GetPositionZ() - active->GetPositionZ();
-                float distsq = dx * dx + dy * dy + dz * dz;
-
-                float mindistsq = DynamicVisibilityMgr::GetReqMoveDistSq(active->FindMap()->GetEntry()->map_type);
-                if (distsq < mindistsq)
-                    return;
-
-                active->m_last_notify_position.Relocate(active->GetPositionX(), active->GetPositionY(), active->GetPositionZ());
-            }
-        }
-
-        GetMap()->LoadGridsInRange(*player, MAX_VISIBILITY_DISTANCE);
-
-        Acore::PlayerRelocationNotifier notifier(*player);
-        Cell::VisitObjects(player->GetSightPosition().GetPositionX(), player->GetSightPosition().GetPositionY(), player->GetMap(), notifier, player->GetSightRange());
-        Cell::VisitFarVisibleObjects(player->GetSightPosition().GetPositionX(), player->GetSightPosition().GetPositionY(), player->GetMap(), notifier, VISIBILITY_DISTANCE_GIGANTIC);
-        notifier.SendToSelf();
-
-        this->AddToNotify(NOTIFY_AI_RELOCATION);
+        // Scan, link / unlink and packet run in the view phase (BeatPool U2), after every object published this beat.
+        player->RequestViewScan(false);
     }
     else if (Creature* unit = this->ToCreature())
     {
@@ -17079,7 +17568,7 @@ void Unit::SendMovementHover(Player* sendTo)
     sendTo->SendDirectMessage(&data);
 }
 
-void Unit::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target)
+void Unit::BuildValuesUpdateFrom(uint8 updateType, ByteBuffer* data, Player* target, UpdateValuesSource const& src)
 {
     if (!target)
         return;
@@ -17090,32 +17579,44 @@ void Unit::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target)
     if (target == this)
         visibleFlag |= UF_FLAG_PRIVATE;
 
-    Player* plr = GetCharmerOrOwnerPlayerOrPlayerItself();
-    if (GetOwnerGUID() == target->GetGUID())
+    // Step 13: on a viewer's build (src.slot set) every input beyond the field array comes from the slot.
+    Player* plr = GetCharmerOrOwnerPlayerOrPlayerItself(src);
+    if (ObjectGuid(src.values[UNIT_FIELD_SUMMONEDBY] | (uint64(src.values[UNIT_FIELD_SUMMONEDBY + 1]) << 32)) == target->GetGUID())
         visibleFlag |= UF_FLAG_OWNER;
 
-    if (HasDynamicFlag(UNIT_DYNFLAG_SPECIALINFO))
-        if (HasAuraTypeWithCaster(SPELL_AURA_EMPATHY, target->GetGUID()))
+    if (src.values[UNIT_DYNAMIC_FLAGS] & UNIT_DYNFLAG_SPECIALINFO)
+    {
+        bool const empathy = src.slot
+            ? SlotReader(*src.slot).HasAuraTypeWithCaster(SPELL_AURA_EMPATHY, target->GetGUID())
+            : HasAuraTypeWithCaster(SPELL_AURA_EMPATHY, target->GetGUID());
+        if (empathy)
             visibleFlag |= UF_FLAG_SPECIAL_INFO;
+    }
 
     if (plr && plr->IsInSameRaidWith(target))
         visibleFlag |= UF_FLAG_PARTY_MEMBER;
 
+    // The per-flag cache is the owner's: only the live build (this object's own task) reads or fills it.
+    // A viewer building from a slot (step 10) builds straight; it is one build per viewer either way.
+    bool const live = src.IsLive();
     uint64 cacheKey = static_cast<uint64>(visibleFlag) << 8 | updateType;
 
-    auto cacheIt = _valuesUpdateCache.find(cacheKey);
-    if (cacheIt != _valuesUpdateCache.end())
+    if (live)
     {
-        int32 cachePos = static_cast<int32>(data->wpos());
-        data->append(cacheIt->second.buffer);
+        auto cacheIt = _valuesUpdateCache.find(cacheKey);
+        if (cacheIt != _valuesUpdateCache.end())
+        {
+            int32 cachePos = static_cast<int32>(data->wpos());
+            data->append(cacheIt->second.buffer);
 
-        BuildValuesCachePosPointers dataAdjustedPos = cacheIt->second.posPointers;
-        if (cachePos)
-            dataAdjustedPos.ApplyOffset(cachePos);
+            BuildValuesCachePosPointers dataAdjustedPos = cacheIt->second.posPointers;
+            if (cachePos)
+                dataAdjustedPos.ApplyOffset(cachePos);
 
-        PatchValuesUpdate(*data, dataAdjustedPos, target);
+            PatchValuesUpdate(*data, dataAdjustedPos, target, src);
 
-        return;
+            return;
+        }
     }
 
     BuildValuesCachedBuffer cacheValue(500);
@@ -17127,17 +17628,17 @@ void Unit::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target)
 
     for (uint16 index = 0; index < m_valuesCount; ++index)
     {
-        if (_fieldNotifyFlags & flags[index] ||
+        if ((_fieldNotifyFlags | src.notifyFlags) & flags[index] ||
                 ((flags[index] & visibleFlag) & UF_FLAG_SPECIAL_INFO) ||
-                ((updateType == UPDATETYPE_VALUES ? _changesMask.GetBit(index) : m_uint32Values[index]) && (flags[index] & visibleFlag)) ||
-                (index == UNIT_FIELD_AURASTATE && HasFlag(UNIT_FIELD_AURASTATE, PER_CASTER_AURA_STATE_MASK)))
+                ((updateType == UPDATETYPE_VALUES ? src.Changed(index) : src.values[index]) && (flags[index] & visibleFlag)) ||
+                (index == UNIT_FIELD_AURASTATE && (src.values[UNIT_FIELD_AURASTATE] & PER_CASTER_AURA_STATE_MASK)))
         {
             updateMask.SetBit(index);
 
             if (index == UNIT_NPC_FLAGS)
             {
                 cacheValue.posPointers.UnitNPCFlagsPos = int32(fieldBuffer.wpos());
-                fieldBuffer << m_uint32Values[UNIT_NPC_FLAGS];
+                fieldBuffer << src.values[UNIT_NPC_FLAGS];
             }
             else if (index == UNIT_FIELD_AURASTATE)
             {
@@ -17148,7 +17649,8 @@ void Unit::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target)
             else if (index >= UNIT_FIELD_BASEATTACKTIME && index <= UNIT_FIELD_RANGEDATTACKTIME)
             {
                 // convert from float to uint32 and send
-                fieldBuffer << uint32(m_floatValues[index] < 0 ? 0 : m_floatValues[index]);
+                float const f = src.F(index);
+                fieldBuffer << uint32(f < 0 ? 0 : f);
             }
             // there are some float values which may be negative or can't get negative due to other checks
             else if ((index >= UNIT_FIELD_NEGSTAT0   && index <= UNIT_FIELD_NEGSTAT4) ||
@@ -17156,35 +17658,35 @@ void Unit::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target)
                      (index >= UNIT_FIELD_RESISTANCEBUFFMODSNEGATIVE  && index <= (UNIT_FIELD_RESISTANCEBUFFMODSNEGATIVE + 6)) ||
                      (index >= UNIT_FIELD_POSSTAT0   && index <= UNIT_FIELD_POSSTAT4))
             {
-                fieldBuffer << uint32(m_floatValues[index]);
+                fieldBuffer << uint32(src.F(index));
             }
             // Gamemasters should be always able to select units - remove not selectable flag
             else if (index == UNIT_FIELD_FLAGS)
             {
                 cacheValue.posPointers.UnitFieldFlagsPos = int32(fieldBuffer.wpos());
-                fieldBuffer << m_uint32Values[UNIT_FIELD_FLAGS];
+                fieldBuffer << src.values[UNIT_FIELD_FLAGS];
             }
             // use modelid_a if not gm, _h if gm for CREATURE_FLAG_EXTRA_TRIGGER creatures
             else if (index == UNIT_FIELD_DISPLAYID)
             {
                 cacheValue.posPointers.UnitFieldDisplayPos = int32(fieldBuffer.wpos());
-                fieldBuffer << m_uint32Values[UNIT_FIELD_DISPLAYID];
+                fieldBuffer << src.values[UNIT_FIELD_DISPLAYID];
             }
             else if (index == UNIT_DYNAMIC_FLAGS)
             {
                 cacheValue.posPointers.UnitDynamicFlagsPos = int32(fieldBuffer.wpos());
-                uint32 dynamicFlags = m_uint32Values[UNIT_DYNAMIC_FLAGS] & ~(UNIT_DYNFLAG_TAPPED | UNIT_DYNFLAG_TAPPED_BY_PLAYER);
+                uint32 dynamicFlags = src.values[UNIT_DYNAMIC_FLAGS] & ~(UNIT_DYNFLAG_TAPPED | UNIT_DYNFLAG_TAPPED_BY_PLAYER);
                 fieldBuffer << dynamicFlags;
             }
             else if (index == UNIT_FIELD_BYTES_2)
             {
                 cacheValue.posPointers.UnitFieldBytes2Pos = int32(fieldBuffer.wpos());
-                fieldBuffer << m_uint32Values[index];
+                fieldBuffer << src.values[index];
             }
             else if (index == UNIT_FIELD_FACTIONTEMPLATE)
             {
                 cacheValue.posPointers.UnitFieldFactionTemplatePos = int32(fieldBuffer.wpos());
-                fieldBuffer << m_uint32Values[index];
+                fieldBuffer << src.values[index];
             }
             else
             {
@@ -17192,7 +17694,7 @@ void Unit::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target)
                     cacheValue.posPointers.other[index] = static_cast<uint32>(fieldBuffer.wpos());
 
                 // send in current format (float as float, uint32 as uint32)
-                fieldBuffer << m_uint32Values[index];
+                fieldBuffer << src.values[index];
             }
         }
     }
@@ -17210,33 +17712,44 @@ void Unit::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target)
     if (cachePos)
         dataAdjustedPos.ApplyOffset(cachePos);
 
-    PatchValuesUpdate(*data, dataAdjustedPos, target);
+    PatchValuesUpdate(*data, dataAdjustedPos, target, src);
 
-    _valuesUpdateCache.insert(std::pair<uint64, BuildValuesCachedBuffer>(cacheKey, std::move(cacheValue)));
+    if (live)
+        _valuesUpdateCache.insert(std::pair<uint64, BuildValuesCachedBuffer>(cacheKey, std::move(cacheValue)));
 }
 
-void Unit::PatchValuesUpdate(ByteBuffer& valuesUpdateBuf, BuildValuesCachePosPointers& posPointers, Player* target)
+void Unit::PatchValuesUpdate(ByteBuffer& valuesUpdateBuf, BuildValuesCachePosPointers& posPointers, Player* target, UpdateValuesSource const& src)
 {
     Creature const* creature = ToCreature();
+
+    // Step 13: a viewer's build reads this unit through src (the slot); the live getters run only on the
+    // owner's own build. The remaining live reads on this path are listed in plans/13 (loot, conditions).
+    Player* plr = GetCharmerOrOwnerPlayerOrPlayerItself(src);
+    auto inRaidWithTarget = [&]() { return src.IsLive() ? IsInRaidWith(target) : (plr && plr->IsInSameRaidWith(target)); };
+    auto hasAuraTypeWithCaster = [&](AuraType type, ObjectGuid caster)
+    {
+        return src.IsLive() ? HasAuraTypeWithCaster(type, caster) : SlotReader(*src.slot).HasAuraTypeWithCaster(type, caster);
+    };
 
     // UNIT_NPC_FLAGS
     if (creature && posPointers.UnitNPCFlagsPos >= 0)
     {
-        uint32 appendValue = m_uint32Values[UNIT_NPC_FLAGS];
+        uint32 appendValue = src.values[UNIT_NPC_FLAGS];
+        NPCFlags const npcFlags = NPCFlags(appendValue);
 
         if (sWorld->getIntConfig(CONFIG_INSTANT_TAXI) == 2 && appendValue & UNIT_NPC_FLAG_FLIGHTMASTER)
             appendValue |= UNIT_NPC_FLAG_GOSSIP; // flight masters need NPC gossip flag to show instant flight toggle option
 
-        if (!target->CanSeeSpellClickOn(creature))
+        if (!target->CanSeeSpellClickOn(creature, npcFlags))
             appendValue &= ~UNIT_NPC_FLAG_SPELLCLICK;
 
-        if (!target->CanSeeVendor(creature))
+        if (!target->CanSeeVendor(creature, npcFlags))
         {
             appendValue &= ~UNIT_NPC_FLAG_REPAIR;
             appendValue &= ~UNIT_NPC_FLAG_VENDOR_MASK;
         }
 
-        if (!target->CanSeeTrainer(creature))
+        if (!target->CanSeeTrainer(creature, npcFlags))
             appendValue &= ~UNIT_NPC_FLAG_TRAINER;
 
         valuesUpdateBuf.put(posPointers.UnitNPCFlagsPos, appendValue);
@@ -17244,12 +17757,17 @@ void Unit::PatchValuesUpdate(ByteBuffer& valuesUpdateBuf, BuildValuesCachePosPoi
 
     // UNIT_FIELD_AURASTATE
     if (posPointers.UnitFieldAuraStatePos >= 0)
-        valuesUpdateBuf.put(posPointers.UnitFieldAuraStatePos, uint32(BuildAuraStateUpdateForTarget(target)));
+    {
+        uint32 const auraStates = src.IsLive()
+            ? BuildAuraStateUpdateForTarget(target)
+            : SlotReader(*src.slot).AuraStateForTarget(target->GetGUID());
+        valuesUpdateBuf.put(posPointers.UnitFieldAuraStatePos, auraStates);
+    }
 
     // UNIT_FIELD_FLAGS
     if (posPointers.UnitFieldFlagsPos >= 0)
     {
-        uint32 appendValue = m_uint32Values[UNIT_FIELD_FLAGS];
+        uint32 appendValue = src.values[UNIT_FIELD_FLAGS];
         if (target->IsGameMaster() && target->GetSession()->IsGMAccount())
             appendValue &= ~UNIT_FLAG_NOT_SELECTABLE;
 
@@ -17260,7 +17778,7 @@ void Unit::PatchValuesUpdate(ByteBuffer& valuesUpdateBuf, BuildValuesCachePosPoi
     // Use modelid_a if not gm, _h if gm for CREATURE_FLAG_EXTRA_TRIGGER creatures.
     if (posPointers.UnitFieldDisplayPos >= 0)
     {
-        uint32 displayId = m_uint32Values[UNIT_FIELD_DISPLAYID];
+        uint32 displayId = src.values[UNIT_FIELD_DISPLAYID];
         if (creature)
         {
             CreatureTemplate const* cinfo = creature->GetCreatureTemplate();
@@ -17291,7 +17809,7 @@ void Unit::PatchValuesUpdate(ByteBuffer& valuesUpdateBuf, BuildValuesCachePosPoi
     // Hide lootable animation for unallowed players.
     if (posPointers.UnitDynamicFlagsPos >= 0)
     {
-        uint32 dynamicFlags = m_uint32Values[UNIT_DYNAMIC_FLAGS] & ~(UNIT_DYNFLAG_TAPPED | UNIT_DYNFLAG_TAPPED_BY_PLAYER);
+        uint32 dynamicFlags = src.values[UNIT_DYNAMIC_FLAGS] & ~(UNIT_DYNFLAG_TAPPED | UNIT_DYNFLAG_TAPPED_BY_PLAYER);
 
         if (creature)
         {
@@ -17302,13 +17820,14 @@ void Unit::PatchValuesUpdate(ByteBuffer& valuesUpdateBuf, BuildValuesCachePosPoi
                     dynamicFlags |= UNIT_DYNFLAG_TAPPED_BY_PLAYER;
             }
 
-            if (!target->isAllowedToLoot(creature))
+            // Only a lootable corpse needs the (live, loot-reading) recipient check.
+            if ((dynamicFlags & UNIT_DYNFLAG_LOOTABLE) && !target->isAllowedToLoot(creature))
                 dynamicFlags &= ~UNIT_DYNFLAG_LOOTABLE;
         }
 
         // unit UNIT_DYNFLAG_TRACK_UNIT should only be sent to caster of SPELL_AURA_MOD_STALKED auras
         if (dynamicFlags & UNIT_DYNFLAG_TRACK_UNIT)
-            if (!HasAuraTypeWithCaster(SPELL_AURA_MOD_STALKED, target->GetGUID()))
+            if (!hasAuraTypeWithCaster(SPELL_AURA_MOD_STALKED, target->GetGUID()))
                 dynamicFlags &= ~UNIT_DYNFLAG_TRACK_UNIT;
 
         valuesUpdateBuf.put(posPointers.UnitDynamicFlagsPos, dynamicFlags);
@@ -17317,27 +17836,27 @@ void Unit::PatchValuesUpdate(ByteBuffer& valuesUpdateBuf, BuildValuesCachePosPoi
     // UNIT_FIELD_BYTES_2
     if (posPointers.UnitFieldBytes2Pos >= 0)
     {
-        if (IsControlledByPlayer() && target != this && sWorld->getBoolConfig(CONFIG_ALLOW_TWO_SIDE_INTERACTION_GROUP) && IsInRaidWith(target))
+        if (IsControlledByPlayer() && target != this && sWorld->getBoolConfig(CONFIG_ALLOW_TWO_SIDE_INTERACTION_GROUP) && inRaidWithTarget())
         {
-            FactionTemplateEntry const* ft1 = GetFactionTemplateEntry();
+            FactionTemplateEntry const* ft1 = sFactionTemplateStore.LookupEntry(src.values[UNIT_FIELD_FACTIONTEMPLATE]);
             FactionTemplateEntry const* ft2 = target->GetFactionTemplateEntry();
             if (ft1 && ft2 && !ft1->IsFriendlyTo(*ft2))
                 // Allow targetting opposite faction in party when enabled in config
-                valuesUpdateBuf.put(posPointers.UnitFieldBytes2Pos, (m_uint32Values[UNIT_FIELD_BYTES_2] & ((UNIT_BYTE2_FLAG_SANCTUARY /*| UNIT_BYTE2_FLAG_AURAS | UNIT_BYTE2_FLAG_UNK5*/) << 8))); // this flag is at uint8 offset 1 !!
+                valuesUpdateBuf.put(posPointers.UnitFieldBytes2Pos, (src.values[UNIT_FIELD_BYTES_2] & ((UNIT_BYTE2_FLAG_SANCTUARY /*| UNIT_BYTE2_FLAG_AURAS | UNIT_BYTE2_FLAG_UNK5*/) << 8))); // this flag is at uint8 offset 1 !!
         }// pussywizard / Callmephil
         else if (target->IsSpectator() && target->FindMap() && target->FindMap()->IsBattleArena() &&
                     (this->IsPlayer() || this->IsCreature() || this->IsDynamicObject()))
         {
-                valuesUpdateBuf.put(posPointers.UnitFieldBytes2Pos, (m_uint32Values[UNIT_FIELD_BYTES_2] & 0xFFFFF2FF)); // clear UNIT_BYTE2_FLAG_PVP, UNIT_BYTE2_FLAG_FFA_PVP, UNIT_BYTE2_FLAG_SANCTUARY
+                valuesUpdateBuf.put(posPointers.UnitFieldBytes2Pos, (src.values[UNIT_FIELD_BYTES_2] & 0xFFFFF2FF)); // clear UNIT_BYTE2_FLAG_PVP, UNIT_BYTE2_FLAG_FFA_PVP, UNIT_BYTE2_FLAG_SANCTUARY
         }
     }
 
     // UNIT_FIELD_FACTIONTEMPLATE
     if (posPointers.UnitFieldFactionTemplatePos >= 0)
     {
-        if (IsControlledByPlayer() && target != this && sWorld->getBoolConfig(CONFIG_ALLOW_TWO_SIDE_INTERACTION_GROUP) && IsInRaidWith(target))
+        if (IsControlledByPlayer() && target != this && sWorld->getBoolConfig(CONFIG_ALLOW_TWO_SIDE_INTERACTION_GROUP) && inRaidWithTarget())
         {
-            FactionTemplateEntry const* ft1 = GetFactionTemplateEntry();
+            FactionTemplateEntry const* ft1 = sFactionTemplateStore.LookupEntry(src.values[UNIT_FIELD_FACTIONTEMPLATE]);
             FactionTemplateEntry const* ft2 = target->GetFactionTemplateEntry();
             if (ft1 && ft2 && !ft1->IsFriendlyTo(*ft2))
                 // pretend that all other HOSTILE players have own faction, to allow follow, heal, rezz (trade wont work)

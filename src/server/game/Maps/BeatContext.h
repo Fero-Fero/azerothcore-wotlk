@@ -58,10 +58,36 @@ struct BeatContext
     static inline thread_local uint64 foreignReads = 0;
     static inline std::atomic<uint64> foreignReadsTotal{0};
 
+    // Singletons marked *mutex* in the step 03 table count their lock acquisitions here (step 13). A count
+    // that scales with population means the kind was mis-marked and should be a defer. Read by .debug singletons.
+    enum SingletonLock : uint8
+    {
+        LOCK_CHARACTER_CACHE,
+        LOCK_ACHIEVEMENT_REALM_FIRST,
+        LOCK_GUILD_MEMBER,
+        LOCK_MAX
+    };
+    static inline std::atomic<uint64> singletonLocks[LOCK_MAX]{};
+    static inline std::atomic<uint64> singletonLocksInBeat[LOCK_MAX]{};
+    static void CountSingletonLock(SingletonLock kind)
+    {
+        singletonLocks[kind].fetch_add(1, std::memory_order_relaxed);
+        if (inBeat.load(std::memory_order_relaxed))
+            singletonLocksInBeat[kind].fetch_add(1, std::memory_order_relaxed);
+    }
+    static char const* SingletonLockName(SingletonLock kind);
+
     static bool InTask() { return owner != nullptr; }
     static bool InSealTask() { return sealMap != nullptr; }
+    static bool InBeat() { return inBeat.load(std::memory_order_relaxed); }
 
-    // True when the running thread may read or write o's live fields. Always true outside a beat.
+    // The map whose defer buffer a global (S2) defer appended from this thread goes to: the running task
+    // root's map, or the sealing map. nullptr outside a beat, where the caller mutates directly.
+    static Map* DeferMap();
+
+    // True when the running thread may read or write o's live fields. Always true outside a beat, for an
+    // object that is not in the world (being built or already torn down by the task holding it), and for an
+    // item whose owner's task is running.
     static bool MayAccess(Object const* o);
 
     // True inside a task when o is in the world and outside the owner's task group: a write to it must be a
@@ -128,9 +154,14 @@ struct GridTaskScope
 // Legal between beats and in a map seal task, never inside a unit task (step 03, step 13).
 #define ASSERT_NOT_IN_TASK() ASSERT(!BeatContext::InTask(), "global mutation from task of {}", \
     BeatContext::owner->GetGUID().ToString())
+// Mutators marked *defer* in the step 03 table: legal only in seal phase S2 or between beats, not even in a
+// map seal task (two maps' seal tasks run concurrently).
+#define ASSERT_NOT_IN_BEAT() ASSERT(!BeatContext::InBeat(), "defer-marked mutation inside a beat (task of {}, seal map {})", \
+    BeatContext::owner ? BeatContext::owner->GetGUID().ToString() : "none", static_cast<void const*>(BeatContext::sealMap))
 #else
 #define ASSERT_OWNED(obj) ((void)0)
 #define ASSERT_NOT_IN_TASK() ((void)0)
+#define ASSERT_NOT_IN_BEAT() ((void)0)
 #endif
 
 #endif

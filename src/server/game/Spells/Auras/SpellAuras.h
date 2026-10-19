@@ -27,6 +27,7 @@ class SpellInfo;
 struct SpellModifier;
 struct ProcTriggerSpell;
 struct SpellProcEntry;
+struct AreaAuraApplyRecord;
 
 // forward decl
 class AuraEffect;
@@ -264,8 +265,28 @@ public:
     void SetTriggeredByAuraSpellInfo(SpellInfo const* triggeredByAuraSpellInfo);
     SpellInfo const* GetTriggeredByAuraSpellInfo() const;
 
+    // Step 08 §3: area auras as per-target clones (AreaAuraRecords.h).
+    //  - The spreading aura keeps the guids of the members it reached by record in m_areaCloneTargets and
+    //    refreshes them every UPDATE_TARGET_MAP_INTERVAL; a member no longer in range gets an
+    //    AreaAuraRemoveRecord, and _Remove sends one to every member.
+    //  - A clone is a UnitAura owned by the member, flagged by MarkAreaClone with the spreading aura's guid.
+    //    It only ever applies to its owner (FillTargetMap) and removes itself when the owner stops
+    //    refreshing it (AREA_CLONE_TIMEOUT_MS, see Update).
+    [[nodiscard]] bool IsAreaClone() const { return m_isAreaClone; }
+    [[nodiscard]] ObjectGuid GetAreaOwnerGUID() const { return m_areaOwnerGuid; }
+    // the per-second cost (m_timeCla) is the spreading aura's, a clone never pays it
+    void MarkAreaClone(ObjectGuid areaOwner) { m_isAreaClone = true; m_areaOwnerGuid = areaOwner; m_areaCloneSinceRefreshMs = 0; m_timeCla = 0; }
+    void TouchAreaClone() { m_areaCloneSinceRefreshMs = 0; }
+    // the unit whose area aura this is: the owner itself, or the spreading aura's owner for a clone
+    [[nodiscard]] Unit* GetAreaOwnerUnit() const;
+    [[nodiscard]] GuidUnorderedSet const& GetAreaCloneTargets() const { return m_areaCloneTargets; }
+    void BuildAreaAuraApplyRecord(AreaAuraApplyRecord& out, uint8 effMask, Unit* caster, Unit* target) const;
+    void EmitAreaAuraRemove(ObjectGuid memberGuid, AuraRemoveMode removeMode);
+
 private:
     void _DeleteRemovedApplications();
+    void RouteForeignAreaTargets(std::map<Unit*, uint8>& targets, Unit* caster);
+    void EmitCasterPerSecondCost(Unit* caster, Powers powerType, int32 cost) const;
 
 protected:
     SpellInfo const* const m_spellInfo;
@@ -297,6 +318,12 @@ private:
     Unit::AuraApplicationList m_removedApplications;
 
     SpellInfo const* m_triggeredByAuraSpellInfo;
+
+    // step 08 §3
+    bool m_isAreaClone = false;
+    ObjectGuid m_areaOwnerGuid;
+    uint32 m_areaCloneSinceRefreshMs = 0;
+    GuidUnorderedSet m_areaCloneTargets;
 };
 
 class UnitAura : public Aura

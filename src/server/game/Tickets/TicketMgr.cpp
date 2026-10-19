@@ -16,6 +16,7 @@
  */
 
 #include "TicketMgr.h"
+#include "BeatContext.h"
 #include "CharacterCache.h"
 #include "Chat.h"
 #include "Common.h"
@@ -360,6 +361,7 @@ void TicketMgr::LoadSurveys()
 
 void TicketMgr::AddTicket(GmTicket* ticket)
 {
+    ASSERT_NOT_IN_TASK();
     _ticketList[ticket->GetId()] = ticket;
     if (!ticket->IsClosed())
         ++_openTicketCount;
@@ -371,6 +373,7 @@ void TicketMgr::AddTicket(GmTicket* ticket)
 
 void TicketMgr::CloseTicket(uint32 ticketId, ObjectGuid source)
 {
+    ASSERT_NOT_IN_TASK();
     if (GmTicket* ticket = GetTicket(ticketId))
     {
         CharacterDatabaseTransaction trans = CharacterDatabaseTransaction(nullptr);
@@ -385,6 +388,7 @@ void TicketMgr::CloseTicket(uint32 ticketId, ObjectGuid source)
 
 void TicketMgr::RemoveTicket(uint32 ticketId)
 {
+    ASSERT_NOT_IN_TASK();
     if (GmTicket* ticket = GetTicket(ticketId))
     {
         ticket->DeleteFromDB();

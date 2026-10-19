@@ -15,7 +15,9 @@
  * with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "AreaAuraRecords.h"
 #include "ArenaSpectator.h"
+#include "BeatContext.h"
 #include "CellImpl.h"
 #include "Common.h"
 #include "GameTime.h"
@@ -28,9 +30,11 @@
 #include "ScriptMgr.h"
 #include "Spell.h"
 #include "SpellAuraEffects.h"
+#include "SpellHitRecord.h"
 #include "SpellMgr.h"
 #include "SpellScript.h"
 #include "Unit.h"
+#include "UnitRecordLog.h"
 #include "Util.h"
 #include "Vehicle.h"
 #include "WorldPacket.h"
@@ -631,6 +635,142 @@ void Aura::_Remove(AuraRemoveMode removeMode)
         target->_UnapplyAura(aurApp, removeMode);
         appItr = m_applications.begin();
     }
+
+    // Step 08 §3: members holding a clone drop it on their own task
+    for (ObjectGuid const& memberGuid : m_areaCloneTargets)
+        EmitAreaAuraRemove(memberGuid, removeMode);
+    m_areaCloneTargets.clear();
+}
+
+// Step 08 §3. Every target of an area aura that is outside this task group is taken out of `targets` and
+// reached by an AreaAuraApplyRecord instead; a member reached that way last interval and not wanted any more
+// gets an AreaAuraRemoveRecord. The checks the register loop below does by reading the target
+// (immunities, CanBeAppliedOn, flight) are done here on the handle; stacking and exclusivity, which read the
+// member's aura lists, are the member's (Unit::ApplyAreaAuraApply).
+void Aura::RouteForeignAreaTargets(std::map<Unit*, uint8>& targets, Unit* caster)
+{
+    if (!BeatContext::InTask())
+    {
+        // no task, nothing is foreign: a leftover clone set from an earlier task is released
+        for (ObjectGuid const& memberGuid : m_areaCloneTargets)
+            EmitAreaAuraRemove(memberGuid, AURA_REMOVE_BY_DEFAULT);
+        m_areaCloneTargets.clear();
+        return;
+    }
+
+    GuidUnorderedSet desired;
+    for (std::map<Unit*, uint8>::iterator itr = targets.begin(); itr != targets.end();)
+    {
+        Unit* target = itr->first;
+        if (target == GetOwner() || !BeatContext::IsForeign(target))
+        {
+            ++itr;
+            continue;
+        }
+
+        uint8 effMask = itr->second;
+        for (uint8 effIndex = 0; effIndex < MAX_SPELL_EFFECTS; ++effIndex)
+            if ((effMask & (1 << effIndex)) && target->IsImmunedToSpellEffect(GetSpellInfo(), effIndex, caster))
+                effMask &= ~(1 << effIndex);
+
+        bool wanted = effMask && !target->IsImmunedToSpell(GetSpellInfo(), caster) && CanBeAppliedOn(target);
+        if (wanted && GetType() == DYNOBJ_AURA_TYPE)
+        {
+            if (target->IsInFlight())
+                wanted = false;
+            if (target->HasAura(GetId()) && GetSpellInfo()->HasAttribute(SPELL_ATTR0_CU_ONLY_ONE_AREA_AURA))
+                wanted = false;
+        }
+
+        if (wanted)
+        {
+            AreaAuraApplyRecord rec;
+            BuildAreaAuraApplyRecord(rec, effMask, caster, target);
+            sRecordLogs->Append(GetOwner()->GetGUID(), target, RecordKind::AreaAuraApply, rec);
+            desired.insert(target->GetGUID());
+        }
+
+        targets.erase(itr++);
+    }
+
+    for (ObjectGuid const& memberGuid : m_areaCloneTargets)
+        if (desired.find(memberGuid) == desired.end())
+            EmitAreaAuraRemove(memberGuid, AURA_REMOVE_BY_DEFAULT);
+
+    m_areaCloneTargets = std::move(desired);
+}
+
+void Aura::BuildAreaAuraApplyRecord(AreaAuraApplyRecord& out, uint8 effMask, Unit* caster, Unit* target) const
+{
+    out.spellId = GetId();
+    out.areaOwner = GetOwner()->GetGUID();
+    out.caster = GetCasterGUID();
+    out.castItemGuid = GetCastItemGUID();
+    out.castItemEntry = GetCastItemEntry();
+    out.stackAmount = GetStackAmount();
+
+    AuraLaunchData& launch = out.launch;
+    launch = AuraLaunchData();
+    launch.spellId = GetId();
+    launch.effMask = effMask;
+    launch.casterLevel = GetCasterLevel();
+    launch.charges = GetCharges();
+    launch.maxDuration = GetMaxDuration();
+    launch.duration = GetDuration();
+    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+    {
+        AuraEffect const* eff = m_effects[i];
+        if (!eff || !(effMask & (1 << i)))
+            continue;
+        eff->ExportLaunchData(launch);
+
+        // a persistent area aura's done bonus is folded in on the owner side: the clone is a unit aura and
+        // its ticks apply only the taken bonus (see HandlePeriodicDamageAurasTick, DYNOBJ_AURA_TYPE branch)
+        if (GetType() == DYNOBJ_AURA_TYPE && caster && target)
+        {
+            switch (eff->GetAuraType())
+            {
+                case SPELL_AURA_PERIODIC_DAMAGE:
+                case SPELL_AURA_PERIODIC_LEECH:
+                    launch.amount[i] = int32(caster->SpellDamageBonusDone(target, GetSpellInfo(), uint32(std::max(launch.amount[i], 0)), DOT, i, 0.0f, GetStackAmount()));
+                    break;
+                case SPELL_AURA_PERIODIC_HEAL:
+                    launch.amount[i] = int32(caster->SpellHealingBonusDone(target, GetSpellInfo(), uint32(std::max(launch.amount[i], 0)), DOT, i, 0.0f, GetStackAmount()));
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+}
+
+void Aura::EmitAreaAuraRemove(ObjectGuid memberGuid, AuraRemoveMode removeMode)
+{
+    if (!GetOwner()->IsInWorld())
+        return;
+
+    Unit* member = ObjectAccessor::GetUnit(*GetOwner(), memberGuid);
+    if (!member)
+        return;
+
+    AreaAuraRemoveRecord rec;
+    rec.spellId = GetId();
+    rec.areaOwner = GetOwner()->GetGUID();
+    rec.caster = GetCasterGUID();
+    rec.removeMode = uint8(removeMode);
+
+    // outside a task nothing is foreign and the member can drop the clone now
+    if (!BeatContext::IsForeign(member))
+        member->ApplyAreaAuraRemove(rec);
+    else
+        sRecordLogs->Append(GetOwner()->GetGUID(), member, RecordKind::AreaAuraRemove, rec);
+}
+
+Unit* Aura::GetAreaOwnerUnit() const
+{
+    if (!m_isAreaClone)
+        return GetOwner()->ToUnit();
+    return ObjectAccessor::GetUnit(*GetOwner(), m_areaOwnerGuid);
 }
 
 // paladin auras of the same spell may coexist on a target (one per caster) so Aura Mastery works
@@ -691,6 +831,9 @@ void Aura::UpdateTargetMap(Unit* caster, bool apply)
     std::map<Unit*, uint8> targets;
 
     FillTargetMap(targets, caster);
+
+    // Step 08 §3: members outside this task group get a clone by record instead of an application here
+    RouteForeignAreaTargets(targets, caster);
 
     UnitList targetsToRemove;
 
@@ -936,6 +1079,18 @@ void Aura::UpdateOwner(uint32 diff, WorldObject* owner)
 
 void Aura::Update(uint32 diff, Unit* caster)
 {
+    // Step 08 §3: a clone the spreading aura stopped refreshing (owner gone, out of range without a remove
+    // record reaching us, owner no longer updating) removes itself
+    if (m_isAreaClone)
+    {
+        m_areaCloneSinceRefreshMs += diff;
+        if (m_areaCloneSinceRefreshMs > AREA_CLONE_TIMEOUT_MS)
+        {
+            Remove();
+            return;
+        }
+    }
+
     if (m_duration > 0)
     {
         m_duration -= diff;
@@ -953,11 +1108,20 @@ void Aura::Update(uint32 diff, Unit* caster)
                 {
                     m_timeCla += 1000 - diff;
 
+                    // Step 08 §2: the aura ticks on its owner's task; a caster outside it pays through a
+                    // PeriodicLandedRecord (Unit::ApplyPeriodicLanded). The "can it still pay" decision is a
+                    // read of the caster handle; the caster clamps again when it applies.
+                    bool const casterForeign = BeatContext::IsForeign(caster);
                     Powers powertype = Powers(m_spellInfo->PowerType);
                     if (powertype == POWER_HEALTH)
                     {
                         if (int32(caster->GetHealth()) > ManaPerSecond)
-                            caster->ModifyHealth(-ManaPerSecond);
+                        {
+                            if (casterForeign)
+                                EmitCasterPerSecondCost(caster, powertype, ManaPerSecond);
+                            else
+                                caster->ModifyHealth(-ManaPerSecond);
+                        }
                         else
                         {
                             Remove();
@@ -967,7 +1131,12 @@ void Aura::Update(uint32 diff, Unit* caster)
                     else
                     {
                         if (int32(caster->GetPower(powertype)) >= ManaPerSecond)
-                            caster->ModifyPower(powertype, -ManaPerSecond);
+                        {
+                            if (casterForeign)
+                                EmitCasterPerSecondCost(caster, powertype, ManaPerSecond);
+                            else
+                                caster->ModifyPower(powertype, -ManaPerSecond);
+                        }
                         else
                         {
                             Remove();
@@ -978,6 +1147,24 @@ void Aura::Update(uint32 diff, Unit* caster)
             }
         }
     }
+}
+
+void Aura::EmitCasterPerSecondCost(Unit* caster, Powers powerType, int32 cost) const
+{
+    Unit* target = GetOwner()->ToUnit();
+    PeriodicLandedRecord rec;
+    rec.target = target ? target->GetGUID() : GetOwner()->GetGUID();
+    rec.caster = caster->GetGUID();
+    rec.spellId = GetId();
+    rec.stackAmount = GetStackAmount();
+    if (powerType == POWER_HEALTH)
+        rec.healthDelta = -cost;
+    else
+    {
+        rec.powerGain = -cost;
+        rec.powerType = uint8(powerType);
+    }
+    sRecordLogs->Append(GetOwner()->GetGUID(), caster, RecordKind::PeriodicLanded, rec);
 }
 
 int32 Aura::CalcMaxDuration(Unit* caster) const
@@ -1319,6 +1506,10 @@ bool Aura::IsRemovedOnShapeLost(Unit* target) const
 bool Aura::CanBeSaved() const
 {
     SpellInfo const* spellInfo = GetSpellInfo();
+
+    // step 08 §3: a clone of someone else's area aura is theirs, not a buff of ours to keep
+    if (IsAreaClone())
+        return false;
 
     if (spellInfo->HasAttribute(SPELL_ATTR0_CU_FORCE_AURA_SAVING))
     {
@@ -3102,8 +3293,8 @@ void UnitAura::FillTargetMap(std::map<Unit*, uint8>& targets, Unit* caster)
         if (!HasEffect(effIndex))
             continue;
         UnitList targetList;
-        // non-area aura
-        if (GetSpellInfo()->Effects[effIndex].Effect == SPELL_EFFECT_APPLY_AURA)
+        // non-area aura; step 08 §3: a clone of an area aura applies to its owner only
+        if (GetSpellInfo()->Effects[effIndex].Effect == SPELL_EFFECT_APPLY_AURA || IsAreaClone())
         {
             targetList.push_back(GetUnitOwner());
         }

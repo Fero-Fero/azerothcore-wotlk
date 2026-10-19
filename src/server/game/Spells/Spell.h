@@ -349,6 +349,9 @@ public:
     SpellLandedRecord& Feedback();
     // Every read of a caster field on the land step (plan §9). On this slice it wraps the live caster.
     [[nodiscard]] UnitView CasterView() const;
+    // Step 08 §2: a periodic tick on another unit's task asked for this cast; the aura is known by ids only.
+    // interruptChannelOnFail keeps prepare()'s "failed periodic trigger of a player ends the channel" rule.
+    void SetTriggeredByAuraSpell(TriggeredByAuraSpellData const& data, bool interruptChannelOnFail);
 
     void EffectNULL(SpellEffIndex effIndex);
     void EffectUnused(SpellEffIndex effIndex);
@@ -868,6 +871,7 @@ public:
     // we can't store original aura link to prevent access to deleted auras
     // and in same time need aura data and after aura deleting.
     TriggeredByAuraSpellData m_triggeredByAuraSpell;
+    bool m_recordedTriggerInterruptsChannel = false;   // step 08 §2, see SetTriggeredByAuraSpell
 
     bool m_skipCheck;
     uint8 m_auraScaleMask;

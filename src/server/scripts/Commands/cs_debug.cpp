@@ -17,6 +17,7 @@
 
 #include "ArenaTeamMgr.h"
 #include "BeatContext.h"
+#include "BeatPool.h"
 #include "AuctionHouseMgr.h"
 #include "Bag.h"
 #include "BattlegroundMgr.h"
@@ -120,7 +121,9 @@ public:
             { "factionchange",  HandleDebugFactionChangeCommand,       rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::Yes},
             { "zonestats",      HandleDebugZoneStatsCommand,           rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::Yes},
             { "slot",           HandleDebugSlotCommand,                rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::No },
-            { "foreignreads",   HandleDebugForeignReadsCommand,        rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::Yes}
+            { "foreignreads",   HandleDebugForeignReadsCommand,        rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::Yes},
+            { "singletons",     HandleDebugSingletonsCommand,          rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::Yes},
+            { "slowtasks",      HandleDebugSlowTasksCommand,           rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::Yes}
         };
         static ChatCommandTable commandTable =
         {
@@ -1462,6 +1465,35 @@ public:
         BeatContext::FlushForeignReads();
         uint64 const count = BeatContext::foreignReadsTotal.exchange(0, std::memory_order_relaxed);
         handler->PSendSysMessage("Foreign live-field reads since last query: {}", count);
+        return true;
+    }
+
+    // Step 13: lock acquisitions of the singletons marked *mutex* in plans/03 since the last query, total and
+    // the share taken inside a beat. A count that scales with population means the kind should be a defer.
+    static bool HandleDebugSingletonsCommand(ChatHandler* handler)
+    {
+        for (uint8 i = 0; i < BeatContext::LOCK_MAX; ++i)
+        {
+            auto const kind = BeatContext::SingletonLock(i);
+            uint64 const total = BeatContext::singletonLocks[i].exchange(0, std::memory_order_relaxed);
+            uint64 const inBeat = BeatContext::singletonLocksInBeat[i].exchange(0, std::memory_order_relaxed);
+            handler->PSendSysMessage("{}: {} lock(s), {} inside a beat", BeatContext::SingletonLockName(kind), total, inBeat);
+        }
+        return true;
+    }
+
+    // Step 12: the ten longest unit tasks of the last beat and the pool's clock line.
+    static bool HandleDebugSlowTasksCommand(ChatHandler* handler)
+    {
+        PoolClock const& c = sBeatPool->LastClock();
+        handler->PSendSysMessage("Beat {}: tasks={} wall={}us task={}us tail={}us view={}us seal_map={}us seal_ser={}us heavy_threshold={}us",
+            sBeatPool->Beat(), c.tasks, c.wall / 1000, c.task / 1000, c.tail / 1000, c.view / 1000,
+            c.sealMap / 1000, c.sealSer / 1000, sBeatPool->HeavyThresholdNs() / 1000);
+
+        for (SlowTask const& task : sBeatPool->LastSlowTasks())
+            handler->PSendSysMessage("  {}{} entry={} map={} {}us (inbox {}us, update {}us, publish {}us)",
+                task.heavy ? "[heavy] " : "", task.guid.ToString(), task.entry, task.mapId, task.ns / 1000,
+                task.inboxNs / 1000, task.updateNs / 1000, task.publishNs / 1000);
         return true;
     }
 

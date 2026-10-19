@@ -3725,6 +3725,13 @@ SpellCastResult Spell::prepare(SpellCastTargets const* targets, AuraEffect const
             SendChannelUpdate(0);
             triggeredByAura->GetBase()->SetDuration(0);
         }
+        // Step 08 §2: the same rule for a trigger a recorded tick asked for. The aura lives on the target's
+        // task; ending the channel here makes the channel's aura removal reach it the usual way.
+        else if (unitCaster && unitCaster->IsPlayer() && m_recordedTriggerInterruptsChannel)
+        {
+            SendChannelUpdate(0);
+            unitCaster->InterruptSpell(CURRENT_CHANNELED_SPELL);
+        }
 
         // Allows to cast melee attack spell if result is SPELL_FAILED_OUT_OF_RANGE
         if (!IsNextMeleeSwingSpell() || result != SPELL_FAILED_OUT_OF_RANGE)

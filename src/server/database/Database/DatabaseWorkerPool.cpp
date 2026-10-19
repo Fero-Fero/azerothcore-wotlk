@@ -492,6 +492,9 @@ T* DatabaseWorkerPool<T>::GetFreeConnection()
         ss << boost::stacktrace::stacktrace();
         LOG_WARN("sql.performances", "Sync query at:\n{}", ss.str());
     }
+
+    // A sync query reached from a unit task parks a core for the round trip (step 11): a crash in debug.
+    ASSERT(!_syncQueryForbidden || !_syncQueryForbidden(), "Synchronous query on a unit task path");
 #endif
 
     uint8 i = 0;
