@@ -948,11 +948,22 @@ private:
     // Written only at the seal (step 12). nullptr means this object is its own task root.
     WorldObject* _taskRoot{nullptr};
     // Non-empty on a root with members (a vehicle's seated units, a charmer's charmed unit).
+    // Owner (step 16 table): the root, by value; allocated on the first TaskGroupJoin, never shrunk (seats <= 8),
+    // freed with the object.
     std::vector<WorldObject*> _taskMembers;
     // Grid the S1a router tagged this object for. -1 unless it is in that grid's pending list.
     int32 _pendingInGrid{-1};
     // Beat this root is scheduled for (BeatPool::Schedule CAS); 0 when not in any ring.
     std::atomic<uint32> _scheduledBeat{0};
+    // Step 14: set by the core that popped this root's item for the duration of its task body. A duplicate
+    // handle that loses the exchange is dropped (second line of defence behind _scheduledBeat).
+    alignas(8) std::atomic<uint8> _claimed{0};
+    bool TryClaim()
+    {
+        uint8 expected = 0;
+        return _claimed.compare_exchange_strong(expected, 1, std::memory_order_acquire, std::memory_order_relaxed);
+    }
+    void Unclaim() { _claimed.store(0, std::memory_order_release); }
     // Duration of this root's last task body, for the heavy ring.
     uint32 _lastTaskNs{0};
 

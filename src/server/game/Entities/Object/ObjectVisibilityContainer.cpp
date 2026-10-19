@@ -20,6 +20,7 @@
 #include "Player.h"
 #include "UnitRecordLog.h"
 #include "UnitRecords.h"
+#include <thread>
 
 /*
 * Some implementation notes:
@@ -123,8 +124,8 @@ VisibleWorldObjectsMap::iterator ObjectVisibilityContainer::UnlinkVisibilityFrom
 
 // Step 10: the target's half of a link. The record form (VisibilityLink / VisibilityUnlink to a foreign unit,
 // applied from its inbox next beat) is wired but not used yet: an object removed at the end of this tick
-// would be freed before the record lands, leaving the viewer's map pointing at it. The view phase runs with
-// no concurrent task until step 14, so the write is direct; step 12 orders the free after the inbox.
+// would be freed before the record lands, leaving the viewer's map pointing at it. The write stays direct;
+// step 14 made it safe under concurrent view commits with the one-byte spinlock in the two Direct*Player* writers.
 namespace
 {
     constexpr bool USE_VISIBILITY_LINK_RECORDS = false;
@@ -178,12 +179,28 @@ void ObjectVisibilityContainer::DirectRemoveVisibilityReference(ObjectGuid guid)
     (*_visibleWorldObjectsMap).erase(guid);
 }
 
+namespace
+{
+    struct PlayersLockScope
+    {
+        explicit PlayersLockScope(std::atomic_flag& flag) : _flag(flag)
+        {
+            while (_flag.test_and_set(std::memory_order_acquire))
+                std::this_thread::yield();
+        }
+        ~PlayersLockScope() { _flag.clear(std::memory_order_release); }
+        std::atomic_flag& _flag;
+    };
+}
+
 void ObjectVisibilityContainer::DirectInsertVisiblePlayerReference(Player* player)
 {
+    PlayersLockScope lock(_playersLock);
     _visiblePlayersMap.insert(std::make_pair(player->GetGUID(), player));
 }
 
 void ObjectVisibilityContainer::DirectRemoveVisiblePlayerReference(ObjectGuid guid)
 {
+    PlayersLockScope lock(_playersLock);
     _visiblePlayersMap.erase(guid);
 }

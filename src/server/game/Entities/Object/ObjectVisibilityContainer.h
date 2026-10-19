@@ -20,6 +20,7 @@
 
 #include "Common.h"
 #include "ObjectGuid.h"
+#include <atomic>
 #include <memory>
 #include <unordered_map>
 
@@ -93,6 +94,11 @@ private:
     // List of players who are currently able to see this worldobject.
     // All worldobjects will contain this map
     VisiblePlayersMap _visiblePlayersMap;
+
+    // Step 14: view commits run concurrently in U2 and several viewers may link / unlink the same target in
+    // the same phase. The target's map is only ever read by its owner (U1, seal), never in U2, so a one-byte
+    // spinlock around the two direct writes is the whole protocol; held for one hash-map op.
+    std::atomic_flag _playersLock = ATOMIC_FLAG_INIT;
 };
 
 #endif

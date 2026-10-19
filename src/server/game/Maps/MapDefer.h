@@ -18,8 +18,11 @@
 #ifndef ACORE_MAP_DEFER_H
 #define ACORE_MAP_DEFER_H
 
+#include "BeatContext.h"
 #include "Define.h"
 #include "ObjectGuid.h"
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <type_traits>
 #include <vector>
@@ -117,6 +120,7 @@ struct RelinkDefer
 struct GridLoadDefer
 {
     uint32 cell = 0;        // Cell::data.All
+    uint8 objects = 1;      // 1: EnsureGridLoaded (terrain + objects); 0: EnsureGridCreated (terrain only)
 };
 
 struct AddToMapDefer
@@ -269,7 +273,8 @@ static_assert(std::is_trivially_copyable_v<GameEventActionDefer>, "defer payload
 static_assert(std::is_trivially_copyable_v<SpawnDefer>, "defer payloads are plain values");
 
 // Append-only byte buffer of defers written by one map in one tick. Resident: reserved once, grows only on
-// spill. Step 14 makes one per core; on this step each Map owns one.
+// spill. Owner (step 16 table): Map::_defers, a DeferBufferSet with one buffer per core; allocated on the first
+// append from that core, reset (capacity kept) at every seal, freed with the map.
 class DeferBuffer
 {
 public:
@@ -289,6 +294,8 @@ public:
     void Reset();
 
     [[nodiscard]] std::size_t Size() const { return _size; }
+    [[nodiscard]] std::size_t Capacity() const { return _bytes.size(); }
+    [[nodiscard]] std::size_t HighWater() const { return _highWater; }
     [[nodiscard]] uint32 Count() const { return _sequence; }
     [[nodiscard]] uint32 Spills() const { return _spills; }
 
@@ -298,9 +305,73 @@ private:
 
     std::vector<uint8> _bytes;
     std::size_t _size = 0;
+    std::size_t _highWater = 0;
     std::size_t _block = 0;
     uint32 _sequence = 0;
     uint32 _spills = 0;
+};
+
+// Step 14: one DeferBuffer per core for one map. Tasks of one map run on every core at once, so each core
+// appends to its own buffer; the seal drains them all and orders by sequence (per-core order is kept, cross-core
+// order was never defined). Buffers allocate on their first append, so an idle core costs a few words.
+class DeferBufferSet
+{
+public:
+    static constexpr uint8 MAX_CORES = 64;
+
+    template <typename T>
+    void Append(Map* map, DeferKind kind, T const& payload)
+    {
+        _buffers[std::min<uint8>(BeatContext::core, MAX_CORES - 1)].Append(map, kind, payload);
+    }
+
+    void DrainInto(std::vector<DeferHeader const*>& out) const
+    {
+        for (DeferBuffer const& buffer : _buffers)
+            if (buffer.Size())
+                buffer.DrainInto(out);
+    }
+
+    void Reset()
+    {
+        for (DeferBuffer& buffer : _buffers)
+            if (buffer.Size() || buffer.Count())
+                buffer.Reset();
+    }
+
+    [[nodiscard]] uint32 Count() const
+    {
+        uint32 count = 0;
+        for (DeferBuffer const& buffer : _buffers)
+            count += buffer.Count();
+        return count;
+    }
+
+    // Step 16: resident bytes, the largest fill any seal drained, and how many cores ever appended.
+    [[nodiscard]] std::size_t Capacity() const
+    {
+        std::size_t bytes = 0;
+        for (DeferBuffer const& buffer : _buffers)
+            bytes += buffer.Capacity();
+        return bytes;
+    }
+    [[nodiscard]] std::size_t HighWater() const
+    {
+        std::size_t bytes = 0;
+        for (DeferBuffer const& buffer : _buffers)
+            bytes += buffer.HighWater();
+        return bytes;
+    }
+    [[nodiscard]] uint8 Allocated() const
+    {
+        uint8 n = 0;
+        for (DeferBuffer const& buffer : _buffers)
+            n += buffer.Capacity() ? 1 : 0;
+        return n;
+    }
+
+private:
+    std::array<DeferBuffer, MAX_CORES> _buffers;
 };
 
 #endif

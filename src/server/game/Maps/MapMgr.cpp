@@ -18,6 +18,7 @@
 #include "MapMgr.h"
 #include "BeatContext.h"
 #include "BeatPool.h"
+#include "MapTree.h"
 #include "Chat.h"
 #include "DatabaseEnv.h"
 #include "GridDefines.h"
@@ -60,16 +61,31 @@ void MapMgr::Initialize()
 {
     int num_threads(sWorld->getIntConfig(CONFIG_NUMTHREADS));
 
-    // One record log per core: the world thread plus every map update worker.
-    uint8 const cores = uint8(std::clamp(num_threads, 0, 63) + 1);
+    // Step 14: the pool has MapUpdate.PhaseThreads cores (the world thread is core 0). The record logs are
+    // indexed by BeatContext::core, which the startup grid preload threads (MapUpdate.Threads) also carry, so
+    // they are sized for whichever set is larger; preloads never overlap a beat.
+    uint32 const key = std::clamp<uint32>(sWorld->getIntConfig(CONFIG_MAPUPDATE_PHASE_THREADS), 1, 64);
+    uint8 const cores = uint8(std::max<uint32>(key, std::clamp(num_threads, 0, 63) + 1));
     sRecordLogs->Init(cores);
     sRecordLogs->BeginBeat(BeatContext::beat.load(std::memory_order_relaxed));
 
-    // Step 12: the beat loop runs on the world thread at one core; step 14 gives the pool its workers. The
-    // updater threads only serve the grid preloads at startup.
-    sBeatPool->Init(1);
+    sBeatPool->Init(uint8(key));
+
+    // Writes to the shared vmap tree / nav mesh (tile installs) are legal in a seal task or outside a beat.
+    VMAP::SetGeometryWriteCheck([]() { return BeatContext::InSealTask() || !BeatContext::InBeat(); });
+
+    // The updater threads only serve the grid preloads at startup.
     if (num_threads > 0)
         m_updater.activate(num_threads);
+}
+
+void MapMgr::StartBeatPool()
+{
+    // After the world loaded and the grid preloads finished: the workers exist from here to UnloadAll.
+    if (m_updater.activated())
+        m_updater.wait();
+    if (sBeatPool->Cores() > 1)
+        sBeatPool->Start();
 }
 
 void MapMgr::InitializeVisibilityDistanceInfo()
@@ -325,6 +341,8 @@ bool MapMgr::IsValidMAP(uint32 mapid, bool startUp)
 void MapMgr::UnloadAll()
 {
     ASSERT_NOT_IN_TASK();
+    // Workers first: the maps below are freed with no beat running and nothing to steal.
+    sBeatPool->Stop();
     for (MapMapType::iterator iter = i_maps.begin(); iter != i_maps.end();)
     {
         iter->second->UnloadAll();
@@ -334,6 +352,10 @@ void MapMgr::UnloadAll()
 
     if (m_updater.activated())
         m_updater.deactivate();
+
+    // Step 16: the record logs' owner frees them once no map can append (an append after this re-initialises
+    // a one-core set, as before Initialize).
+    sRecordLogs->Shutdown();
 }
 
 void MapMgr::GetNumInstances(uint32& dungeons, uint32& battlegrounds, uint32& arenas)

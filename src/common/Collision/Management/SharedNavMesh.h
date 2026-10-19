@@ -20,22 +20,18 @@
 
 #include "Define.h"
 #include "DetourNavMesh.h"
+#include "Errors.h"
+#include "MapTree.h"
 #include <atomic>
 #include <memory>
-#include <shared_mutex>
-#include <thread>
 #include <utility>
 
 // One holder per map id for the dtNavMesh shared by every instance of that map.
 //
-// Readers (path searches, GM inspection) never touch the mutex: they bump an
-// in-flight counter through NavMeshQueryScope. Writers (tile loads) take the
-// mutex exclusively and then wait for the counter to drain before touching the
-// mesh. Tile loads happen on grid creation only, so writer starvation is not a
-// practical concern.
-//
-// Lock order: MapGridManager::_gridLock -> StaticMapTree::_mutex -> this.
-// Nothing takes _gridLock while inside Write().
+// Step 14: readers (path searches, GM inspection) take nothing. Tiles install only inside a map seal task,
+// when no unit task runs, so a writer never meets a reader; a counter or lock on the query path would be one
+// cache line bouncing between every core that paths. In debug builds NavMeshQueryScope still counts the
+// in-flight queries so Write can assert that there are none instead of waiting for them.
 class SharedNavMesh
 {
 public:
@@ -47,33 +43,39 @@ public:
     // Read side. Pair every EnterQuery with LeaveQuery; prefer NavMeshQueryScope.
     dtNavMesh const* EnterQuery() const
     {
-        _queries.fetch_add(1, std::memory_order_acq_rel);
+#if defined(ACORE_DEBUG)
+        _queries.fetch_add(1, std::memory_order_relaxed);
+#endif
         return _mesh.get();
     }
 
     void LeaveQuery() const
     {
-        _queries.fetch_sub(1, std::memory_order_release);
+#if defined(ACORE_DEBUG)
+        _queries.fetch_sub(1, std::memory_order_relaxed);
+#endif
     }
 
-    // Write side: exclusive lock, drain in-flight queries, then run fn(dtNavMesh*).
+    // Write side: legal in a seal task or outside a beat only, with no query in flight; then runs fn(dtNavMesh*).
     template <typename F>
     auto Write(F&& fn)
     {
-        std::unique_lock<std::shared_mutex> lock(_mutex);
-        while (_queries.load(std::memory_order_acquire) != 0)
-            std::this_thread::yield();
-
+        ASSERT(VMAP::GeometryWriteAllowed(), "nav mesh written outside a seal task while a beat runs");
+#if defined(ACORE_DEBUG)
+        ASSERT(_queries.load(std::memory_order_relaxed) == 0, "nav mesh written with {} queries in flight",
+            _queries.load(std::memory_order_relaxed));
+#endif
         return std::forward<F>(fn)(_mesh.get());
     }
 
-    // Unguarded access. Only for code that runs when no query can be in flight.
+    // The raw mesh. Safe wherever a query is: tiles only install in a seal task.
     dtNavMesh const* UnsafeGet() const { return _mesh.get(); }
 
 private:
     std::shared_ptr<dtNavMesh> _mesh;
-    mutable std::shared_mutex _mutex;
+#if defined(ACORE_DEBUG)
     mutable std::atomic<uint32> _queries{0};
+#endif
 };
 
 // RAII around EnterQuery/LeaveQuery. `ptr` is valid for the lifetime of the scope only.

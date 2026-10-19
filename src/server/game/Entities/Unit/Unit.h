@@ -2208,10 +2208,21 @@ public:
     // Movement info
     Movement::MoveSpline* movespline;
 
+    // Step 17 (crowd buffer): the public-only values block of this unit from a slot, block header included,
+    // built once per beat by the cell's crowd item and copied by every viewer the block applies to.
+    void BuildPublicValuesBlock(ObjectSlot const& slot, BuildValuesCachedBuffer& out);
+    // True when `viewer` would get exactly the public fields of this unit (not itself, not an owner or raid
+    // member, no empathy), so the shared block plus PatchValuesUpdate equals its own build.
+    [[nodiscard]] bool SharedBlockApplies(ObjectSlot const& slot, Player const* viewer) const;
+    // Copies a shared block, patches the per-viewer indices for `viewer`, appends it to `data`.
+    void AppendSharedValuesBlock(BuildValuesCachedBuffer const& shared, UpdateData* data, Player* viewer, ObjectSlot const& slot);
+
 protected:
     explicit Unit();
 
     void BuildValuesUpdateFrom(uint8 updateType, ByteBuffer* data, Player* target, UpdateValuesSource const& src) override;
+    // The loop of BuildValuesUpdateFrom: mask + fields for `visibleFlag` into `out`, pos pointers relative to out.buffer.
+    void BuildValuesCacheEntry(uint8 updateType, uint32 visibleFlag, UpdateValuesSource const& src, BuildValuesCachedBuffer& out);
     void FillSlot(ObjectSlot& slot) override;
     void PrepareRemovalForeign() override;
     void PrepareRemovalOwn() override;

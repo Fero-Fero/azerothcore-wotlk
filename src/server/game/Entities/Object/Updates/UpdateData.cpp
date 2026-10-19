@@ -74,3 +74,14 @@ void UpdateData::Clear()
     m_outOfRangeGUIDs.clear();
     m_blockCount = 0;
 }
+
+void UpdateData::Compact(std::size_t maxBytes)
+{
+    if (m_data.capacity() > maxBytes)
+    {
+        ByteBuffer empty;
+        m_data = std::move(empty);
+    }
+    if (m_outOfRangeGUIDs.capacity() * sizeof(ObjectGuid) > maxBytes)
+        GuidVector().swap(m_outOfRangeGUIDs);
+}

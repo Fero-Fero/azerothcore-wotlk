@@ -15,6 +15,7 @@
  * with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "BeatPool.h"
 #include "DBCStores.h"
 #include "DetourNavMeshQuery.h"
 #include "DisableMgr.h"
@@ -175,13 +176,8 @@ bool DynamicVMapCollisionData::GetObjectHitPos(uint32 phasemask, float x1, float
     return result;
 }
 
-dtNavMeshQuery const* MMapData::GetNavMeshQuery()
+MapCollisionData::~MapCollisionData()
 {
-    if (_navMesh && !_navMeshQuery)
-    {
-        NavMeshQueryScope scope(*_navMesh);
-        _navMeshQuery = MMAP::MMapMgr::CreateNavMeshQuery(scope.ptr);
-    }
-
-    return _navMeshQuery.get();
+    if (_mmapData._navMesh && _mmapData._navMesh.use_count() == 1)
+        sBeatPool->ForgetNavMesh(*_mmapData._navMesh);
 }

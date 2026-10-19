@@ -147,7 +147,7 @@ class PathGenerator
 
         WorldObject const* const _source;       // the object that is moving
         SharedNavMesh const* _navMesh;          // the nav mesh holder; the raw mesh is only read inside a NavMeshQueryScope
-        dtNavMeshQuery const* _navMeshQuery;    // the nav mesh query used to find the path
+        dtNavMeshQuery const* _navMeshQuery;    // this core's query on _navMesh (BeatPool::NavQueryFor)
 
         dtQueryFilterExt _filter;  // use single filter for all movements, update it when needed
 
@@ -166,6 +166,10 @@ class PathGenerator
         [[nodiscard]] bool HaveTile(dtNavMesh const* navMesh, G3D::Vector3 const& p) const;
 
         void BuildPolyPath(dtNavMesh const* navMesh, G3D::Vector3 const& startPos, G3D::Vector3 const& endPos);
+        // findPath under the per-beat node-expansion budget (CONFIG_PATH_ITER_BUDGET, step 14): a search that
+        // runs out returns the leg to the explored polygon closest to the goal with DT_PARTIAL_RESULT.
+        dtStatus FindPathBudgeted(dtPolyRef startPoly, dtPolyRef endPoly, float const* startPoint, float const* endPoint,
+            dtPolyRef* path, int* pathCount, int maxPath);
         void BuildPointPath(dtNavMesh const* navMesh, float const* startPoint, float const* endPoint);
         void BuildShortcut();
 

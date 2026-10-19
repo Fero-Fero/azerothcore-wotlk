@@ -464,6 +464,8 @@ public:
         _storage.shrink_to_fit();
     }
 
+    [[nodiscard]] std::size_t capacity() const { return _storage.capacity(); }
+
     void append(char const* src, std::size_t cnt)
     {
         return append((uint8 const*)src, cnt);

@@ -17,7 +17,9 @@
 
 #include "AchievementMgr.h"
 #include "BattlefieldMgr.h"
+#include "BeatPool.h"
 #include "CellImpl.h"
+#include "CrowdBuffer.h"
 #include "Channel.h"
 #include "ChannelMgr.h"
 #include "DynamicVisibility.h"
@@ -44,6 +46,7 @@
 #include "WeatherMgr.h"
 #include "WorldState.h"
 #include "WorldStatePackets.h"
+#include <chrono>
 
 /// @todo: this import is not necessary for compilation and marked as unused by the IDE
 //  however, for some reasons removing it would cause a damn linking issue
@@ -54,12 +57,24 @@
 // Zone Interval should be 1 second
 constexpr auto ZONE_UPDATE_INTERVAL = 1000;
 
+// Step 16: a ViewWork packet buffer above this is given back after the commit (normal beats are far below it).
+constexpr std::size_t VIEW_UPDATE_DATA_CAP = 64 * 1024;
+
 void Player::Update(uint32 p_time)
 {
     if (!IsInWorld())
         return;
 
     sScriptMgr->OnPlayerBeforeUpdate(this, p_time);
+
+    // The pet left visibility range in the last view phase (ViewCommit, U2); the removal is this task's write.
+    if (_view.petLeftRange)
+    {
+        _view.petLeftRange = false;
+        if (Pet* pet = GetPet())
+            if (!HaveAtClient(pet))
+                pet->Remove(PET_SAVE_NOT_IN_SLOT, true);
+    }
 
     // undelivered mail
     if (m_nextMailDelivereTime && m_nextMailDelivereTime <= GameTime::GetGameTime().count())
@@ -1790,6 +1805,10 @@ void Player::ViewBuild(ViewWork& work, uint32 chunk)
         }
     }
 
+    // Step 17 (optional): a player in a crowded cell has its public block built once by the cell's crowd item.
+    bool const crowd = sWorld->getBoolConfig(CONFIG_CROWD_BUFFER);
+    Map const* map = GetMap();
+
     VisibleWorldObjectsMap const& visible = *GetObjectVisibilityContainer().GetVisibleWorldObjectsMap();
     uint32 const buckets = visible.bucket_count();
     uint32 const from = buckets * chunk / work.chunkCount;
@@ -1800,12 +1819,28 @@ void Player::ViewBuild(ViewWork& work, uint32 chunk)
         {
             WorldObject* obj = it->second;
             ObjectSlot const& s = obj->ReadSlot();
-            if (s.beat == work.slotBeat && s.AnyChange())
-                obj->BuildValuesUpdateFromSlot(s, &data, this);
+            if (s.beat != work.slotBeat || !s.AnyChange())
+                continue;
+
+            if (crowd && obj->IsPlayer())
+                if (CrowdBuffer const* buffer = map->FindCrowdBuffer(s.cellId))
+                {
+                    Unit* unit = obj->ToUnit();
+                    if (unit->SharedBlockApplies(s, this))
+                    {
+                        buffer->WaitReady();
+                        if (BuildValuesCachedBuffer const* block = buffer->Find(obj->GetGUID()))
+                        {
+                            unit->AppendSharedValuesBlock(*block, &data, this, s);
+                            BeatPool::CountCrowdCopy();
+                            continue;
+                        }
+                    }
+                }
+
+            obj->BuildValuesUpdateFromSlot(s, &data, this);
         }
     }
-
-    work.chunksDone.fetch_add(1, std::memory_order_release);
 }
 
 void Player::ViewCommit(ViewWork& work)
@@ -1816,9 +1851,17 @@ void Player::ViewCommit(ViewWork& work)
 
     for (WorldObject* obj : work.delta.left)
     {
+        // Step 14: the commit runs in U2 on any core, concurrently with other viewers' commits that may be
+        // reading this pet (GetInitialVisiblePackets). RemovePet writes the pet (CombatStop, auras), so inside a
+        // beat it waits for the owner's next unit task; outside one (login, teleport) it runs now as before.
         if (Creature* creature = obj->ToCreature())
             if (GetPetGUID() == creature->GetGUID() && creature->IsPet())
-                ((Pet*)creature)->Remove(PET_SAVE_NOT_IN_SLOT, true);
+            {
+                if (BeatContext::InBeat())
+                    work.petLeftRange = true;
+                else
+                    ((Pet*)creature)->Remove(PET_SAVE_NOT_IN_SLOT, true);
+            }
 
         obj->BuildOutOfRangeUpdateBlock(&data);
         GetObjectVisibilityContainer().UnlinkWorldObjectVisibility(obj);
@@ -1834,6 +1877,7 @@ void Player::ViewCommit(ViewWork& work)
     {
         data.AddUpdateBlock(work.chunkData[chunk]);
         work.chunkData[chunk].Clear();
+        work.chunkData[chunk].Compact(VIEW_UPDATE_DATA_CAP);
     }
 
     if (data.HasData())
@@ -1846,6 +1890,8 @@ void Player::ViewCommit(ViewWork& work)
         }
         data.Clear();
     }
+    // Step 16: the per-beat packet buffers keep their capacity up to this cap; a burst above it is returned.
+    data.Compact(VIEW_UPDATE_DATA_CAP);
 
     // Auras and attack state of units that just appeared, after their create block.
     for (WorldObject* obj : work.delta.entered)
@@ -1860,24 +1906,61 @@ void Player::ViewCommit(ViewWork& work)
 
 void Player::RunViewPhase()
 {
+    BeginViewPhase(1);
+    RunViewChunk(0);
+}
+
+void Player::BeginViewPhase(uint32 chunkCount)
+{
+    ViewWork& work = _view;
+    work.slotBeat = BeatContext::beat.load(std::memory_order_relaxed);
+    work.chunkCount = std::max<uint32>(chunkCount, 1);
+    work.chunksDone.store(0, std::memory_order_relaxed);
+    // Capacity is retained across beats; after the first beat these are no-ops.
+    work.chunkData.resize(work.chunkCount);
+    work.chunkNs.assign(work.chunkCount, 0);
+}
+
+void Player::RunViewChunk(uint32 chunk)
+{
     if (!IsInWorld())
         return;
 
     ViewWork& work = _view;
-    work.slotBeat = BeatContext::beat.load(std::memory_order_relaxed);
+    uint64 const t0 = uint64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
 
-    if (work.scanDue)
-        ViewScan(work);
+    if (chunk == 0)
+    {
+        if (work.scanDue)
+            ViewScan(work);
 
-    // Re-evaluate what asked for it (a scan that reached the object already decided; ViewCollect dedups).
-    for (ObjectGuid guid : work.pokes)
-        if (WorldObject* obj = ObjectAccessor::GetWorldObject(*this, guid))
-            ViewCollect(obj, work);
-    work.pokes.clear();
-    work.scanDue = work.scanForced = work.gobjOnly = false;
+        // Re-evaluate what asked for it (a scan that reached the object already decided; ViewCollect dedups).
+        for (ObjectGuid guid : work.pokes)
+            if (WorldObject* obj = ObjectAccessor::GetWorldObject(*this, guid))
+                ViewCollect(obj, work);
+        work.pokes.clear();
+        work.scanDue = work.scanForced = work.gobjOnly = false;
+    }
 
-    ViewBuild(work, 0);
-    ViewCommit(work);
+    // The visible map is read-only until the commit; chunks of one viewer only ever write their own
+    // chunkData / chunkNs entry.
+    ViewBuild(work, chunk);
+
+    uint64 const dt = uint64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count()) - t0;
+    if (chunk < work.chunkNs.size())
+        work.chunkNs[chunk] = uint32(std::min<uint64>(dt, 0xFFFFFFFFu));
+
+    // Last finisher commits: it sees every other chunk's blocks through the acq_rel on chunksDone.
+    if (work.chunksDone.fetch_add(1, std::memory_order_acq_rel) + 1 == work.chunkCount)
+    {
+        uint32 total = 0;
+        for (uint32 ns : work.chunkNs)
+            total += ns;
+        work.lastNs = total;
+        ViewCommit(work);
+    }
 }
 
 void Player::UpdateObjectVisibility(bool forced, bool fromUpdate)
@@ -1900,6 +1983,9 @@ void Player::UpdateObjectVisibility(bool forced, bool fromUpdate)
     }
 }
 
+// Runs in the view commit (U2): every unit is quiescent there (U1 complete, nothing in U2 writes a unit), so
+// the target's live aura list, state and victim handle are read-only snapshots of the beat; packets go to
+// this player's own session.
 void Player::GetInitialVisiblePackets(Unit* target)
 {
     GetAurasForTarget(target);

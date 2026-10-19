@@ -101,6 +101,7 @@ namespace MMAP
         {
             LOG_ERROR("maps", "MMAP:loadMap: Bad header or data in mmap {:03}{:02}{:02}.mmtile", mapId, x, y);
             fclose(file);
+            dtFree(data);   // step 16: the tile buffer is ours until addTile takes it
             return false;
         }
 

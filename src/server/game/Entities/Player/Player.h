@@ -2460,17 +2460,21 @@ public:
     {
         uint32 slotBeat = 0;                          // slot stamp that counts as "changed this beat"
         uint32 chunkCount = 1;                        // step 14: > 1 for a crowded viewer
+        uint32 lastNs = 0;                            // Σ chunk durations of the last view phase (chunking input)
         std::atomic<uint32> chunksDone{0};
         std::vector<UpdateData> chunkData;            // one per chunk; chunk 0 also takes the delta's blocks
+        std::vector<uint32> chunkNs;                  // duration of each chunk this phase, summed into lastNs
         VisibilityDelta delta;
         std::unordered_set<ObjectGuid> seen;          // objects the current phase already decided on
         std::vector<ObjectGuid> pokes;                // objects to re-evaluate (VisibilityPoke records)
         bool scanDue = false;                         // the relocation timer fired or a scan was requested
         bool scanForced = false;                      // skip the minimum-move-distance check
         bool gobjOnly = false;                        // map change: grid visit limited to game objects
+        bool petLeftRange = false;                    // step 14: the pet went out of range in U2; removed in the next U1
     };
 
     ViewWork& View() { return _view; }
+    ViewWork const& View() const { return _view; }
     void RequestViewScan(bool forced, bool gobjOnly = false);
     // Per visited object: decide from its slot, record the decision in `work.delta`.
     void ViewCollect(WorldObject* target, ViewWork& work);
@@ -2484,6 +2488,10 @@ public:
     void ViewCommit(ViewWork& work);
     // Scan if due, pokes, build chunk 0, commit. Called by the pool's view phase (U2) after every object published.
     void RunViewPhase();
+    // Step 14: the owner's U1 task fixes the chunk count and the slot stamp; each chunk then runs on any core.
+    // Chunk 0 scans and handles the pokes, every chunk builds its bucket range, the last to finish commits.
+    void BeginViewPhase(uint32 chunkCount);
+    void RunViewChunk(uint32 chunk);
 
     // Items whose fields changed since the last view phase; their values blocks go in the owner's packet.
     void AddChangedItem(Item* item) { _changedItems.insert(item); }
@@ -3122,6 +3130,8 @@ private:
 
     Optional<float> _farSightDistance = { };
 
+    // Owner (step 16 table): the player, by value; chunkData has one UpdateData per chunk (<= cores), each kept
+    // up to VIEW_UPDATE_DATA_CAP after a commit; delta / seen / pokes keep their capacity. Freed with the player.
     ViewWork _view;
     std::unordered_set<Item*> _changedItems;
 

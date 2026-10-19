@@ -1071,6 +1071,10 @@ void World::SetInitialWorldSettings()
             sMapMgr->GetMapUpdater()->wait();
     }
 
+    // Step 14: the beat pool's workers start once everything is loaded; a dry run never starts them.
+    if (!sConfigMgr->isDryRun())
+        sMapMgr->StartBeatPool();
+
     uint32 startupDuration = GetMSTimeDiffToNow(startupBegin);
 
     LOG_INFO("server.loading", " ");

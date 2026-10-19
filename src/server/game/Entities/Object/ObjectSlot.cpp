@@ -16,6 +16,8 @@
  */
 
 #include "ObjectSlot.h"
+#include "BeatContext.h"
+#include "Errors.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "Unit.h"
@@ -32,68 +34,75 @@ namespace
 void ObjectSlotPair::Init(uint16 valuesCount, bool isUnit)
 {
     uint32 const maskWords = (valuesCount + 31) / 32;
-    uint32 const wordsPerSlot = valuesCount + maskWords;
+    _valuesWords = valuesCount + maskWords;
 
-    _storage = std::make_unique<uint32[]>(wordsPerSlot * 2);
-    std::memset(_storage.get(), 0, wordsPerSlot * 2 * sizeof(uint32));
+    _storage = std::make_unique<uint32[]>(_valuesWords * 2);
+    std::memset(_storage.get(), 0, _valuesWords * 2 * sizeof(uint32));
 
     for (uint32 i = 0; i < 2; ++i)
     {
         _slot[i].valuesCount = valuesCount;
-        _slot[i].values = _storage.get() + i * wordsPerSlot;
+        _slot[i].values = _storage.get() + i * _valuesWords;
         _slot[i].changesMask = _slot[i].values + valuesCount;
     }
 
     if (isUnit)
-        EnsureAuraCapacity(valuesCount >= PLAYER_END ? INITIAL_PLAYER_AURA_CAPACITY : INITIAL_UNIT_AURA_CAPACITY);
+    {
+        // Both slots at the initial capacity, so the first beats grow nothing.
+        uint32 const initial = valuesCount >= PLAYER_END ? INITIAL_PLAYER_AURA_CAPACITY : INITIAL_UNIT_AURA_CAPACITY;
+        for (uint32 i = 0; i < 2; ++i)
+        {
+            _auraStorage[i] = std::make_unique<SlotAura[]>(initial);
+            _auraCapacity[i] = initial;
+            _slot[i].auras = _auraStorage[i].get();
+        }
+    }
 }
 
+// The write slot is the only one touched: its previous content is about to be overwritten by FillSlot, and the
+// published slot (which a view chunk or a foreign reader may be walking right now) keeps its own array. Growth
+// is therefore legal mid-beat (step 16); the old array is freed here because nobody can hold it: the write slot
+// was last read two beats ago, before this object's previous publish moved the stamp.
 void ObjectSlotPair::EnsureAuraCapacity(uint32 count)
 {
-    if (count <= _auraCapacity)
+    uint32 const w = WriteIndex();
+    if (count <= _auraCapacity[w])
         return;
 
-    uint32 capacity = std::max<uint32>(_auraCapacity, INITIAL_UNIT_AURA_CAPACITY);
+    uint32 capacity = std::max<uint32>(_auraCapacity[w], INITIAL_UNIT_AURA_CAPACITY);
     while (capacity < count)
         capacity *= 2;
 
-    auto storage = std::make_unique<SlotAura[]>(capacity * 2);
-
-    // Keep the readable slot's auras valid across the grow. The write slot is about to be refilled.
-    for (uint32 i = 0; i < 2; ++i)
-    {
-        SlotAura* dst = storage.get() + i * capacity;
-        if (_slot[i].auras && _slot[i].auraCount)
-            std::copy_n(_slot[i].auras, std::min(_slot[i].auraCount, _auraCapacity), dst);
-        _slot[i].auras = dst;
-    }
-
-    _auraStorage = std::move(storage);
-    _auraCapacity = capacity;
+    _auraStorage[w] = std::make_unique<SlotAura[]>(capacity);
+    _auraCapacity[w] = capacity;
+    _slot[w].auras = _auraStorage[w].get();
+    _slot[w].auraCount = 0;
+    ++_regrowths;
 }
 
 void ObjectSlotPair::EnsureMovementCapacity(uint32 bytes)
 {
-    if (bytes <= _movementCapacity)
+    uint32 const w = WriteIndex();
+    if (bytes <= _movementCapacity[w])
         return;
 
-    uint32 capacity = std::max<uint32>(_movementCapacity, 64);
+    uint32 capacity = std::max<uint32>(_movementCapacity[w], 64);
     while (capacity < bytes)
         capacity *= 2;
 
-    auto storage = std::make_unique<uint8[]>(capacity * 2);
+    _movementStorage[w] = std::make_unique<uint8[]>(capacity);
+    _movementCapacity[w] = capacity;
+    _slot[w].movementBlock = _movementStorage[w].get();
+    _slot[w].movementBlockSize = 0;
+    ++_regrowths;
+}
 
-    // Keep the readable slot's block valid across the grow. The write slot is about to be refilled.
+std::size_t ObjectSlotPair::HeapBytes() const
+{
+    std::size_t bytes = _storage ? std::size_t(_valuesWords) * 2 * sizeof(uint32) : 0;
     for (uint32 i = 0; i < 2; ++i)
-    {
-        uint8* dst = storage.get() + i * capacity;
-        if (_slot[i].movementBlock && _slot[i].movementBlockSize)
-            std::copy_n(_slot[i].movementBlock, std::min<uint32>(_slot[i].movementBlockSize, _movementCapacity), dst);
-        _slot[i].movementBlock = dst;
-    }
-
-    _movementStorage = std::move(storage);
-    _movementCapacity = capacity;
+        bytes += std::size_t(_auraCapacity[i]) * sizeof(SlotAura) + _movementCapacity[i];
+    return bytes;
 }
 
 SlotIndexAllocator* SlotIndexAllocator::instance()
@@ -104,11 +113,15 @@ SlotIndexAllocator* SlotIndexAllocator::instance()
 
 uint32 SlotIndexAllocator::Allocate()
 {
+    uint32 const beat = BeatContext::beat.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> guard(_lock);
-    if (!_free.empty())
+    // Oldest release first; an index freed in this beat is skipped (its record heads are still addressable),
+    // a fresh one is taken instead. The list is in release order, so the front is the oldest.
+    if (!_free.empty() && _free.front().beat < beat)
     {
-        uint32 index = _free.back();
-        _free.pop_back();
+        uint32 const index = _free.front().index;
+        _free.pop_front();
+        ASSERT(index < _next);
         return index;
     }
     return _next++;
@@ -120,13 +133,19 @@ void SlotIndexAllocator::Release(uint32 index)
         return;
 
     std::lock_guard<std::mutex> guard(_lock);
-    _free.push_back(index);
+    _free.push_back(Freed{ index, BeatContext::beat.load(std::memory_order_relaxed) });
 }
 
 uint32 SlotIndexAllocator::Capacity() const
 {
     std::lock_guard<std::mutex> guard(_lock);
     return _next;
+}
+
+uint32 SlotIndexAllocator::FreeCount() const
+{
+    std::lock_guard<std::mutex> guard(_lock);
+    return uint32(_free.size());
 }
 
 SlotAura const* SlotReader::FindAura(uint32 spellId, ObjectGuid caster) const

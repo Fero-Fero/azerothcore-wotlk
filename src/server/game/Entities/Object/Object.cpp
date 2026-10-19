@@ -1454,9 +1454,12 @@ void WorldObject::ApplyInbox()
 void WorldObject::ApplyRecords(std::vector<RecordHeader const*> const& records)
 {
     for (RecordHeader const* hdr : records)
+    {
+        RecordChain::ApplyScope chain(hdr->depth);
         if (!ApplyCommonRecord(*hdr, reinterpret_cast<uint8 const*>(hdr) + RECORD_HEADER_SIZE))
             LOG_DEBUG("maps.records", "{} dropped record {} from {}: no applier on this object type",
                 GetGUID().ToString(), RecordKindName(hdr->kind), hdr->source.ToString());
+    }
 }
 
 bool WorldObject::ApplyCommonRecord(RecordHeader const& header, uint8 const* payload)
@@ -1546,7 +1549,7 @@ void WorldObject::RemoveFromWorld()
     }
 
     // The index goes back in seal phase S2 so a record addressed this beat is not misdelivered (step 12).
-    sBeatPool->_slotIndicesToReturn.push_back(_slots.SlotIndex());
+    sBeatPool->ReturnSlotIndex(_slots.SlotIndex());
     _slots.SetSlotIndex(ObjectSlotPair::NO_SLOT_INDEX);
 
     Object::RemoveFromWorld();

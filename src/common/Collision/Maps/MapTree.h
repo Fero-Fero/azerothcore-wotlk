@@ -20,12 +20,40 @@
 
 #include "BoundingIntervalHierarchy.h"
 #include "Define.h"
-#include <shared_mutex>
+#include "Errors.h"
+#include <atomic>
 #include <unordered_map>
 
-// Read-side guard for shared geometry (vmap tree). Every reader goes through this
-// macro so a later step can turn it into a debug-only assert with a one-line change.
-#define GEOMETRY_READ_GUARD(m) std::shared_lock<std::shared_mutex> _geometryGuard(m)
+namespace VMAP
+{
+    // Step 14: the vmap tree has no read lock. Tiles install only inside a map seal task, when no unit task
+    // runs, so a reader on the query path takes nothing (a shared_lock or fetch_add there would be one cache
+    // line bouncing between every core doing line of sight). The server installs a check that says whether
+    // the running thread may write (seal task, or no beat running); it is consulted by the debug guards only.
+    using GeometryWriteCheck = bool (*)();
+    void SetGeometryWriteCheck(GeometryWriteCheck check);
+    bool GeometryWriteAllowed();
+
+    // Debug-only RAII around a tile load / unload: flags the tree as writing so a concurrent reader asserts.
+    struct GeometryWriteScope
+    {
+        std::atomic<bool>& flag;
+        explicit GeometryWriteScope(std::atomic<bool>& f) : flag(f)
+        {
+            ASSERT(GeometryWriteAllowed(), "geometry written outside a seal task while a beat runs");
+            flag.store(true, std::memory_order_relaxed);
+        }
+        ~GeometryWriteScope() { flag.store(false, std::memory_order_relaxed); }
+    };
+}
+
+#if defined(ACORE_DEBUG)
+#define GEOMETRY_READ_GUARD(flag) ASSERT(!(flag).load(std::memory_order_relaxed), "geometry read during a tile load")
+#define GEOMETRY_WRITE_SCOPE(flag) VMAP::GeometryWriteScope _geometryWrite(flag)
+#else
+#define GEOMETRY_READ_GUARD(flag) ((void)0)
+#define GEOMETRY_WRITE_SCOPE(flag) ((void)0)
+#endif
 
 namespace VMAP
 {
@@ -83,10 +111,10 @@ namespace VMAP
         loadedTileMap iLoadedTiles;
         std::string iBasePath;
 
-        // Guards iTree / iTreeValues / iLoadedTiles against tile loads from a sibling
-        // instance map. Readers take it shared, tile loads and unloads take it exclusive.
-        // Lock order: MapGridManager::_gridLock -> this. Nothing takes _gridLock while holding this.
-        mutable std::shared_mutex _mutex;
+        // Set while a tile load / unload edits iTree / iTreeValues / iLoadedTiles (debug guard only; writers
+        // run inside a seal task, when no reader can). Two instances of one map id serialise their tile loads
+        // on MapGridManager::_gridLock of the parent.
+        mutable std::atomic<bool> _writing{false};
 
     private:
         bool GetIntersectionTime(G3D::Ray const& pRay, float& pMaxDist, bool StopAtFirstHit, ModelIgnoreFlags ignoreFlags) const;
@@ -105,7 +133,7 @@ namespace VMAP
         bool GetObjectHitPos(G3D::Vector3 const& pos1, G3D::Vector3 const& pos2, G3D::Vector3& pResultHitPos, float pModifyDist) const;
         [[nodiscard]] float getHeight(G3D::Vector3 const& pPos, float maxSearchDist) const;
         bool GetLocationInfo(G3D::Vector3 const& pos, LocationInfo& info) const;
-        // Same query as GetLocationInfo but the answer is copied out under the read lock;
+        // Same query as GetLocationInfo but the answer is copied out as plain values;
         // use this when liquid or area data of the hit model is needed after return.
         [[nodiscard]] LocationQueryResult QueryLocation(G3D::Vector3 const& pos) const;
 

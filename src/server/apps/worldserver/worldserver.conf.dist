@@ -1339,9 +1339,47 @@ MapUpdate.Threads = 1
 #                     them. On a 14-core machine that is 13. Tasks come from
 #                     every map in one process-wide pool.
 #        Default:     1
-#                     2..128 - (pool size, including the world thread)
+#                     2..64 - (pool size, including the world thread)
 
 MapUpdate.PhaseThreads = 1
+
+#
+#    MapUpdate.PhaseAffinity
+#        Description: Optional comma-separated CPU list. When set, pool core i
+#                     (the world thread is core 0) is pinned to the i-th CPU and
+#                     work stealing prefers the cores of the same NUMA node.
+#                     Needs at least MapUpdate.PhaseThreads entries. Empty
+#                     leaves placement to the scheduler.
+#        Example:     "0,2,4,6"
+#        Default:     ""
+
+MapUpdate.PhaseAffinity = ""
+
+#
+#    MapUpdate.PathIterBudget
+#        Description: Detour node expansions one path search may spend inside a
+#                     unit task. A search that runs out returns the leg to the
+#                     explored polygon closest to the goal; the creature walks
+#                     it and paths again on arrival. 0 disables the budget.
+#        Default:     512
+#
+
+MapUpdate.PathIterBudget = 512
+
+#
+#    MapUpdate.CrowdBuffer
+#        Description: In a cell holding 32 or more players, build each player's
+#                     public update block once per beat and let every viewer
+#                     copy it instead of building its own. Viewer-specific
+#                     fields are still patched per viewer; self, raid members,
+#                     owners and stealthed or invisible players take the
+#                     per-viewer path. Optional; off until the gate numbers of
+#                     plan 17 justify it.
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
+#
+
+MapUpdate.CrowdBuffer = 0
 
 #
 #    MoveMaps.Enable

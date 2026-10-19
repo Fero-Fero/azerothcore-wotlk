@@ -70,6 +70,9 @@ public:
     }
 
     void Initialize(void); // also inits sRecordLogs and sBeatPool
+    // Step 14: starts the pool's worker threads. Called once from World::SetInitialWorldSettings after the
+    // grid preloads; UnloadAll stops them.
+    void StartBeatPool();
     // Step 12: accumulates diff and runs one beat (BeatPool::RunBeat) when the map update interval elapsed.
     void Update(uint32);
 

@@ -23,6 +23,7 @@
 * mmap sub-commands
 */
 
+#include "BeatPool.h"
 #include "CellImpl.h"
 #include "Chat.h"
 #include "CommandScript.h"
@@ -178,7 +179,7 @@ public:
 
         // calculate navmesh tile location
         SharedNavMesh const* sharedNavMesh = map->GetMapCollisionData().GetMMapData().GetSharedNavMesh();
-        dtNavMeshQuery const* navmeshquery = map->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
+        dtNavMeshQuery const* navmeshquery = sharedNavMesh ? sBeatPool->NavQueryFor(*sharedNavMesh) : nullptr;
         if (!sharedNavMesh || !navmeshquery)
         {
             handler->PSendSysMessage("NavMesh not loaded for current map.");
@@ -234,7 +235,7 @@ public:
     {
         Map* map = handler->GetSession()->GetPlayer()->GetMap();
         SharedNavMesh const* sharedNavMesh = map->GetMapCollisionData().GetMMapData().GetSharedNavMesh();
-        dtNavMeshQuery const* navmeshquery = map->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
+        dtNavMeshQuery const* navmeshquery = sharedNavMesh ? sBeatPool->NavQueryFor(*sharedNavMesh) : nullptr;
         if (!sharedNavMesh || !navmeshquery)
         {
             handler->PSendSysMessage("NavMesh not loaded for current map.");

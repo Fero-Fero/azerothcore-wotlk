@@ -50,7 +50,6 @@ public:
     bool IsGridsFullyLoaded() const;
 
 private:
-    // Callers hold _gridLock
     MapGridType* GetGridUnlocked(uint16 const x, uint16 const y) const;
     bool IsGridCreatedUnlocked(uint16 const x, uint16 const y) const;
     bool IsGridLoadedUnlocked(uint16 const x, uint16 const y) const;
@@ -60,9 +59,9 @@ private:
     uint32 _createdGridsCount;
     uint32 _loadedGridsCount;
 
-    // Guards the grid slots and the counters. Not recursive: never call a locking
-    // public method while holding it. Lock order: this -> StaticMapTree::_mutex -> SharedNavMesh
-    // (both taken inside LoadTerrain); nothing takes this lock while holding either of those.
+    // Step 14: taken by CreateGrid only. Two instances of one map id are two seal tasks that can both ask the
+    // parent to create the same grid at once; every other mutation is seal-only or between beats and every
+    // reader is unlocked. Not recursive: never call CreateGrid while holding it.
     mutable std::mutex _gridLock;
     std::unique_ptr<MapGridType> _mapGrid[MAX_NUMBER_OF_GRIDS][MAX_NUMBER_OF_GRIDS];
 };

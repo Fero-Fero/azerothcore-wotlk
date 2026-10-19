@@ -22,6 +22,7 @@
 #include "CellImpl.h"
 #include "Chat.h"
 #include "Creature.h"
+#include "CrowdBuffer.h"
 #include "DisableMgr.h"
 #include "DynamicTree.h"
 #include "GameEventMgr.h"
@@ -178,23 +179,55 @@ template<class T>
 void Map::DeleteFromWorld(T* obj)
 {
     // Note: In case resurrectable corpse and pet its removed from global lists in own destructor
-    delete obj;
+    // Step 14: inside a beat the free waits for S2, where the coordinator runs alone; a seal task on another
+    // core may still hold a handle, and the pool's lists are scrubbed by ~WorldObject without a lock.
+    if (BeatContext::InBeat())
+        sBeatPool->FreeAtSealSerial(obj);
+    else
+        delete obj;
 }
 
 template<>
 void Map::DeleteFromWorld(Player* player)
 {
     ObjectAccessor::RemoveObject(player);
-    delete player;
+    if (BeatContext::InBeat())
+        sBeatPool->FreeAtSealSerial(player);
+    else
+        delete player;
+}
+
+// Step 14: a grid create installs vmap / nav mesh tiles and writes the grid array, which is legal in a seal task
+// or between beats only. From a unit task or a view chunk (summons, SmartAI, waypoint end grids, vehicles,
+// cinematics, teleport handlers) the load is deferred to this map's seal; the caller's own follow-up
+// (AddToMap, relocation) is deferred the same way and re-runs the check when it applies.
+bool Map::DeferGridLoad(Cell const& cell, bool objects)
+{
+    if (!BeatContext::InBeat() || BeatContext::InSealTask())
+        return false;
+
+    GridLoadDefer rec;
+    rec.cell = cell.data.All;
+    rec.objects = objects ? 1 : 0;
+    AppendDefer(DeferKind::GridLoad, rec);
+    return true;
 }
 
 void Map::EnsureGridCreated(GridCoord const& gridCoord)
 {
+    if (_mapGridManager.IsGridCreated(gridCoord.x_coord, gridCoord.y_coord))
+        return;
+    if (DeferGridLoad(Cell(CellCoord(gridCoord.x_coord * MAX_NUMBER_OF_CELLS, gridCoord.y_coord * MAX_NUMBER_OF_CELLS)), false))
+        return;
+
     _mapGridManager.CreateGrid(gridCoord.x_coord, gridCoord.y_coord);
 }
 
 bool Map::EnsureGridLoaded(Cell const& cell)
 {
+    if (!_mapGridManager.IsGridLoaded(cell.GridX(), cell.GridY()) && DeferGridLoad(cell, true))
+        return false;
+
     EnsureGridCreated(GridCoord(cell.GridX(), cell.GridY()));
 
     if (_mapGridManager.LoadGrid(cell.GridX(), cell.GridY()))
@@ -669,9 +702,13 @@ void Map::ApplyDefer(DeferHeader const& header, uint8 const* payload)
             break;
         case DeferKind::GridLoad:
         {
+            GridLoadDefer const& rec = DeferPayload<GridLoadDefer>(payload);
             Cell cell;
-            cell.data.All = DeferPayload<GridLoadDefer>(payload).cell;
-            EnsureGridLoaded(cell);
+            cell.data.All = rec.cell;
+            if (rec.objects)
+                EnsureGridLoaded(cell);
+            else
+                EnsureGridCreated(GridCoord(cell.GridX(), cell.GridY()));
             break;
         }
         case DeferKind::AddToMap:
@@ -1651,6 +1688,79 @@ void Map::UnloadAll()
     _corpsesByGrid.clear();
     _corpsesByPlayer.clear();
     _corpseBones.clear();
+
+    // Step 16: an AddToMap defer is the sole owner of its object until the seal hands it to the map. A map that
+    // goes away with defers still pending (an instance expiring in the same S2 that a task deferred into, or
+    // shutdown) frees those objects here instead of leaking them.
+    DropPendingAddToMapDefers();
+}
+
+void Map::DropPendingAddToMapDefers()
+{
+    std::vector<DeferHeader const*> pending;
+    _defers.DrainInto(pending);
+    for (DeferHeader const* hdr : pending)
+    {
+        if (hdr->kind != DeferKind::AddToMap)
+            continue;
+        WorldObject* obj = DeferPayload<AddToMapDefer>(reinterpret_cast<uint8 const*>(hdr) + DEFER_HEADER_SIZE).obj;
+        if (!obj || obj->IsInWorld())
+            continue;
+        LOG_DEBUG("maps.defers", "Map {} ({}) dropped a pending AddToMap of {} at unload", GetId(), GetInstanceId(), obj->GetGUID().ToString());
+        obj->ResetMap();
+        delete obj;
+    }
+    _defers.Reset();
+}
+
+// ---- Step 17: crowd buffers ----
+
+void Map::PlanCrowdBuffers(std::vector<uint32>& out)
+{
+    for (auto& [cellId, players] : _crowdScratch)
+        players.clear();
+
+    if (sWorld->getBoolConfig(CONFIG_CROWD_BUFFER))
+        for (MapReference const& ref : GetPlayers())
+        {
+            Player const* player = ref.GetSource();
+            if (!player || !player->IsInWorld())
+                continue;
+            uint32 const cellId = Acore::ComputeCellCoord(player->GetPositionX(), player->GetPositionY()).GetId();
+            _crowdScratch[cellId].push_back(player->GetGUID());
+        }
+
+    for (auto& [cellId, buffer] : _crowdBuffers)
+        if (buffer->Active())
+        {
+            auto it = _crowdScratch.find(cellId);
+            if (it == _crowdScratch.end() || it->second.size() < CrowdBuffer::THRESHOLD)
+                buffer->Deactivate();
+        }
+
+    for (auto& [cellId, players] : _crowdScratch)
+    {
+        if (players.size() < CrowdBuffer::THRESHOLD)
+            continue;
+        std::unique_ptr<CrowdBuffer>& buffer = _crowdBuffers[cellId];
+        if (!buffer)
+            buffer = std::make_unique<CrowdBuffer>(cellId);
+        buffer->Plan(players);
+        out.push_back(cellId);
+    }
+}
+
+void Map::BuildCrowdBuffer(uint32 cellId, uint32 beat)
+{
+    auto it = _crowdBuffers.find(cellId);
+    if (it != _crowdBuffers.end() && it->second->Active())
+        it->second->Build(*this, beat);
+}
+
+CrowdBuffer const* Map::FindCrowdBuffer(uint32 cellId) const
+{
+    auto it = _crowdBuffers.find(cellId);
+    return it != _crowdBuffers.end() && it->second->Active() ? it->second.get() : nullptr;
 }
 
 std::shared_ptr<GridTerrainData> Map::GetGridTerrainDataSharedPtr(GridCoord const& gridCoord)

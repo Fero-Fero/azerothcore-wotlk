@@ -84,3 +84,44 @@ During B and C2, `.debug procchain` (a debug counter in `ApplySpellLanded`/`Proc
 - [ ] Outdoor world state during the cell.
 - [ ] Memory numbers handed to step 16.
 - [ ] No source change was made during the soak.
+
+## Status
+
+**Not run.** This session had no build tree (`var/build` empty, no `worldserver` binary anywhere under the
+repo, no MSVC on the path) and the soak needs a server with 2–300 characters online for 15-minute runs. Nothing
+below the "Runs" heading was executed; the checklist is untouched on purpose.
+
+**Prerequisites landed before the soak (source edits are forbidden once it starts):**
+
+- `.debug procchain` did not exist; the B / C2 runs read it. `RecordHeader::pad` became `depth`: the log stamps
+  every record with `RecordChain::applying + 1`, and both apply loops (`WorldObject::ApplyRecords`,
+  `Unit::ApplyRecords`) set `applying` to the record's depth for the duration of its applier, so a record emitted
+  while applying a depth-*d* record is depth *d*+1. A task's own action is depth 1. Counters are per core on their
+  own line (`RecordChain::CoreStats`, relaxed, written by the owning core only): a 16-bucket histogram, the
+  deepest chain, and a 16-entry (spell id → max depth) table for records at depth ≥ 4 (`SpellHit`,
+  `DeferredSpellHit`, `SpellLanded`, `PeriodicLanded`, `ProcActor`). `.debug procchain` prints
+  `depth:count` pairs, the deepest, the spells at ≥ 4 by name, and resets. Inline landings (self hit, reflected,
+  the seal's deferred hits) do not deepen the chain: they add no beat.
+- `Player::ViewCommit` under concurrent U2 (plan 14 exit note): pet removal deferred to the owner's next U1,
+  target-side visibility writes under a one-byte spinlock.
+
+**How to run it when a build exists.** Build `RelWithDebInfo` for every run and one `Debug` for the C2 assert
+session. `MapUpdate.PhaseThreads` is the key; `MapUpdate.Threads` stays at its default (it only loads).
+`Warden.Enabled = 0` if characters come from the AzerothGhost harness. Per run, record into the table below and
+stop at the first crash as defined above.
+
+| Run | Key | Chars | `.server info` mean / p95 / p99 / max | `pool timing` (wall, task, sum_task, tail, idle, view, view_tail, seal_map, seal_tail, seal_ser, coord, barrier, path, claim, wake_dup) | Mem start / steady / after logout / shutdown | Result |
+| --- | --- | --- | --- | --- | --- | --- |
+| A | 1 | 2 (two Deadmines) | | | | |
+| B | 1 | 2 | | | | |
+| C2 | 2 | 3 | | | | |
+| C2 debug | 2 | 3 | | | | asserts: |
+| Cell | 1 / 7 / 13 | n | | | | |
+| Pair | 1 / 13 | | | | | |
+
+`.debug procchain` after B and after C2: histogram line and the depth ≥ 4 spell list go here verbatim.
+
+**What this session cannot decide and the first run will:** the plan 13 / 14 exit notes list the asserts a debug
+boot is expected to hit first (foreign `CanSeeVendor` conditions, `CreatureGroup::LeaderStartedMoving`,
+`OnPatchValuesUpdate`, the `StaticMapTree` `_writing` guard across sibling instances, `Unschedule` inside a
+beat). Those are run-A / run-C2 material, not soak failures of the kind the Decision table routes.

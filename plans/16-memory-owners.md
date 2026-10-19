@@ -48,8 +48,41 @@ In a debug build run C2 under ASan (Linux) or Application Verifier (Windows) for
 
 ## Checklist
 
-- [ ] Every row in the table has a free site in code and a comment naming the owner at the allocation.
-- [ ] `.debug memory` prints the capacities.
-- [ ] Fixes 1–3 landed.
-- [ ] Soak memory numbers pass the three criteria.
-- [ ] ASan / Verifier run clean.
+- [x] Every row in the table has a free site in code and a comment naming the owner at the allocation. (rows that exist in the build; see Status for the rows whose allocation was never made)
+- [x] `.debug memory` prints the capacities.
+- [x] Fixes 1–3 landed. (3 is moot: there is no pooled land-side `Spell`; see Status)
+- [ ] Soak memory numbers pass the three criteria. (needs the step 15 runs, not run)
+- [ ] ASan / Verifier run clean. (needs a build)
+
+## Status
+
+Done statically (no build). The table above was written against the plan's design; the build differs in places,
+so the row-by-row result is:
+
+| Row | In the build | Owner comment / free site |
+| --- | --- | --- |
+| `ObjectSlotPair` | yes | `ObjectSlot.h` at `Init`. **Changed:** the aura and movement arrays are now one allocation *per slot* (`_auraStorage[2]`, `_movementStorage[2]`), so `EnsureAuraCapacity` / `EnsureMovementCapacity` only ever replace the write slot's array. The old code reallocated one block for both slots mid-beat and freed the previous one while a view chunk on another core could be walking the published slot's `auras` — a use-after-free the plan's "regrow at the seal" was meant to avoid. Per-slot arrays make a mid-beat grow legal without the seal: the write slot was last readable two beats ago. `Regrowths()` and `HeapBytes()` added; `.debug slot` prints both. |
+| `UnitRecordLog` bytes, `TargetHead` | yes, but owned by `RecordLogSet` (singleton), not `CoreState` | comment on `RecordLogSet`; `Shutdown()` added and called from `MapMgr::UnloadAll` after the pool stopped; `HighWater()` / `HeadCapacity()` for the command. Growth is on spill, not ×1.5 at the seal. |
+| `DeferBuffer` | yes: `Map::_defers` is a `DeferBufferSet`, one buffer per core per map, not per `CoreState` | comment on `DeferBuffer` and `Map::_defers`; freed with the map; `Capacity()` / `HighWater()` / `Allocated()` added |
+| `WorkDeque` ring | yes | `CoreState` comment; `Fill` swaps the phase list in, no growth rule needed |
+| `_wakeOverflow` | no such thing (`next` is a vector) | — |
+| `dtNavMeshQuery` per (core, mesh) | yes | `CoreState::navQueries`; `ForgetNavMesh` from `~MapCollisionData` |
+| Land-side `Spell` pool | **no** — `Unit::ApplySpellHit` builds the land `Spell` on the stack, so its destructor runs on every exit path | fix 3 has nothing to apply to |
+| `AddToMap` defer owning a `WorldObject*` | yes | **fix added:** `Map::DropPendingAddToMapDefers()` from `Map::UnloadAll` deletes objects of never-applied `AddToMap` defers (expired instance / shutdown with defers pending) |
+| `RemoveFromMap` free | yes, as `CoreState::freeList`, freed in `SealSerial` | comment |
+| `Map::_newcomers`, `GridPending`, `Player::_updateData`, `MapPhaseClock` | do not exist (S1a not built; newcomers are scheduled directly; `UpdateData` lives in `ViewWork`) | — |
+| `CrowdBuffer` per crowded cell | yes (step 17, built after this audit) | `Map::_crowdBuffers`, allocated in S2 at the first threshold crossing, inactive but retained when the cell empties, freed with the map; `_entries` keep their `ByteBuffer`s at high-water; `.debug memory` prints allocated / active / KB |
+| `_taskMembers` | yes | comment at the member |
+| `heavy`, `viewItems`, histogram, `CoreState` | yes | `CoreState` comment; alive to process exit (objects freed in `UnloadAll` still return slot indices through it after `Stop`) |
+| `ViewWork` | yes | comment at `Player::_view`; **cap added:** `UpdateData::Compact(64 KB)` after every commit (new `Capacity()` on `UpdateData`, `capacity()` on `ByteBuffer`) |
+| Slot index | yes | **fix 2:** the free list is a beat-tagged deque; `Allocate` takes the oldest release only if `freedBeat < beat`, else a fresh index. S2 order is free list → `DestroyExpiredInstances` → return indices; the parity-*k* log is still read in beat *k*+1, and the new holder of a reused index never has the dead object's `_writtenBy` bits, so *k*+1 is the right gate. `FreeCount()` added. |
+
+**Fix 1:** `MMapMgr::LoadTile` leaked the tile buffer on a short `fread`; `dtFree(data)` added. `SharedNavMesh::Write`
+already frees on a failed `addTile`.
+
+**`.debug memory`** prints process RSS (Windows `GetProcessMemoryInfo`, Linux `/proc/self/statm`), every core's
+list and deque capacities and nav-query count, both record-log parities (bytes, heads, high-water, spills), slot
+indices handed out / in use / free, per-map defer buffers (allocated, resident, high-water), and for in-world
+players the `ViewWork` buffers and slot-pair bytes with the regrowth count.
+
+**Not done:** the soak measurement and the ASan / Verifier run both need a running server (plan 15 Status).

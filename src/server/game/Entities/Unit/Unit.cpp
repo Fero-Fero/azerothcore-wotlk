@@ -13168,7 +13168,10 @@ void Unit::ApplyRecords(std::vector<RecordHeader const*> const& records)
     } healthBatch(this);
 
     for (RecordHeader const* hdr : records)
+    {
+        RecordChain::ApplyScope chain(hdr->depth);
         ApplyRecord(*hdr, reinterpret_cast<uint8 const*>(hdr) + RECORD_HEADER_SIZE);
+    }
 }
 
 void Unit::ApplyRecord(RecordHeader const& header, uint8 const* payload)
@@ -17573,7 +17576,6 @@ void Unit::BuildValuesUpdateFrom(uint8 updateType, ByteBuffer* data, Player* tar
     if (!target)
         return;
 
-    uint32* flags = UnitUpdateFieldFlags;
     uint32 visibleFlag = UF_FLAG_PUBLIC;
 
     if (target == this)
@@ -17620,6 +17622,24 @@ void Unit::BuildValuesUpdateFrom(uint8 updateType, ByteBuffer* data, Player* tar
     }
 
     BuildValuesCachedBuffer cacheValue(500);
+    BuildValuesCacheEntry(updateType, visibleFlag, src, cacheValue);
+
+    int32 cachePos = static_cast<int32>(data->wpos());
+    data->append(cacheValue.buffer);
+
+    BuildValuesCachePosPointers dataAdjustedPos = cacheValue.posPointers;
+    if (cachePos)
+        dataAdjustedPos.ApplyOffset(cachePos);
+
+    PatchValuesUpdate(*data, dataAdjustedPos, target, src);
+
+    if (live)
+        _valuesUpdateCache.insert(std::pair<uint64, BuildValuesCachedBuffer>(cacheKey, std::move(cacheValue)));
+}
+
+void Unit::BuildValuesCacheEntry(uint8 updateType, uint32 visibleFlag, UpdateValuesSource const& src, BuildValuesCachedBuffer& cacheValue)
+{
+    uint32* flags = UnitUpdateFieldFlags;
 
     ByteBuffer fieldBuffer(400);
 
@@ -17704,18 +17724,41 @@ void Unit::BuildValuesUpdateFrom(uint8 updateType, ByteBuffer* data, Player* tar
     int32 fieldBufferPos = static_cast<int32>(cacheValue.buffer.wpos());
     cacheValue.buffer.append(fieldBuffer);
     cacheValue.posPointers.ApplyOffset(fieldBufferPos);
+}
 
-    int32 cachePos = static_cast<int32>(data->wpos());
-    data->append(cacheValue.buffer);
+void Unit::BuildPublicValuesBlock(ObjectSlot const& slot, BuildValuesCachedBuffer& out)
+{
+    out.buffer.clear();
+    out.posPointers = BuildValuesCachePosPointers();
+    out.buffer << uint8(UPDATETYPE_VALUES);
+    out.buffer << GetPackGUID();
+    // Pos pointers come out relative to out.buffer, header included, since the entry appends at its wpos.
+    BuildValuesCacheEntry(UPDATETYPE_VALUES, UF_FLAG_PUBLIC, UpdateValuesSource{ slot.values, slot.changesMask, &slot, 0 }, out);
+}
 
-    BuildValuesCachePosPointers dataAdjustedPos = cacheValue.posPointers;
-    if (cachePos)
-        dataAdjustedPos.ApplyOffset(cachePos);
+bool Unit::SharedBlockApplies(ObjectSlot const& slot, Player const* viewer) const
+{
+    if (viewer == this)
+        return false;                                                   // UF_FLAG_PRIVATE
+    if (slot.vis.stealth.flags || slot.vis.invisibility.flags)
+        return false;                                                   // detection is per viewer
+    if (ObjectGuid(slot.values[UNIT_FIELD_SUMMONEDBY] | (uint64(slot.values[UNIT_FIELD_SUMMONEDBY + 1]) << 32)) == viewer->GetGUID())
+        return false;                                                   // UF_FLAG_OWNER
+    if (slot.values[UNIT_DYNAMIC_FLAGS] & UNIT_DYNFLAG_SPECIALINFO)
+        return false;                                                   // UF_FLAG_SPECIAL_INFO depends on the viewer's empathy
+    // Same owner resolution as BuildValuesUpdateFrom (a charmed player answers for its charmer's raid).
+    Player const* plr = GetCharmerOrOwnerPlayerOrPlayerItself(UpdateValuesSource{ slot.values, slot.changesMask, &slot, 0 });
+    if (plr && plr->IsInSameRaidWith(viewer))
+        return false;                                                   // UF_FLAG_PARTY_MEMBER
+    return true;
+}
 
-    PatchValuesUpdate(*data, dataAdjustedPos, target, src);
-
-    if (live)
-        _valuesUpdateCache.insert(std::pair<uint64, BuildValuesCachedBuffer>(cacheKey, std::move(cacheValue)));
+void Unit::AppendSharedValuesBlock(BuildValuesCachedBuffer const& shared, UpdateData* data, Player* viewer, ObjectSlot const& slot)
+{
+    ByteBuffer buf(shared.buffer);
+    BuildValuesCachePosPointers pos = shared.posPointers;
+    PatchValuesUpdate(buf, pos, viewer, UpdateValuesSource{ slot.values, slot.changesMask, &slot, 0 });
+    data->AddUpdateBlock(buf);
 }
 
 void Unit::PatchValuesUpdate(ByteBuffer& valuesUpdateBuf, BuildValuesCachePosPointers& posPointers, Player* target, UpdateValuesSource const& src)

@@ -64,6 +64,7 @@ void DeferBuffer::Init(std::size_t bytes)
 
 void DeferBuffer::Reset()
 {
+    _highWater = std::max(_highWater, _size);
     _size = 0;
     _sequence = 0;
 }

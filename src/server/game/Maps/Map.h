@@ -45,6 +45,7 @@
 #include <memory>
 #include <set>
 #include <shared_mutex>
+#include <unordered_map>
 
 class Unit;
 class WorldPacket;
@@ -66,6 +67,7 @@ class MapInstanced;
 class InstanceMap;
 class BattlegroundMap;
 class Transport;
+class CrowdBuffer;
 class StaticTransport;
 class MotionTransport;
 class PathGenerator;
@@ -602,6 +604,8 @@ private:
     std::vector<DynamicObject*> _dynamicObjectsToMove;
 
     bool EnsureGridLoaded(Cell const& cell);
+    // Inside a beat and not in a seal task: appends a GridLoad defer and returns true (the caller skips the load).
+    bool DeferGridLoad(Cell const& cell, bool objects);
     MapGridType* GetMapGrid(uint16 const x, uint16 const y);
 
     void ScriptsProcess();
@@ -681,7 +685,15 @@ private:
     void RelinkObjectNow(WorldObject* obj, Cell const& oldCell, Cell const& newCell);
     void RemoveListedObject(WorldObject* obj);
 
-    DeferBuffer _defers;
+    // Owner of this map's defers (step 16 table): one buffer per core, allocated on first append, reset at every
+    // seal with the capacity kept, freed with the map. UnloadAll frees the objects of AddToMap defers never applied.
+    DeferBufferSet _defers;
+    void DropPendingAddToMapDefers();
+public:
+    [[nodiscard]] DeferBufferSet const& Defers() const { return _defers; }
+private:
+    // Duration of this map's last seal task (S1b heavy-first ordering, step 14).
+    uint32 _lastSealNs{0};
 
     void _AddObjectToUpdateList(WorldObject* obj);
     void _RemoveObjectFromUpdateList(WorldObject* obj);
@@ -748,6 +760,20 @@ private:
 
     // Step 12: the pool scheduled this map's players and updatable list once (first beat the map took part in).
     bool _beatSeeded{false};
+
+    // Step 17 (optional): one shared public-block buffer per crowded cell; see CrowdBuffer.h for the owner.
+    std::unordered_map<uint32, std::unique_ptr<CrowdBuffer>> _crowdBuffers;
+    std::unordered_map<uint32, std::vector<ObjectGuid>> _crowdScratch;   // S2 only: cell -> players, capacity kept
+
+public:
+    // S2: counts players per cell, plans a buffer for every cell at or above CrowdBuffer::THRESHOLD, deactivates
+    // the rest; `out` receives the cell ids whose crowd item the pool runs first in the next U2.
+    void PlanCrowdBuffers(std::vector<uint32>& out);
+    // U2: the crowd item of one cell.
+    void BuildCrowdBuffer(uint32 cellId, uint32 beat);
+    // U2, a viewer chunk: the active buffer of a cell, or nullptr. _crowdBuffers changes only in S2.
+    [[nodiscard]] CrowdBuffer const* FindCrowdBuffer(uint32 cellId) const;
+    [[nodiscard]] std::unordered_map<uint32, std::unique_ptr<CrowdBuffer>> const& CrowdBuffers() const { return _crowdBuffers; }
 };
 
 // Declared before any use so the Transport path is never implicitly instantiated from the generic body.

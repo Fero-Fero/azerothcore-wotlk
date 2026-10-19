@@ -15,6 +15,17 @@
  * with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
+#ifndef ACORE_UNIT_UTILS_H
+#define ACORE_UNIT_UTILS_H
+
+#include "ByteBuffer.h"
+#include "Define.h"
+#include "Errors.h"
+#include "Position.h"
+#include <unordered_map>
+
+class Unit;
+
 class MMapTargetData
 {
 public:
@@ -115,3 +126,5 @@ struct BuildValuesCachedBuffer
 
     BuildValuesCachePosPointers posPointers;
 };
+
+#endif

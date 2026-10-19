@@ -60,17 +60,15 @@ class MMapData
     friend class MapCollisionData;
 
 public:
-    // Null when no mmap exists for this map. Read the mesh through a NavMeshQueryScope only.
+    // Null when no mmap exists for this map. Read the mesh through a NavMeshQueryScope only. The
+    // dtNavMeshQuery for it is per core: BeatPool::NavQueryFor (step 14).
     SharedNavMesh* GetSharedNavMesh() { return _navMesh.get(); }
     SharedNavMesh const* GetSharedNavMesh() const { return _navMesh.get(); }
-    dtNavMeshQuery const* GetNavMeshQuery();
 
 protected:
     // _navMesh is a shared_ptr as it will point to a parent maps nav mesh (if exists) to save on memory;
     // every instance of one map id shares the one SharedNavMesh and its guard
     std::shared_ptr<SharedNavMesh> _navMesh;
-    // navMeshQuery is not thread safe and needs its own instance per map
-    MMAP::ManagedNavMeshQuery _navMeshQuery;
 };
 
 // Map collision data holders (dynamic&static vmap, mmaps)
@@ -78,7 +76,8 @@ class MapCollisionData
 {
 public:
     MapCollisionData(Map const& map, Map const* parentMap);
-    ~MapCollisionData() = default;
+    // The last holder of a nav mesh drops every core's query on it (map unload: S2 or between beats).
+    ~MapCollisionData();
 
     int LoadVMapTile(uint32 tileX, uint32 tileY);
     int LoadMMapTile(uint32 tileX, uint32 tileY);

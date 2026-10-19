@@ -60,6 +60,11 @@ public:
     [[nodiscard]] bool HasData() const { return m_blockCount > 0 || !m_outOfRangeGUIDs.empty(); }
     void Clear();
 
+    // Step 16: Clear keeps the buffers' capacity (the per-beat packet reuses it); a one-off burst above maxBytes
+    // (a mass respawn in view, a login scan) is given back so a player's ViewWork cannot stay at its peak.
+    void Compact(std::size_t maxBytes);
+    [[nodiscard]] std::size_t Capacity() const { return m_data.capacity() + m_outOfRangeGUIDs.capacity() * sizeof(ObjectGuid); }
+
 protected:
     uint32 m_blockCount;
     GuidVector m_outOfRangeGUIDs;

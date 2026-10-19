@@ -16,6 +16,7 @@
  */
 
 #include "PathGenerator.h"
+#include "BeatPool.h"
 #include "Creature.h"
 #include "DetourCommon.h"
 #include "Geometry.h"
@@ -23,6 +24,8 @@
 #include "MMapMgr.h"
 #include "Map.h"
 #include "Metric.h"
+#include "World.h"
+#include <chrono>
 
 // Blades Edge Arena Ropes normalization
 namespace
@@ -134,10 +137,28 @@ PathGenerator::PathGenerator(WorldObject const* owner) :
     //if (sDisableMgr->IsPathfindingEnabled(_sourceUnit->FindMap()))
     {
         _navMesh = _source->GetMap()->GetMapCollisionData().GetMMapData().GetSharedNavMesh();
-        _navMeshQuery = _source->GetMap()->GetMapCollisionData().GetMMapData().GetNavMeshQuery();
+        // Step 14: the Detour query belongs to the core running the task (dtNavMeshQuery is not thread-safe).
+        // A generator kept by a movement generator runs on a different core next beat, so CalculatePath looks
+        // it up again on every call; this is only the first lookup.
+        if (_navMesh)
+            _navMeshQuery = sBeatPool->NavQueryFor(*_navMesh);
     }
 
     CreateFilter();
+}
+
+namespace
+{
+    // Adds the enclosed time to the running task's path split (.debug slowtasks, pool clock `path`).
+    struct PathTimer
+    {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~PathTimer()
+        {
+            sBeatPool->AddPathNs(uint64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start).count()));
+        }
+    };
 }
 
 PathGenerator::~PathGenerator()
@@ -158,6 +179,7 @@ bool PathGenerator::CalculatePath(float x, float y, float z, float destX, float 
         return false;
 
     METRIC_DETAILED_EVENT("mmap_events", "CalculatePath", "");
+    PathTimer timer;
 
     G3D::Vector3 dest(destX, destY, destZ);
     SetEndPosition(dest);
@@ -166,6 +188,10 @@ bool PathGenerator::CalculatePath(float x, float y, float z, float destX, float 
     SetStartPosition(start);
 
     _forceDestination = forceDest;
+
+    // This core's query (see the constructor).
+    if (_navMesh)
+        _navMeshQuery = sBeatPool->NavQueryFor(*_navMesh);
 
     // make sure navMesh works - we can run on map w/o mmap
     Unit const* _sourceUnit = _source->ToUnit();
@@ -473,12 +499,11 @@ void PathGenerator::BuildPolyPath(dtNavMesh const* navMesh, G3D::Vector3 const& 
         }
         else
         {
-            dtResult = _navMeshQuery->findPath(
+            dtResult = FindPathBudgeted(
                 suffixStartPoly,    // start polygon
                 endPoly,            // end polygon
                 suffixEndPoint,     // start position
                 endPoint,           // end position
-                &_filter,            // polygon search filter
                 _pathPolyRefs + prefixPolyLength - 1,    // [out] path
                 (int*)&suffixPolyLength,
                 MAX_PATH_LENGTH - prefixPolyLength); // max number of polygons in output path
@@ -576,12 +601,11 @@ void PathGenerator::BuildPolyPath(dtNavMesh const* navMesh, G3D::Vector3 const& 
         }
         else
         {
-            dtResult = _navMeshQuery->findPath(
+            dtResult = FindPathBudgeted(
                 startPoly,          // start polygon
                 endPoly,            // end polygon
                 startPoint,         // start position
                 endPoint,           // end position
-                &_filter,           // polygon search filter
                 _pathPolyRefs,     // [out] path
                 (int*)&_polyLength,
                 MAX_PATH_LENGTH);   // max number of polygons in output path
@@ -619,6 +643,36 @@ void PathGenerator::BuildPolyPath(dtNavMesh const* navMesh, G3D::Vector3 const& 
 
     // generate the point-path out of our up-to-date poly-path
     BuildPointPath(navMesh, startPoint, endPoint);
+}
+
+dtStatus PathGenerator::FindPathBudgeted(dtPolyRef startPoly, dtPolyRef endPoly, float const* startPoint, float const* endPoint,
+    dtPolyRef* path, int* pathCount, int maxPath)
+{
+    // Step 14: the per-beat path budget. A far path across a continent is the usual U1 straggler; Detour's
+    // sliced search stops after `budget` node expansions and finalize returns the path to the explored node
+    // closest to the goal. The movement generator walks that leg and re-paths on arrival, from closer, with a
+    // fresh budget. No slice state outlives this call, so the per-core query is reused freely.
+    int const budget = int(sWorld->getIntConfig(CONFIG_PATH_ITER_BUDGET));
+    if (budget <= 0)
+        return _navMeshQuery->findPath(startPoly, endPoly, startPoint, endPoint, &_filter, path, pathCount, maxPath);
+
+    // The sliced query mutates the dtNavMeshQuery; it is this core's own (BeatPool::NavQueryFor).
+    dtNavMeshQuery* query = const_cast<dtNavMeshQuery*>(_navMeshQuery);
+    dtStatus status = query->initSlicedFindPath(startPoly, endPoly, startPoint, endPoint, &_filter);
+    if (dtStatusFailed(status))
+        return status;
+
+    int done = 0;
+    status = query->updateSlicedFindPath(budget, &done);
+    bool const exhausted = dtStatusInProgress(status);
+    status = query->finalizeSlicedFindPath(path, pathCount, maxPath);
+    if (exhausted && dtStatusSucceed(status))
+    {
+        // Partial leg: the caller sees DT_PARTIAL_RESULT through the end-poly check and marks the path incomplete.
+        status |= DT_PARTIAL_RESULT;
+        sBeatPool->CountPathIncomplete();
+    }
+    return status;
 }
 
 void PathGenerator::BuildPointPath(dtNavMesh const* navMesh, float const* startPoint, float const* endPoint)

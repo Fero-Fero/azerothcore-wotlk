@@ -33,6 +33,22 @@ using G3D::Vector3;
 
 namespace VMAP
 {
+    namespace
+    {
+        GeometryWriteCheck geometryWriteCheck = nullptr;
+    }
+
+    void SetGeometryWriteCheck(GeometryWriteCheck check)
+    {
+        geometryWriteCheck = check;
+    }
+
+    bool GeometryWriteAllowed()
+    {
+        // Tools and the loading thread install no check: everything is allowed.
+        return !geometryWriteCheck || geometryWriteCheck();
+    }
+
     class MapRayCallback
     {
     public:
@@ -94,7 +110,7 @@ namespace VMAP
 
     bool StaticMapTree::GetLocationInfo(Vector3 const& pos, LocationInfo& info) const
     {
-        GEOMETRY_READ_GUARD(_mutex);
+        GEOMETRY_READ_GUARD(_writing);
         return GetLocationInfoUnlocked(pos, info);
     }
 
@@ -102,7 +118,7 @@ namespace VMAP
     {
         LocationQueryResult result;
 
-        GEOMETRY_READ_GUARD(_mutex);
+        GEOMETRY_READ_GUARD(_writing);
         LocationInfo info;
         if (!GetLocationInfoUnlocked(pos, info))
             return result;
@@ -156,7 +172,7 @@ namespace VMAP
 
     bool StaticMapTree::isInLineOfSight(Vector3 const& pos1, Vector3 const& pos2, ModelIgnoreFlags ignoreFlags) const
     {
-        GEOMETRY_READ_GUARD(_mutex);
+        GEOMETRY_READ_GUARD(_writing);
         float maxDist = (pos2 - pos1).magnitude();
         // return false if distance is over max float, in case of cheater teleporting to the end of the universe
         if (maxDist == std::numeric_limits<float>::max() || !std::isfinite(maxDist))
@@ -184,7 +200,7 @@ namespace VMAP
 
     bool StaticMapTree::GetObjectHitPos(Vector3 const& pPos1, Vector3 const& pPos2, Vector3& pResultHitPos, float pModifyDist) const
     {
-        GEOMETRY_READ_GUARD(_mutex);
+        GEOMETRY_READ_GUARD(_writing);
         bool result = false;
         float maxDist = (pPos2 - pPos1).magnitude();
         // valid map coords should *never ever* produce float overflow, but this would produce NaNs too
@@ -230,7 +246,7 @@ namespace VMAP
 
     float StaticMapTree::getHeight(Vector3 const& pPos, float maxSearchDist) const
     {
-        GEOMETRY_READ_GUARD(_mutex);
+        GEOMETRY_READ_GUARD(_writing);
         float height = G3D::finf();
         Vector3 dir = Vector3(0, 0, -1);
         G3D::Ray ray(pPos, dir);   // direction with length of 1
@@ -294,7 +310,7 @@ namespace VMAP
     bool StaticMapTree::InitMap(std::string const& fname)
     {
         //VMAP_DEBUG_LOG(LOG_FILTER_MAPS, "StaticMapTree::InitMap() : initializing StaticMapTree '{}'", fname);
-        std::unique_lock<std::shared_mutex> lock(_mutex);
+        GEOMETRY_WRITE_SCOPE(_writing);
         bool success = false;
         std::string fullname = iBasePath + fname;
         FILE* rf = fopen(fullname.c_str(), "rb");
@@ -346,7 +362,7 @@ namespace VMAP
 
     void StaticMapTree::UnloadMap()
     {
-        std::unique_lock<std::shared_mutex> lock(_mutex);
+        GEOMETRY_WRITE_SCOPE(_writing);
         iLoadedTiles.clear();
     }
 
@@ -354,7 +370,7 @@ namespace VMAP
 
     bool StaticMapTree::LoadMapTile(uint32 tileX, uint32 tileY)
     {
-        std::unique_lock<std::shared_mutex> lock(_mutex);
+        GEOMETRY_WRITE_SCOPE(_writing);
         if (!iIsTiled)
         {
             // currently, core creates grids for all maps, whether it has terrain tiles or not
@@ -455,7 +471,7 @@ namespace VMAP
 
     void StaticMapTree::UnloadMapTile(uint32 tileX, uint32 tileY)
     {
-        std::unique_lock<std::shared_mutex> lock(_mutex);
+        GEOMETRY_WRITE_SCOPE(_writing);
         uint32 tileID = packTileID(tileX, tileY);
         loadedTileMap::iterator tile = iLoadedTiles.find(tileID);
         if (tile == iLoadedTiles.end())

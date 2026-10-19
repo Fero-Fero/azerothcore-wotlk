@@ -216,17 +216,112 @@ Same budget for `findStraightPath` smoothing (`MAX_POINT_PATH_LENGTH` already ca
 
 ## Checklist
 
-- [ ] Chase–Lev deques (Lê et al. 2013 fences), growth at the seal only, wake overflow vector; `next` is a plain ring.
-- [ ] Claim CAS + `_scheduledBeat` CAS dedupe; dropped count subtracted from completion.
-- [ ] Steal random start, one round.
-- [ ] Per-core padded `completed`; `published` fixed before wake; semaphore wake once per beat.
-- [ ] `tIdle`, `tail` recorded.
-- [ ] `StaticMapTree::_mutex` deleted, `SharedNavMesh` counters debug-only, `MapGridManager` readers unlocked, `_gridLock` on `CreateGrid` only.
-- [ ] Per-worker nav queries keyed by mesh pointer, freed on map unload in S2; `MMapData::_navMeshQuery` deleted.
-- [ ] U2 view chunks (`VIEW_CHUNK_TARGETS`, `_lastViewNs`), bucket ranges, last-chunk commit; `view_tail` recorded.
-- [ ] S1a grid items and S1b map items on the pool; `grid_tail`, `seal_tail` recorded.
-- [ ] `PopHeavy` across all cores before `current`; two-level `stealOrder` (local node first).
-- [ ] Per-beat path budget via sliced Detour API, `CONFIG_PATH_ITER_BUDGET`, `path` split in `.debug slowtasks`.
-- [ ] First-touch allocation of per-core buffers in `WorkerMain`; optional `MapUpdate.PhaseAffinity`.
-- [ ] `Start` once after load, `Stop` joins at shutdown.
-- [ ] Checks 1–12 passed and written in the exit note.
+- [x] Chase–Lev deques (Lê et al. 2013 fences), growth at the seal only, wake overflow vector; `next` is a plain ring. (`next` is a `std::vector`, `Fill`ed into the deque at phase start; no overflow vector needed — see Status)
+- [x] Claim CAS + `_scheduledBeat` CAS dedupe; dropped count subtracted from completion. (`completed + dropped == published`)
+- [x] Steal random start, one round.
+- [x] Per-core padded `completed`; `published` fixed before wake; semaphore wake once per beat.
+- [x] `tIdle`, `tail` recorded.
+- [x] `StaticMapTree::_mutex` deleted, `SharedNavMesh` counters debug-only, `MapGridManager` readers unlocked, `_gridLock` on `CreateGrid` only.
+- [x] Per-worker nav queries keyed by mesh pointer, freed on map unload in S2; `MMapData::_navMeshQuery` deleted. (freed from `~MapCollisionData` when the last holder of the mesh goes, which is S2 / shutdown)
+- [x] U2 view chunks (`VIEW_CHUNK_TARGETS`, `_lastViewNs`), bucket ranges, last-chunk commit; `view_tail` recorded.
+- [ ] S1a grid items and S1b map items on the pool; `grid_tail`, `seal_tail` recorded. (S1b done, `seal_tail` recorded; S1a does not exist — step 12 left it open, see Status)
+- [x] `PopHeavy` across all cores before `current`; two-level `stealOrder` (local node first).
+- [x] Per-beat path budget via sliced Detour API, `CONFIG_PATH_ITER_BUDGET`, `path` split in `.debug slowtasks`.
+- [x] First-touch allocation of per-core buffers in `WorkerMain`; optional `MapUpdate.PhaseAffinity`.
+- [x] `Start` once after load, `Stop` joins at shutdown.
+- [ ] Checks 1–12 passed and written in the exit note. (not run: building and running the server were not permitted in this session)
+
+## Status / exit note
+
+Implemented statically; `apps/codestyle/codestyle-cpp.py` clean, no build. Checks 1–12 are still owed to the first session that may build.
+
+**What landed, by file.**
+
+- `Maps/BeatPool.h/.cpp` — rewritten. `WorkItem` (16-byte tagged `Unit` / `View` / `MapSeal`; object items hold the
+  `WorldObject*` so `Unschedule` can match them). `WorkDeque` with the Lê et al. 2013 fences (`seq_cst` fence in `pop`,
+  `acquire` loads + `seq_cst` fence + CAS in `steal`, retry on abort); `Fill(vector)` copies a phase's items in before
+  the wake, so the ring never grows mid-phase. `CoreState` per core: `current` / `heavy` deques, `next` / `heavyNext` /
+  `viewItems` / `sealItems` vectors, `stealOrder`, nav queries, slow tasks, slot indices to return, free list, clocks,
+  `alignas(64) completed` / `dropped`. `Init(key)` clamps to 1..64; `Start()` reads `MapUpdate.PhaseAffinity`, builds
+  the two-level steal orders (NUMA node of each pinned CPU via `GetNumaProcessorNode` / sysfs; random order when not
+  pinned), spawns `cores − 1` workers; `Stop()` sets `_stop`, releases the beat semaphore, joins. `WorkerMain` pins,
+  sets `BeatContext::core`, first-touches its `CoreState` vectors, then loops `_beatSem.acquire → WorkerLoop →
+  _completionSem.release`. `RunBeat`: swap `heavyNext → heavy`, `Fill(next)`, U1, `PreloadViewGrids` (coordinator,
+  under `SealTaskScope`), U2 (view items sorted by `lastNs`, heaviest first), S1b (maps spread `id % cores`, sorted
+  by `_lastSealNs`), S2. `RunPhase` fixes `published`, skips the wake when zero, otherwise releases the semaphore
+  `threads` times, runs the coordinator's own `WorkerLoop`, then `WaitCompletion` acquires `threads` parks and asserts
+  `Σ(completed + dropped) == published`; `idle` accumulates park-to-phase-end per core. `WorkerLoop`: probe every
+  core's `heavy` until empty, pop own `current`, one steal pass over `stealOrder`, park. `RunItem` claims via
+  `TryClaim`, counts a lost claim in `dropped`. `TaskBody` as step 12 plus the `path` split, per-core slow tasks,
+  `heavyNext` / `next` republish. `QueueView` picks the chunk count from `max(byCount, byTime)` clamped to `cores`
+  and calls `BeginViewPhase`. `SealSerial`: global defers, free the per-core `freeList`s, destroy expired instances,
+  return slot indices, clear view items, heavy threshold, flush. Log line adds `idle`, `barrier`, `claim`,
+  `wake_dup`, `path`.
+- `Object.h/.cpp` — `_claimed` + `TryClaim` / `Unclaim`; `ReturnSlotIndex` goes through the pool (per-core list).
+- `MapDefer.h`, `Map.h/.cpp` — `DeferBufferSet` (64 `DeferBuffer`s indexed by `BeatContext::core`) replaces the
+  single per-map buffer, which was a hidden race once U1 ran on several cores. `Map::DeleteFromWorld` inside a beat
+  defers the `delete` to `FreeAtSealSerial`. `_lastSealNs` for the S1b ordering.
+- `Player.h`, `PlayerUpdates.cpp` — `ViewWork::lastNs` / `chunkNs`; `BeginViewPhase(chunks)` (owner's U1 task) and
+  `RunViewChunk(chunk)` (any core; chunk 0 also does the scan and pokes; the last finisher through
+  `chunksDone.fetch_add(acq_rel)` sums `lastNs` and runs `ViewCommit`). `RunViewPhase()` = `BeginViewPhase(1);
+  RunViewChunk(0)` for the key-1 path.
+- `ViewCommit` under concurrent U2: the pet-left-range `Pet::Remove` (writes the pet: `CombatStop`, auras, while
+  another viewer's commit may be reading it in `GetInitialVisiblePackets`) is deferred to the owner's next U1
+  via `ViewWork::petLeftRange`, checked at the top of `Player::Update`; outside a beat it still runs inline.
+  With that, nothing in U2 writes a unit, so `GetInitialVisiblePackets` reading a target's live aura list is a
+  read of quiescent state.
+- `ObjectVisibilityContainer.h/.cpp` — view commits now run concurrently in U2, so two viewers may link the same
+  target in the same phase: the two `Direct*VisiblePlayerReference` writers take a one-byte `atomic_flag` spinlock.
+  Nothing reads a target's `_visiblePlayersMap` in U2 (owner-only, U1 / seal), so that is the whole protocol.
+  `USE_VISIBILITY_LINK_RECORDS` stays `false` (the dead-pointer issue from step 10 is unchanged).
+- `Collision/Maps/MapTree.h/.cpp` — `_mutex` deleted; debug `GEOMETRY_READ_GUARD(_writing)` on every reader and
+  `GEOMETRY_WRITE_SCOPE(_writing)` on `InitMap` / `UnloadMap` / `LoadMapTile` / `UnloadMapTile`, both asserting the
+  `GeometryWriteCheck` callback (`InSealTask() || !InBeat()`, installed by `MapMgr::Initialize` because `src/common`
+  cannot see `BeatContext`). `SharedNavMesh` — mutex gone, `EnterQuery` / `LeaveQuery` count only under
+  `ACORE_DEBUG`, `Write` asserts the callback and `_queries == 0`. `MapGridManager` — all readers unlocked,
+  `_gridLock` only in `CreateGrid`.
+- `MapCollisionData.h/.cpp`, `PathGenerator.h/.cpp`, `cs_mmaps.cpp` — `MMapData::_navMeshQuery` deleted; every query
+  comes from `sBeatPool->NavQueryFor(mesh)` (per-core map keyed by `dtNavMesh const*`); `~MapCollisionData` calls
+  `ForgetNavMesh` when it is the last holder. `PathGenerator::CalculatePath` re-resolves the query every call
+  (long-lived generators migrate between cores) and times itself into `AddPathNs`. `FindPathBudgeted` uses
+  `initSlicedFindPath` / `updateSlicedFindPath(budget)` / `finalizeSlicedFindPath` and flags `DT_PARTIAL_RESULT` +
+  `CountPathIncomplete` when the budget runs out; budget 0 falls back to `findPath`.
+- `WorldConfig.h/.cpp`, `worldserver.conf.dist` — `MapUpdate.PathIterBudget` (512), `MapUpdate.PhaseAffinity` (""),
+  `MapUpdate.PhaseThreads` range 1..64.
+- `MapMgr.h/.cpp`, `World.cpp` — `Initialize` sizes the record logs to `max(key, MapUpdate.Threads + 1)`, `Init`s the
+  pool, installs the geometry write check; `StartBeatPool()` (after the preload wait, not in dry run) waits for the
+  updater and `Start`s when `Cores() > 1`; `UnloadAll` `Stop`s first.
+- `cs_debug.cpp` — `.debug slowtasks` prints `cores`, `idle`, `view_tail`, `seal_tail`, `barrier`, `path`,
+  `path_incomplete`, `claim`, `wake_dup` and the per-task `path` split.
+
+**Deviations.**
+
+- **S1a is absent.** Step 12 left grid items open, so "S1a on the pool" has nothing to run on; S1b map items are on the
+  pool and `seal_tail` is recorded, `grid_tail` is not. Grid loads for viewers entering unloaded grids run serially
+  on the coordinator between U1 and U2 (`PreloadViewGrids`, under `SealTaskScope` so the geometry write check
+  passes); this is the only `LoadGrid` inside a beat and never on a worker.
+- **`next` is a vector, not a ring.** The plan's mid-beat `Wake` push onto the caller's `next` is a single-producer
+  push onto a per-core `std::vector`, copied into the deque by `Fill` at phase start. Growth is amortised and never
+  touches the concurrent ring, so the wake-overflow vector and the 75 % growth rule are unnecessary.
+- **Completion counts `completed + dropped == published`**, not `completed − dropped`: a dropped item never
+  increments `completed`, so subtracting would double-count.
+- **`WaitCompletion` waits for `threads` parks, not for the count alone**: a worker may still be in its last fruitless
+  steal pass when the count is reached, and the coordinator must not `Fill` the deques under it.
+- **`heavy` / `heavyNext` swap.** Step 12 pushed heavy roots onto `heavy` during U1 and popped them in the same beat;
+  they now go to `heavyNext` and are swapped in at the next beat start.
+- **Frees are deferred to S2.** `Map::DeleteFromWorld` inside a beat pushes to the core's `freeList`; `Unschedule`
+  asserts `!InBeat()` instead of scanning other cores' lists (which would race with S1b pushes).
+- **`finalizeSlicedFindPath`** instead of `finalizeSlicedFindPathPartial`: the partial variant needs an existing
+  path to splice onto; the plain finalize returns the path to `lastBestNode` with the partial flag set.
+- **NUMA steal order only with `PhaseAffinity`.** Without pinning a worker's node is unknown, so the order is a random
+  rotation of all cores.
+- **Record logs sized to `max(key, Threads + 1)`** so the legacy `MapUpdater` threads (still used for loading) keep
+  their slots.
+- **`_claimed` is a safety net** as planned; the `_scheduledBeat` CAS is the dedupe. Both counters are in the log
+  line (`claim`, `wake_dup`) for check 5.
+- **Sibling instances and the shared tree.** Two instances of one map share a `StaticMapTree`; an S1b seal task on
+  one may read it while the other's seal task installs a tile. The debug `_writing` guard catches this; the fix
+  (tile loads collected into S2, or per-map-id seal items) is left for the first debug run to confirm it matters.
+
+**Open items carried to `plans/leftovers.md`:** S1a grid items, `GridLoad` defers, dyn-tree rebalance cap, the
+sibling-instance tile install, flipping `USE_VISIBILITY_LINK_RECORDS`, and checks 1–12.

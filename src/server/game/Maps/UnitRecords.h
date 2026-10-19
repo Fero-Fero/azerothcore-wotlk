@@ -53,7 +53,8 @@ struct RecordHeader
     uint32 sequence;       // per-log monotonic, for a stable sort after source guid
     uint16 size;           // payload bytes
     RecordKind kind;
-    uint8 pad;
+    uint8 depth;           // step 15: chain depth, 1 + the depth of the record being applied when this was written
+                           // (1 for a task's own action: a hit is 1, the proc cast it triggers landing is 2, ...)
 
     static constexpr uint32 NO_RECORD = ~0u;
 };

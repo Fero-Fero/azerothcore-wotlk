@@ -25,7 +25,9 @@
 #include "SharedDefines.h"
 #include "SpellAuraDefines.h"
 #include <atomic>
+#include <cstddef>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -165,7 +167,9 @@ public:
     ObjectSlotPair(ObjectSlotPair const&) = delete;
     ObjectSlotPair& operator=(ObjectSlotPair const&) = delete;
 
-    // One allocation for both slots: values*2 and masks*2. Aura arrays start at 64 (unit) or 0 and grow by doubling.
+    // Owner: the WorldObject, by value (step 16 table). Init at _OnValuesInitialized, freed with the object.
+    // One allocation for both slots' values and masks; the aura and movement arrays are one allocation per
+    // slot, so growing the write slot's never moves or frees what a reader of the published slot holds.
     void Init(uint16 valuesCount, bool isUnit);
     [[nodiscard]] bool IsInitialized() const { return _storage != nullptr; }
 
@@ -177,29 +181,42 @@ public:
     void Commit(uint32 beat) { _publishedBeat.store(beat, std::memory_order_release); }
     [[nodiscard]] uint32 PublishedBeat() const { return _publishedBeat.load(std::memory_order_relaxed); }
 
-    // Grows the aura arrays of both slots when count exceeds capacity. Never shrinks. Called from FillSlot only.
+    // Grows the write slot's aura array when count exceeds its capacity. Never shrinks; the published slot's
+    // array is not touched (a reader on another core may be walking it). Called from FillSlot only.
     void EnsureAuraCapacity(uint32 count);
-    [[nodiscard]] uint32 AuraCapacity() const { return _auraCapacity; }
+    [[nodiscard]] uint32 AuraCapacity() const { return _auraCapacity[WriteIndex()]; }
 
-    // Grows the movement block storage of both slots. Never shrinks. Called from PublishSlot only.
+    // Grows the write slot's movement block storage. Never shrinks. Called from PublishSlot only.
     void EnsureMovementCapacity(uint32 bytes);
+    [[nodiscard]] uint32 MovementCapacity() const { return _movementCapacity[WriteIndex()]; }
+
+    // Step 16: regrowths since Init, for `.debug slot` and `.debug memory`.
+    [[nodiscard]] uint32 Regrowths() const { return _regrowths; }
+    // Heap bytes held by this pair (values, masks, both slots' aura and movement arrays).
+    [[nodiscard]] std::size_t HeapBytes() const;
 
     // Dense per-process index for the record log's head arrays (step 06). NO_SLOT_INDEX until AddToWorld.
     [[nodiscard]] uint32 SlotIndex() const { return _slotIndex; }
     void SetSlotIndex(uint32 index) { _slotIndex = index; }
 
 private:
+    [[nodiscard]] uint32 WriteIndex() const { return (_publishedBeat.load(std::memory_order_relaxed) + 1) & 1; }
+
     ObjectSlot _slot[2];
     std::atomic<uint32> _publishedBeat{0};
     uint32 _slotIndex = NO_SLOT_INDEX;
-    std::unique_ptr<uint32[]> _storage;        // values and masks for both slots
-    std::unique_ptr<SlotAura[]> _auraStorage;  // aura arrays for both slots
-    uint32 _auraCapacity = 0;
-    std::unique_ptr<uint8[]> _movementStorage; // movement blocks for both slots
-    uint32 _movementCapacity = 0;
+    uint32 _valuesWords = 0;                      // words per slot in _storage (values + mask)
+    std::unique_ptr<uint32[]> _storage;           // values and masks for both slots
+    std::unique_ptr<SlotAura[]> _auraStorage[2];  // one aura array per slot
+    uint32 _auraCapacity[2] = { 0, 0 };
+    std::unique_ptr<uint8[]> _movementStorage[2]; // one movement block per slot
+    uint32 _movementCapacity[2] = { 0, 0 };
+    uint32 _regrowths = 0;
 };
 
 // Hands out dense slot indices. Taken at add/remove only, which happen between beats or at the seal.
+// Step 16: an index released in beat k addresses record heads written in beat k that are still readable in
+// beat k + 1, so it is not handed out again before beat k + 1 has begun (the free list is beat-tagged).
 class SlotIndexAllocator
 {
 public:
@@ -208,9 +225,17 @@ public:
     uint32 Allocate();
     void Release(uint32 index);
     [[nodiscard]] uint32 Capacity() const;
+    // Indices on the free list (Capacity() − FreeCount() are in use).
+    [[nodiscard]] uint32 FreeCount() const;
 
 private:
-    std::vector<uint32> _free;
+    struct Freed
+    {
+        uint32 index;
+        uint32 beat;    // BeatContext::beat at Release
+    };
+
+    std::deque<Freed> _free;   // oldest release first
     uint32 _next = 0;
     mutable std::mutex _lock;
 };

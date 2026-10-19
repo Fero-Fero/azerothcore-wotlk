@@ -27,6 +27,7 @@
 #include "DatabaseEnv.h"
 #include "Chat.h"
 #include "CommandScript.h"
+#include "CrowdBuffer.h"
 #include "GridNotifiersImpl.h"
 #include "GuildMgr.h"
 #include "ItemTemplate.h"
@@ -42,14 +43,46 @@
 #include "RBAC.h"
 #include "RaceMgr.h"
 #include "ScriptMgr.h"
+#include "SpellMgr.h"
 #include "Transport.h"
+#include "UnitRecordLog.h"
 #include "Warden.h"
 #include <algorithm>
 #include <fstream>
 #include <map>
 #include <set>
 
+#if AC_PLATFORM == AC_PLATFORM_WINDOWS
+#include <windows.h>
+#include <psapi.h>
+#elif AC_PLATFORM == AC_PLATFORM_UNIX
+#include <unistd.h>
+#endif
+
 using namespace Acore::ChatCommands;
+
+namespace
+{
+    // Resident set size of this process in KiB (0 where unknown). Step 16 measurement.
+    std::size_t ResidentKiB()
+    {
+#if AC_PLATFORM == AC_PLATFORM_WINDOWS
+        PROCESS_MEMORY_COUNTERS counters{};
+        counters.cb = sizeof(counters);
+        if (GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters)))
+            return std::size_t(counters.WorkingSetSize / 1024);
+        return 0;
+#elif AC_PLATFORM == AC_PLATFORM_UNIX
+        std::ifstream statm("/proc/self/statm");
+        std::size_t pages = 0, resident = 0;
+        if (statm >> pages >> resident)
+            return resident * std::size_t(sysconf(_SC_PAGESIZE)) / 1024;
+        return 0;
+#else
+        return 0;
+#endif
+    }
+}
 
 class debug_commandscript : public CommandScript
 {
@@ -123,7 +156,9 @@ public:
             { "slot",           HandleDebugSlotCommand,                rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::No },
             { "foreignreads",   HandleDebugForeignReadsCommand,        rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::Yes},
             { "singletons",     HandleDebugSingletonsCommand,          rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::Yes},
-            { "slowtasks",      HandleDebugSlowTasksCommand,           rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::Yes}
+            { "slowtasks",      HandleDebugSlowTasksCommand,           rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::Yes},
+            { "procchain",      HandleDebugProcChainCommand,           rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::Yes},
+            { "memory",         HandleDebugMemoryCommand,              rbac::RBAC_PERM_COMMAND_DEBUG_INFO,     Console::Yes}
         };
         static ChatCommandTable commandTable =
         {
@@ -1486,14 +1521,132 @@ public:
     static bool HandleDebugSlowTasksCommand(ChatHandler* handler)
     {
         PoolClock const& c = sBeatPool->LastClock();
-        handler->PSendSysMessage("Beat {}: tasks={} wall={}us task={}us tail={}us view={}us seal_map={}us seal_ser={}us heavy_threshold={}us",
-            sBeatPool->Beat(), c.tasks, c.wall / 1000, c.task / 1000, c.tail / 1000, c.view / 1000,
-            c.sealMap / 1000, c.sealSer / 1000, sBeatPool->HeavyThresholdNs() / 1000);
+        handler->PSendSysMessage("Beat {} on {} core(s): tasks={} wall={}us task={}us tail={}us idle={}us view={}us view_tail={}us "
+            "seal_map={}us seal_tail={}us seal_ser={}us barrier={}us path={}us path_incomplete={} claim={} wake_dup={} heavy_threshold={}us "
+            "crowd_cells={} crowd_built={} crowd_copied={}",
+            sBeatPool->Beat(), sBeatPool->Cores(), c.tasks, c.wall / 1000, c.task / 1000, c.tail / 1000, c.idle / 1000,
+            c.view / 1000, c.viewTail / 1000, c.sealMap / 1000, c.sealTail / 1000, c.sealSer / 1000, c.barrier / 1000,
+            c.path / 1000, c.pathIncomplete, c.claimsLost, c.wakeDups, sBeatPool->HeavyThresholdNs() / 1000,
+            c.crowdCells, c.crowdBuilt, c.crowdCopied);
 
         for (SlowTask const& task : sBeatPool->LastSlowTasks())
-            handler->PSendSysMessage("  {}{} entry={} map={} {}us (inbox {}us, update {}us, publish {}us)",
+            handler->PSendSysMessage("  {}{} entry={} map={} {}us (inbox {}us, update {}us, publish {}us, path {}us)",
                 task.heavy ? "[heavy] " : "", task.guid.ToString(), task.entry, task.mapId, task.ns / 1000,
-                task.inboxNs / 1000, task.updateNs / 1000, task.publishNs / 1000);
+                task.inboxNs / 1000, task.updateNs / 1000, task.publishNs / 1000, task.pathNs / 1000);
+        return true;
+    }
+
+    // Step 15: histogram of record chain depths since the last query (a hit is depth 1, the proc cast it
+    // triggers landing is 2, that cast's proc 3, ...), the deepest chain, and the spells that reached
+    // RecordChain::DEEP_FROM. Each depth is one beat of player-visible delay. Resets the counters on read.
+    static bool HandleDebugProcChainCommand(ChatHandler* handler)
+    {
+        RecordChain::Report const report = RecordChain::Collect(true);
+
+        uint64 total = 0;
+        for (uint32 count : report.histogram)
+            total += count;
+
+        std::string line;
+        for (uint8 d = 1; d < RecordChain::MAX_DEPTH; ++d)
+        {
+            if (!report.histogram[d])
+                continue;
+            if (!line.empty())
+                line += ' ';
+            line += Acore::StringFormat("{}{}:{}", d, d == RecordChain::MAX_DEPTH - 1 ? "+" : "", report.histogram[d]);
+        }
+        handler->PSendSysMessage("Record chains: {} record(s), deepest {} (depth:count {})", total, report.maxDepth, line.empty() ? "-" : line);
+
+        if (report.deepSpells.empty())
+        {
+            handler->PSendSysMessage("No spell record reached depth {}.", RecordChain::DEEP_FROM);
+            return true;
+        }
+
+        handler->PSendSysMessage("Spells with a record at depth >= {} (candidates for the inline FollowUpCast list):", RecordChain::DEEP_FROM);
+        for (auto const& [spellId, depth] : report.deepSpells)
+        {
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+            char const* name = info && info->SpellName[handler->GetSessionDbcLocale()] ? info->SpellName[handler->GetSessionDbcLocale()] : "?";
+            handler->PSendSysMessage("  {} {} depth {}", spellId, name, depth);
+        }
+        return true;
+    }
+
+    // Step 16: resident capacities of every buffer the beat loop owns, next to the process RSS, so a steady −
+    // start difference in the soak can be matched against the "Grows?" column of the owner table.
+    static bool HandleDebugMemoryCommand(ChatHandler* handler)
+    {
+        handler->PSendSysMessage("Process resident: {} KB, beat {}", ResidentKiB(), sBeatPool->Beat());
+
+        // Pool cores
+        std::size_t poolItems = 0;
+        for (BeatPool::CoreMemory const& m : sBeatPool->Memory())
+        {
+            poolItems += m.current + m.heavy + m.next + m.heavyNext + m.viewItems + m.sealItems + m.crowdItems;
+            handler->PSendSysMessage("  core {}: deque {} heavy {} next {} heavyNext {} view {} seal {} crowd {} items; free {} slotret {} entries; navq {} slow {}",
+                m.core, m.current, m.heavy, m.next, m.heavyNext, m.viewItems, m.sealItems, m.crowdItems, m.freeList, m.slotReturns, m.navQueries, m.slowTasks);
+        }
+        handler->PSendSysMessage("  pool item arrays: {} KB", poolItems * sizeof(WorkItem) / 1024);
+
+        // Record logs: both parities of every core
+        std::size_t logBytes = 0, logHigh = 0, headEntries = 0;
+        uint32 spills = 0;
+        for (uint8 parity = 0; parity < 2; ++parity)
+            for (uint8 core = 0; core < sRecordLogs->Cores(); ++core)
+            {
+                UnitRecordLog const& log = sRecordLogs->Log(parity, core);
+                logBytes += log.Capacity();
+                logHigh = std::max(logHigh, log.HighWater());
+                headEntries += log.HeadCapacity();
+                spills += log.Spills();
+            }
+        handler->PSendSysMessage("Record logs: {} x 2 parities, {} KB bytes (+{} KB heads), high-water {} KB in one log, {} spill(s)",
+            sRecordLogs->Cores(), logBytes / 1024, headEntries * sizeof(TargetHead) / 1024, logHigh / 1024, spills);
+
+        // Slot indices
+        uint32 const slotCapacity = sSlotIndexAllocator->Capacity();
+        uint32 const slotFree = sSlotIndexAllocator->FreeCount();
+        handler->PSendSysMessage("Slot indices: {} handed out (high-water), {} in use, {} on the free list", slotCapacity, slotCapacity - slotFree, slotFree);
+
+        // Per map: defer buffers and (step 17) crowd buffers
+        std::size_t deferBytes = 0, deferHigh = 0, crowdBytes = 0;
+        uint32 maps = 0, deferBuffers = 0, crowdBuffers = 0, crowdActive = 0;
+        sMapMgr->DoForAllMaps([&](Map* map)
+        {
+            ++maps;
+            deferBytes += map->Defers().Capacity();
+            deferHigh += map->Defers().HighWater();
+            deferBuffers += map->Defers().Allocated();
+            for (auto const& [cellId, buffer] : map->CrowdBuffers())
+            {
+                ++crowdBuffers;
+                crowdActive += buffer->Active();
+                crowdBytes += buffer->HeapBytes();
+            }
+        });
+        handler->PSendSysMessage("Defer buffers: {} map(s), {} buffer(s) allocated, {} KB resident, {} KB high-water", maps, deferBuffers, deferBytes / 1024, deferHigh / 1024);
+        handler->PSendSysMessage("Crowd buffers ({}): {} allocated, {} active, {} KB resident",
+            sWorld->getBoolConfig(CONFIG_CROWD_BUFFER) ? "on" : "off", crowdBuffers, crowdActive, crowdBytes / 1024);
+
+        // Players: ViewWork packet buffers and slot pairs
+        std::size_t viewBytes = 0, pairBytes = 0;
+        uint32 players = 0, regrowths = 0, chunks = 0;
+        for (auto const& [guid, player] : ObjectAccessor::GetPlayers())
+        {
+            if (!player->IsInWorld())
+                continue;
+            ++players;
+            Player::ViewWork const& view = player->View();
+            chunks += uint32(view.chunkData.size());
+            for (UpdateData const& data : view.chunkData)
+                viewBytes += data.Capacity();
+            viewBytes += view.seen.bucket_count() * sizeof(void*) + view.pokes.capacity() * sizeof(ObjectGuid);
+            pairBytes += player->Slots().HeapBytes();
+            regrowths += player->Slots().Regrowths();
+        }
+        handler->PSendSysMessage("Players: {} in world, {} view chunk buffer(s) {} KB, slot pairs {} KB ({} regrowth(s))", players, chunks, viewBytes / 1024, pairBytes / 1024, regrowths);
         return true;
     }
 
@@ -1539,8 +1692,8 @@ public:
         handler->PSendSysMessage("  alive {} combat {} unitState {:#x} moveFlags {:#x} victim {} owner {}",
             r.IsAlive(), s.isInCombat, s.unitState, s.movementFlags,
             s.victimGuid.ToString(), s.charmerOrOwnerGuid.ToString());
-        handler->PSendSysMessage("  auras slot {} live {} capacity {}",
-            s.auraCount, uint32(target->GetAppliedAuras().size()), pair.AuraCapacity());
+        handler->PSendSysMessage("  auras slot {} live {} capacity {} | pair {} bytes, {} regrowth(s)",
+            s.auraCount, uint32(target->GetAppliedAuras().size()), pair.AuraCapacity(), pair.HeapBytes(), pair.Regrowths());
         if (diffWords)
             handler->PSendSysMessage("  value words differing from live: {} (first at index {})", diffWords, firstDiff);
         else
