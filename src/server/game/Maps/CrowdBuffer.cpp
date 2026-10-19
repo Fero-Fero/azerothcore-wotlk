@@ -60,11 +60,12 @@ void CrowdBuffer::Build(Map& map, uint32 beat)
     _ready.store(true, std::memory_order_release);
 }
 
-void CrowdBuffer::WaitReady() const
+bool CrowdBuffer::WaitReady() const
 {
     // Bounded: a missing crowd item must not park every view chunk (and then BeatPool::Stop's join).
     for (uint32 n = 0; n < 10000 && !_ready.load(std::memory_order_acquire); ++n)
         std::this_thread::yield();
+    return _ready.load(std::memory_order_acquire);
 }
 
 BuildValuesCachedBuffer const* CrowdBuffer::Find(ObjectGuid guid) const

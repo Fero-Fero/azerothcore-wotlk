@@ -41,6 +41,12 @@
 #include <chrono>
 
 #if AC_PLATFORM == AC_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #else
 #include <pthread.h>
@@ -144,7 +150,9 @@ WorkItem WorkDeque::pop()
 
 WorkItem WorkDeque::steal()
 {
-    for (uint32 tries = 0; tries < 64; ++tries)
+    // ABORT in the paper means another thief or the owner took the slot; look again. Returning empty while
+    // the deque is still non-empty drops the item: every core then parks and the phase assert fires.
+    for (;;)
     {
         int64 t = _top.load(std::memory_order_acquire);
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -154,9 +162,7 @@ WorkItem WorkDeque::steal()
         WorkItem x = _items[std::size_t(t)];
         if (_top.compare_exchange_strong(t, t + 1, std::memory_order_seq_cst, std::memory_order_relaxed))
             return x;
-        // ABORT in the paper: another thief or the owner took it; look again.
     }
-    return WorkItem();
 }
 
 std::size_t WorkDeque::size() const
@@ -457,7 +463,10 @@ dtNavMeshQuery const* BeatPool::NavQueryFor(SharedNavMesh const& mesh)
     auto it = me.navQueries.find(raw);
     if (it == me.navQueries.end())
     {
-        MMAP::ManagedNavMeshQuery query(dtAllocNavMeshQuery());
+        dtNavMeshQuery* rawQuery = dtAllocNavMeshQuery();
+        if (!rawQuery)
+            return nullptr;
+        MMAP::ManagedNavMeshQuery query(rawQuery);
         if (dtStatusFailed(query->init(raw, NAV_QUERY_MAX_NODES)))
             return nullptr;
         it = me.navQueries.emplace(raw, std::move(query)).first;
@@ -534,9 +543,30 @@ void BeatPool::RunBeat(uint32 diff)
     // the map; plan 12 left the GridLoad defer for S1a open).
     PreloadViewGrids();
 
-    // U2 — view items, reading this beat's slots; heavy first within a core. Step 17: the crowd items planned
-    // in last beat's S2 take the heavy deques, so every core drains them before any viewer chunk.
+    // U2 — crowd items in their own phase, then view items. Heavy-first inside one phase is not a barrier:
+    // a core that finds the heavy deques empty starts viewer chunks while another core is still inside
+    // CrowdBuffer::Build, and the viewer's WaitReady timeout then reads the index under that writer.
     _heavyThisBeat = 0;
+    uint32 crowdItems = 0;
+    for (auto const& core : _cores)
+    {
+        // A map that went away since S2 (unload between beats) takes its buffers with it; drop its items.
+        std::erase_if(core->crowdItems, [this](WorkItem const& w)
+        {
+            return std::find(_maps.begin(), _maps.end(), static_cast<Map*>(w.ptr)) == _maps.end();
+        });
+        crowdItems += uint32(core->crowdItems.size());
+    }
+    uint64 crowdWall = 0;
+    if (crowdItems)
+    {
+        for (auto const& core : _cores)
+            core->heavy.Fill(core->crowdItems);
+        _heavyThisBeat = crowdItems;
+        RunPhase(Phase::View, diff, crowdWall);
+        _heavyThisBeat = 0;
+    }
+
     for (auto const& core : _cores)
     {
         std::stable_sort(core->viewItems.begin(), core->viewItems.end(), [](WorkItem const& a, WorkItem const& b)
@@ -545,15 +575,9 @@ void BeatPool::RunBeat(uint32 diff)
                 > static_cast<Player*>(static_cast<WorldObject*>(b.ptr))->View().lastNs;
         });
         core->current.Fill(core->viewItems);
-        // A map that went away since S2 (unload between beats) takes its buffers with it; drop its items.
-        std::erase_if(core->crowdItems, [this](WorkItem const& w)
-        {
-            return std::find(_maps.begin(), _maps.end(), static_cast<Map*>(w.ptr)) == _maps.end();
-        });
-        core->heavy.Fill(core->crowdItems);
-        _heavyThisBeat += uint32(core->heavy.size());
     }
     RunPhase(Phase::View, diff, _clock.view);
+    _clock.view += crowdWall;
 
     // S1b — one seal task per map, spread by id so the continents do not start on one core, heavy first.
     _heavyThisBeat = 0;
@@ -922,15 +946,17 @@ void BeatPool::PreloadViewGrids()
 
 void BeatPool::ViewBody(Player* viewer, uint32 chunk, CoreState& me)
 {
-    if (!viewer->IsInWorld())
-        return;
-
     uint64 const t0 = NowNs();
     _crowdCopied = 0;
+    // A player who left between U1 and this chunk still has to count it. RunViewChunk's last-finisher is
+    // what commits; returning here left the other chunks waiting and the visibility delta unsent.
+    if (viewer->IsInWorld())
     {
         TaskScope scope(viewer, viewer->TaskRoot());
         viewer->RunViewChunk(chunk);
     }
+    else
+        viewer->RunViewChunk(chunk);
     me.crowdCopied += _crowdCopied;
     uint64 const dt = NowNs() - t0;
     me.tView += dt;

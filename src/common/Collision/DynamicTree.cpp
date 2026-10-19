@@ -22,7 +22,6 @@
 #include "ModelIgnoreFlags.h"
 #include "ModelInstance.h"
 #include "RegularGrid.h"
-#include "Timer.h"
 #include "VMapFactory.h"
 #include "VMapMgr2.h"
 #include "WorldModel.h"
@@ -35,7 +34,10 @@ using VMAP::ModelInstance;
 
 namespace
 {
-    int CHECK_TREE_PERIOD = 200;
+    // Step 12 residue: a rebalance is ~1 ms and used to run on every changed model. Balance does not affect
+    // query correctness, so wait for a batch of edits or 32 beats, whichever comes first.
+    constexpr int REBALANCE_DIRTY_THRESHOLD = 16;
+    constexpr int REBALANCE_MAX_BEATS = 32;
 }
 
 template<> struct HashTrait< GameObjectModel>
@@ -62,49 +64,49 @@ struct DynTreeImpl : public ParentTree
     typedef ParentTree base;
 
     DynTreeImpl() :
-        rebalance_timer(CHECK_TREE_PERIOD),
-        unbalanced_times(0)
+        _dirtyCount(0),
+        _beatsSinceBalance(0)
     {
     }
 
     void insert(Model const& mdl)
     {
         base::insert(mdl);
-        ++unbalanced_times;
+        ++_dirtyCount;
     }
 
     void remove(Model const& mdl)
     {
         base::remove(mdl);
-        ++unbalanced_times;
+        ++_dirtyCount;
     }
 
     void balance()
     {
         base::balance();
-        unbalanced_times = 0;
+        _dirtyCount = 0;
+        _beatsSinceBalance = 0;
     }
 
-    void update(uint32 difftime)
+    void update(uint32 /*difftime*/)
     {
         if (!size())
+            return;
+
+        if (_dirtyCount <= 0)
         {
+            _beatsSinceBalance = 0;
             return;
         }
 
-        rebalance_timer.Update(difftime);
-        if (rebalance_timer.Passed())
-        {
-            rebalance_timer.Reset(CHECK_TREE_PERIOD);
-            if (unbalanced_times > 0)
-            {
-                balance();
-            }
-        }
+        // Called once per beat from Map::BeatEpilogue.
+        ++_beatsSinceBalance;
+        if (_dirtyCount >= REBALANCE_DIRTY_THRESHOLD || _beatsSinceBalance >= REBALANCE_MAX_BEATS)
+            balance();
     }
 
-    TimeTrackerSmall rebalance_timer;
-    int unbalanced_times;
+    int _dirtyCount;
+    int _beatsSinceBalance;
 };
 
 DynamicMapTree::DynamicMapTree() : impl(new DynTreeImpl()) { }

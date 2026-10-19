@@ -1828,13 +1828,13 @@ void Player::ViewBuild(ViewWork& work, uint32 chunk)
                     Unit* unit = obj->ToUnit();
                     if (unit->SharedBlockApplies(s, this))
                     {
-                        buffer->WaitReady();
-                        if (BuildValuesCachedBuffer const* block = buffer->Find(obj->GetGUID()))
-                        {
-                            unit->AppendSharedValuesBlock(*block, &data, this, s);
-                            BeatPool::CountCrowdCopy();
-                            continue;
-                        }
+                        if (buffer->WaitReady())
+                            if (BuildValuesCachedBuffer const* block = buffer->Find(obj->GetGUID()))
+                            {
+                                unit->AppendSharedValuesBlock(*block, &data, this, s);
+                                BeatPool::CountCrowdCopy();
+                                continue;
+                            }
                     }
                 }
 
@@ -1923,10 +1923,19 @@ void Player::BeginViewPhase(uint32 chunkCount)
 
 void Player::RunViewChunk(uint32 chunk)
 {
-    if (!IsInWorld())
-        return;
-
     ViewWork& work = _view;
+    if (!IsInWorld())
+    {
+        // Count the chunk without committing: the player is gone, and the other chunks must still finish.
+        if (work.chunkCount && work.chunksDone.fetch_add(1, std::memory_order_acq_rel) + 1 == work.chunkCount)
+        {
+            work.delta.left.clear();
+            work.delta.entered.clear();
+            work.seen.clear();
+        }
+        return;
+    }
+
     uint64 const t0 = uint64(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
 

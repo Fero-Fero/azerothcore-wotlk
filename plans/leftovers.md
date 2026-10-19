@@ -1,30 +1,9 @@
-plan §12 slice 4 is designed to be driven by compiler errors: rename m_caster on the land path to a type the handlers can't write through, make SpellScript::GetCaster() return a UnitView, change the CreatureAI::SpellHit / AuraEffect::CalculateAmount parameter types, then build. The error list is the audit — each line becomes a view read, a Feedback() follow-up, or a Deferred row. Without compiling I can't get that list, and editing ~120 handler sites by guesswork would mostly produce wrong edits. So I did the parts that don't depend on compiler output (the GetCasterView / target-count API and the nine scripts) and left the rename for a session where building is allowed.
+Still open
 
-One deliberate deviation, flagged in Status: the link/unlink records are wired but disabled (USE_VISIBILITY_LINK_RECORDS = false). An object removed at the end of this tick would be freed before the record applied next beat, leaving the viewer's map with a dead pointer. The target-side write stays direct (safe while the view phase has no concurrent task); step 12's seal ordering is the point to flip it.
+These were left unfinished on purpose, and a logged-in client is what they need:
 
-Things most likely to need a compile fix when you build: the lambda-free structured bindings in CollectRest, visible.begin(b) local-bucket iteration in ViewBuild, and TeamId(s.vis.teamId) in the slot CanSeeOrDetect.
-
-ModuleDatabasePool is unguarded; the assert will also fire for sync queries from session packets handled inside the player's task, which is the intended debug crash (we should probably try to avoid a crash here)
-
-Left open (listed in the plan's Status): S1a grid items, frees collected for S2, Spawn defers from ProcessRespawns, dyn-tree rebalance cap, .server info comparison. Note that inBeat is now actually true during U1–S1b, so latent MayAccess asserts from step 09 may show up in a debug build.
-
-
-plan 13 was done statically (no build or play-test). The ASSERT_OWNED layer is now on every field getter, so the first debug boot will surface the open rows of the plan 13 exit table before anything else: conditions evaluation inside CanSeeSpellClickOn/CanSeeVendor on a foreign creature (talk to any NPC), CreatureGroup::LeaderStartedMoving writing member motion masters (any formation patrol), and sScriptMgr->OnPatchValuesUpdate receiving the live unit. The debug SendPacket statistic became thread_local; .debug singletons resets its counters on read. Items are owned by their owner's task (MayAccess resolves the owner guid through FindConnectedPlayer), bank/mail items with no connected owner are free.
-
-plan 14 was done statically too. The pool now runs U1, U2 (view chunks) and S1b on `PhaseThreads` cores; S1a still does not exist, so grid relinks stay in S1b and the only in-beat `LoadGrid` is the coordinator's `PreloadViewGrids` between U1 and U2. Things the first debug boot will surface: the `GEOMETRY_READ_GUARD` on `StaticMapTree` when two instances of one map seal concurrently and one installs a tile; `Unschedule` asserting `!InBeat()` on any removal path that still deletes synchronously inside a task (should all go through `Map::DeleteFromWorld`, which defers to S2); `WaitCompletion`'s `completed + dropped == published` if some item path returns without counting. Likely compile fixes: `std::counting_semaphore` max template argument, `GetNumaProcessorNode` needs `<windows.h>` after `NOMINMAX`, `dtNavMeshQuery` ownership in `MMAP::ManagedNavMeshQuery`. Checks 1–12 of plan 14 are not run. `USE_VISIBILITY_LINK_RECORDS` is still false; the target-side write is now guarded by a one-byte spinlock, so flipping it is only needed if the lock shows up in `view_tail`.
-
-plan 15 (soak) could not be run: no build tree or binaries exist on this machine and no compiler is on the path. What landed is the instrumentation the soak reads and did not yet exist: `.debug procchain` (record chain depth in `RecordHeader::depth`, per-core histogram, spells at depth ≥ 4), plus the two `ViewCommit` fixes (pet removal deferred to U1, spinlocked target-side link). The soak's record table is in the plan's Status section. Everything in plans 12–14 marked "first debug boot will surface" is still outstanding and comes before any soak number is meaningful.
-
-plan 16 was done statically. The one real bug it found: `ObjectSlotPair` grew the aura/movement arrays for both slots in one block and freed the old block mid-beat under a concurrent reader of the published slot; the arrays are now per slot. Other changes: `.debug memory`, beat-gated slot index reuse, `RecordLogSet::Shutdown`, `UpdateData::Compact` after view commits, orphaned `AddToMap` defers freed at map unload, the `LoadTile` `fread` leak. Fix 3 (pooled land `Spell`) does not apply: the land `Spell` is a stack object. Soak memory numbers and the ASan/Verifier run are owed to the first session that can build.
-
-plan 17 (crowd buffer) was built statically behind `MapUpdate.CrowdBuffer` (default off), because the step-15 gate numbers that decide whether it is wanted do not exist. It reuses the `_valuesUpdateCache` / `PatchValuesUpdate` split: the per-cell crowd item (U2, heavy deques, planned in S2) builds one `UF_FLAG_PUBLIC` block per player in a ≥ 32-player cell, viewers copy it and patch their indices; self, owner, raid, `SPECIALINFO`, stealth and invisibility take the per-viewer path. "Fixed radius" and "phase exclusion" from the plan text are not needed with per-target blocks (the viewer filters by its own visible map). The gate run (on/off in the same soak, `crowd_copied` vs `crowd_built` in `.debug slowtasks`) and the three-character visibility check are owed to the first session that can build; if the crowd is mostly one raid, `crowd_copied` will be small and the step should be dropped.
-
-
-MapUpdate.Threads = 1
-MapUpdate.PhaseThreads = 1
-
-MapUpdate.Threads = 2
-MapUpdate.PhaseThreads = 2
-
-MapUpdate.Threads = 7
-MapUpdate.PhaseThreads = 7
+Spell-hit slice 4. Land-side scripts still see a live caster. The plan is to change that type and fix each compiler error as a slot read, a feedback record, or a deferred row. That pass is a behavior change, not a mechanical rename.
+Grid tasks (S1a), spawn defers from respawns, and moving every free to the serial seal.
+Visibility link records stay off. An object removed at the end of a tick can be freed before the record is applied.
+Module database pools have no sync-query guard. The main pools do, and in a debug build a sync query from a unit task is still meant to assert.
+Plans 13–17's play checks: foreign-access asserts, the worker soak, memory numbers, and the crowd-buffer on/off comparison. MapUpdate.CrowdBuffer remains off until that comparison exists.

@@ -53,8 +53,9 @@ public:
     // U2, the crowd item: builds the public block of every planned player whose slot changed this beat.
     void Build(Map& map, uint32 beat);
 
-    // U2, a viewer chunk: the crowd item started before any chunk (heavy ring), so this is a short wait.
-    void WaitReady() const;
+    // U2, a viewer chunk. The crowd phase has already finished when viewers run; this only covers a crowd
+    // item that was dropped. False means the buffer is still unpublished — the caller must not read it.
+    [[nodiscard]] bool WaitReady() const;
     [[nodiscard]] BuildValuesCachedBuffer const* Find(ObjectGuid guid) const;
 
     // Step 16: resident bytes, for `.debug memory`.
