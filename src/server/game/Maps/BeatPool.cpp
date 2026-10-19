@@ -58,6 +58,7 @@ namespace
 
     constexpr uint64 LOG_BEAT_OVER_MS = 20;
     constexpr uint64 LOG_EVERY_MS = 5000;
+    constexpr uint64 STALL_CLI_NS = 3000ull * 1000 * 1000; // a phase this slow is a stuck worker, not a beat
     constexpr std::size_t SLOW_TASKS_KEPT = 10;
     constexpr uint32 VIEW_CHUNK_TARGETS = 64;
     constexpr uint32 NAV_QUERY_MAX_NODES = 1024;      // same as MMapMgr::CreateNavMeshQuery
@@ -645,9 +646,15 @@ void BeatPool::WaitCompletion(uint64& barrierNs)
         if (World::IsStopped() || _stop.load(std::memory_order_acquire))
             break;
         _doneCv.wait_for(lock, std::chrono::milliseconds(100));
-        lock.unlock();
-        sWorld->ProcessCliCommands();
-        lock.lock();
+        // Console / RA / SOAP commands write live units and maps. In a normal beat they run between beats (World::
+        // Update, Main); only when a phase has stalled for seconds (a stuck worker) is the console served from here,
+        // so a hung server can still be shut down.
+        if (NowNs() - t0 > STALL_CLI_NS)
+        {
+            lock.unlock();
+            sWorld->ProcessCliCommands();
+            lock.lock();
+        }
     }
     uint64 const t1 = NowNs();
     barrierNs += t1 - t0;

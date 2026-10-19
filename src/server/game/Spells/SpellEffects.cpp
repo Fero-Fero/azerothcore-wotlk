@@ -1963,7 +1963,10 @@ void Spell::EffectPersistentAA(SpellEffIndex effIndex)
         {
             m_spellAura = aura;
             m_spellAura->SetTriggeredByAuraSpellInfo(m_triggeredByAuraSpell.spellInfo);
-            m_spellAura->_RegisterForTargets();
+            // On a unit task the dynobj is not in the world yet (the seal adds it): it has no caster binding and
+            // no place in the grid to search from. Its first update fills and applies the targets.
+            if (dynObj->IsInWorld())
+                m_spellAura->_RegisterForTargets();
         }
         else
             return;

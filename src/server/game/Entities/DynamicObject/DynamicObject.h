@@ -72,6 +72,8 @@ protected:
     Unit* _caster;
     int32 _duration; // for non-aura dynobjects
     bool _isViewpoint;
+    bool _viewpointPending;                 // viewpoint requested before the seal added us to the world
+    bool _viewpointPendingUpdateVisibility;
     uint32 _updateViewerVisibilityTimer;
     ObjectGuid _oldFarsightGUID;
 };

@@ -124,11 +124,13 @@ void PlayerRelocationNotifier::Visit(PlayerMapType& m)
 
 void CreatureRelocationNotifier::Visit(PlayerMapType& m)
 {
-    // Step 10: only the AI half. A creature that moved into a player's range is picked up by the player's
-    // own scan at its next interval; the creature writes no player.
     for (PlayerMapType::iterator iter = m.begin(); iter != m.end(); ++iter)
     {
         Player* player = iter->GetSource();
+
+        // The player's own scan only runs once the player moved, so a creature walking into (or out of) the range of
+        // a standing player must ask for a re-evaluation of itself: a poke the player's view phase resolves.
+        player->PokeVisibilityOf(&i_creature);
 
         // NOTIFY_AI_RELOCATION does not guarantee that player will do it himself (because distance is also checked), but screw it, it's not that important
         if (!player->m_seer->isNeedNotify(NOTIFY_AI_RELOCATION) && !i_creature.IsMoveInLineOfSightStrictlyDisabled())

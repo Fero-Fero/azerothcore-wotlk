@@ -22,6 +22,8 @@
 #include "G3D/Array.h"
 #include "G3D/Set.h"
 #include "G3D/Table.h"
+#include <atomic>
+#include <mutex>
 
 template<class T, class BoundsFunc = BoundsTrait<T>>
 class BIHWrap
@@ -69,7 +71,11 @@ class BIHWrap
     ObjArray m_objects;
     G3D::Table<T const*, uint32> m_obj2Idx;
     G3D::Set<T const*> m_objects_to_push;
-    int unbalanced_times;
+    // Raised by insert/remove (never concurrent with a reader), cleared by balance() once the rebuild is done.
+    // Readers rebuild lazily, and map update tasks read the same tree on several cores: the rebuild runs under
+    // m_balanceMutex and the counter drops only after it, so a reader that sees 0 sees a finished tree.
+    std::atomic<int> unbalanced_times;
+    std::mutex m_balanceMutex;
 
 public:
     BIHWrap() : unbalanced_times(0) { }
@@ -97,18 +103,27 @@ public:
 
     void balance()
     {
-        if (unbalanced_times == 0)
+        if (unbalanced_times.load(std::memory_order_acquire) == 0)
         {
             return;
         }
 
-        unbalanced_times = 0;
+        std::lock_guard<std::mutex> lock(m_balanceMutex);
+
+        int const pending = unbalanced_times.load(std::memory_order_relaxed);
+        if (pending == 0)
+        {
+            return; // another reader rebuilt while this one waited for the lock
+        }
+
         m_objects.fastClear();
         m_obj2Idx.getKeys(m_objects);
         m_objects_to_push.getMembers(m_objects);
         //assert that m_obj2Idx has all the keys
 
         m_tree.build(m_objects, BoundsFunc::GetBounds2);
+
+        unbalanced_times.fetch_sub(pending, std::memory_order_release);
     }
 
     template<typename RayCallback>

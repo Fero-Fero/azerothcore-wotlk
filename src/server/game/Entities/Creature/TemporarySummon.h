@@ -71,11 +71,17 @@ public:
     void SetVisibleBySummonerOnly(bool visibleBySummonerOnly) { _visibleBySummonerOnly = visibleBySummonerOnly; }
     [[nodiscard]] bool IsVisibleBySummonerOnly() const { return _visibleBySummonerOnly; }
 
+    // Summoned on a unit task: the seal adds the summon to the world (Map::ApplyAddToMap) and only then runs
+    // InitSummon (the owner's JustSummoned, the summon's IsSummonedBy), when the summon has its AI and a place.
+    void SetSummonInitPending(bool pending) { _summonInitPending = pending; }
+    [[nodiscard]] bool IsSummonInitPending() const { return _summonInitPending; }
+
     SummonPropertiesEntry const* const m_Properties;
 
     std::string GetDebugInfo() const override;
 
 private:
+    bool _summonInitPending = false;
     TempSummonType m_type;
     uint32 m_timer;
     uint32 m_lifetime;

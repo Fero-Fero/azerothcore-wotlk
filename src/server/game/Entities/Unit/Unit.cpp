@@ -85,6 +85,21 @@
 #include <cmath>
 #include <limits>
 #include <optional>
+#include <thread>
+
+namespace
+{
+    struct AttackersLockScope
+    {
+        explicit AttackersLockScope(std::atomic_flag& flag) : _flag(flag)
+        {
+            while (_flag.test_and_set(std::memory_order_acquire))
+                std::this_thread::yield();
+        }
+        ~AttackersLockScope() { _flag.clear(std::memory_order_release); }
+        std::atomic_flag& _flag;
+    };
+}
 
 float baseMoveSpeed[MAX_MOVE_TYPE] =
 {
@@ -7844,6 +7859,10 @@ bool Unit::Attack(Unit* victim, bool meleeAttack)
     if (!IsAlive() || !victim->IsAlive())
         return false;
 
+    // a unit with a prepared removal is a dead handle until the seal frees it (it may still read as alive)
+    if (IsRemoving() || victim->IsRemoving())
+        return false;
+
     // pussywizard: check map, world, phase >_> multithreading crash fix
     if (!IsInMap(victim) || !InSamePhase(victim))
         return false;
@@ -7917,11 +7936,15 @@ bool Unit::Attack(Unit* victim, bool meleeAttack)
             ClearUnitState(UNIT_STATE_MELEE_ATTACKING);
     }
 
+    // Link the victim first: a victim whose removal was prepared (its attackers already drained, possibly on
+    // another core) refuses, and nothing of ours changes.
+    if (!victim->_addAttacker(this))
+        return false;
+
     if (m_attacking)
         m_attacking->_removeAttacker(this);
 
     m_attacking = victim;
-    m_attacking->_addAttacker(this);
 
     // Set our target
     SetTarget(victim->GetGUID());
@@ -8144,15 +8167,45 @@ void Unit::AtEngage(Unit* /*target*/)
  */
 void Unit::RemoveAllAttackers()
 {
-    while (!m_attackers.empty())
+    for (;;)
     {
-        AttackerSet::iterator iter = m_attackers.begin();
-        if (!(*iter)->AttackStop())
+        Unit* attacker = nullptr;
+        {
+            // Not held across AttackStop, which erases from this set through _removeAttacker.
+            AttackersLockScope lock(m_attackersLock);
+            if (m_attackers.empty())
+                break;
+            attacker = *m_attackers.begin();
+        }
+
+        if (!attacker->AttackStop())
         {
             LOG_ERROR("entities.unit", "WORLD: Unit has an attacker that isn't attacking it!");
-            m_attackers.erase(iter);
+            _removeAttacker(attacker);
         }
     }
+}
+
+bool Unit::_addAttacker(Unit* pAttacker)
+{
+    AttackersLockScope lock(m_attackersLock);
+    if (m_attackersClosed)
+        return false;
+
+    m_attackers.insert(pAttacker);
+    return true;
+}
+
+void Unit::_removeAttacker(Unit* pAttacker)
+{
+    AttackersLockScope lock(m_attackersLock);
+    m_attackers.erase(pAttacker);
+}
+
+void Unit::CloseAttackers()
+{
+    AttackersLockScope lock(m_attackersLock);
+    m_attackersClosed = true;
 }
 
 void Unit::ModifyAuraState(AuraStateType flag, bool apply)
@@ -11623,15 +11676,20 @@ int32 Unit::ModifyHealth(int32 dVal)
 void Unit::EndHealthBatch()
 {
     ASSERT(_healthBatchDepth > 0);
-    if (--_healthBatchDepth)
+    if (_healthBatchDepth > 1)
+    {
+        --_healthBatchDepth;
         return;
+    }
 
-    if (!_pendingHealthDelta)
-        return;
-
-    // GetHealth() is the batched value until SetHealth clears the delta below.
+    // Read the batched value (field plus pending delta) while the batch is still open: GetHealth() only adds
+    // the delta when the depth is non-zero. SetHealth then writes it and clears the delta.
+    bool const hasPending = _pendingHealthDelta != 0;
     uint32 const health = GetHealth();
-    SetHealth(health);
+    --_healthBatchDepth;
+
+    if (hasPending)
+        SetHealth(health);
 }
 
 int32 Unit::GetHealthGain(int32 dVal)
@@ -13054,34 +13112,50 @@ void Unit::RemoveFromWorld()
             return;
         }
 
-        m_duringRemoveFromWorld = true;
-        if (IsAIEnabled)
-            GetAI()->OnDespawn();
+        RemoveFromWorldOwn(false);
 
-        if (IsVehicle())
-            RemoveVehicleKit();
+        WorldObject::RemoveFromWorld();
+        m_duringRemoveFromWorld = false;
+    }
+}
 
-        RemoveCharmAuras();
-        RemoveBindSightAuras();
-        RemoveNotOwnSingleTargetAuras();
+// The part of leaving the world that only writes this unit (upstream's Unit::RemoveFromWorld body). A prepared
+// removal runs it on the unit's own task from PrepareRemovalOwn; the seal's RemoveFromWorld then only unlinks.
+// Leaves m_duringRemoveFromWorld set: the caller clears it once the unit is out of the world (or, for a prepared
+// removal, right after this returns).
+void Unit::RemoveFromWorldOwn(bool prepared)
+{
+    m_duringRemoveFromWorld = true;
+    if (IsAIEnabled)
+        GetAI()->OnDespawn();
 
-        RemoveAllGameObjects();
-        RemoveAllDynObjects();
+    if (IsVehicle())
+        RemoveVehicleKit();
 
-        ExitVehicle();  // Remove applied auras with SPELL_AURA_CONTROL_VEHICLE
-        UnsummonAllTotems();
-        RemoveAllControlled();
+    RemoveCharmAuras();
+    RemoveBindSightAuras();
+    RemoveNotOwnSingleTargetAuras();
 
-        RemoveAreaAurasDueToLeaveWorld();
+    RemoveAllGameObjects();
+    RemoveAllDynObjects();
 
-        RemoveAllFollowers();
+    ExitVehicle();  // Remove applied auras with SPELL_AURA_CONTROL_VEHICLE
+    UnsummonAllTotems();
+    RemoveAllControlled();
 
-        if (GetCharmerGUID())
-        {
-            LOG_FATAL("entities.unit", "Unit {} has charmer guid when removed from world", GetEntry());
-            ABORT();
-        }
+    RemoveAreaAurasDueToLeaveWorld();
 
+    RemoveAllFollowers();
+
+    if (GetCharmerGUID())
+    {
+        LOG_FATAL("entities.unit", "Unit {} has charmer guid when removed from world", GetEntry());
+        ABORT();
+    }
+
+    // A prepared removal already sent the owner a MinionUnlink record; the owner's list is not ours to write.
+    if (!prepared)
+    {
         if (Unit* owner = GetOwner())
         {
             if (owner->m_Controlled.find(GetGUID()) != owner->m_Controlled.end())
@@ -13092,9 +13166,6 @@ void Unit::RemoveFromWorld()
                 //ABORT();
             }
         }
-
-        WorldObject::RemoveFromWorld();
-        m_duringRemoveFromWorld = false;
     }
 }
 
@@ -13106,8 +13177,18 @@ void Unit::CleanupBeforeRemoveFromMap(bool finalCleanup)
     // This needs to be before RemoveFromWorld to make GetCaster() return a valid pointer on aura removal
     InterruptNonMeleeSpells(true);
 
-    if (IsInWorld() && !_removing) // prepared removals stay addressable until the seal
-        RemoveFromWorld();
+    if (IsInWorld())
+    {
+        if (!_removing)
+            RemoveFromWorld();
+        else
+        {
+            // Prepared removal: stays addressable until the seal, but the own half of leaving the world (minions,
+            // totems, charm, vehicle, dynobjs, single-target auras, AI OnDespawn) runs now, on this task.
+            RemoveFromWorldOwn(true);
+            m_duringRemoveFromWorld = false;
+        }
+    }
 
     // Abort pending events here: left to ~EventProcessor they run after m_spellMods is already
     // destroyed, and cancelling a SpellEvent then hits freed memory in Player::RestoreSpellMods.
@@ -13228,8 +13309,14 @@ void Unit::ApplyRecord(RecordHeader const& header, uint8 const* payload)
             break;
         }
         case RecordKind::ThreatRemove:
-            GetThreatMgr().ApplyThreatRemove(RecordPayload<ThreatRemoveRecord>(payload).deadGuid);
+        {
+            ThreatRemoveRecord const& rec = RecordPayload<ThreatRemoveRecord>(payload);
+            if (rec.backRefOnly)
+                GetThreatMgr().ApplyThreatUnlink(rec.deadGuid);
+            else
+                GetThreatMgr().ApplyThreatRemove(rec.deadGuid);
             break;
+        }
         case RecordKind::CombatRef:
         {
             CombatRefRecord const& rec = RecordPayload<CombatRefRecord>(payload);
@@ -13355,6 +13442,7 @@ void Unit::PrepareRemovalForeign()
         {
             ThreatRemoveRecord record;
             record.deadGuid = deadGuid;
+            record.backRefOnly = 0;
             sRecordLogs->Append(deadGuid, target, RecordKind::ThreatRemove, record);
         }
         else
@@ -13423,6 +13511,10 @@ void Unit::PrepareRemovalForeign()
 
 void Unit::PrepareRemovalOwn()
 {
+    // Before CleanupBeforeRemoveFromMap drains the attackers (CombatStop): any Attack() on this unit from now on
+    // is refused, so the drain is final and ~Unit sees an empty set.
+    CloseAttackers();
+
     if (GetTransport())
     {
         GetTransport()->RemovePassenger(this);

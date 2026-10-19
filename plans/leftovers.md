@@ -18,3 +18,13 @@ plan 15 (soak) could not be run: no build tree or binaries exist on this machine
 plan 16 was done statically. The one real bug it found: `ObjectSlotPair` grew the aura/movement arrays for both slots in one block and freed the old block mid-beat under a concurrent reader of the published slot; the arrays are now per slot. Other changes: `.debug memory`, beat-gated slot index reuse, `RecordLogSet::Shutdown`, `UpdateData::Compact` after view commits, orphaned `AddToMap` defers freed at map unload, the `LoadTile` `fread` leak. Fix 3 (pooled land `Spell`) does not apply: the land `Spell` is a stack object. Soak memory numbers and the ASan/Verifier run are owed to the first session that can build.
 
 plan 17 (crowd buffer) was built statically behind `MapUpdate.CrowdBuffer` (default off), because the step-15 gate numbers that decide whether it is wanted do not exist. It reuses the `_valuesUpdateCache` / `PatchValuesUpdate` split: the per-cell crowd item (U2, heavy deques, planned in S2) builds one `UF_FLAG_PUBLIC` block per player in a ≥ 32-player cell, viewers copy it and patch their indices; self, owner, raid, `SPECIALINFO`, stealth and invisibility take the per-viewer path. "Fixed radius" and "phase exclusion" from the plan text are not needed with per-target blocks (the viewer filters by its own visible map). The gate run (on/off in the same soak, `crowd_copied` vs `crowd_built` in `.debug slowtasks`) and the three-character visibility check are owed to the first session that can build; if the crowd is mostly one raid, `crowd_copied` will be small and the step should be dropped.
+
+
+MapUpdate.Threads = 1
+MapUpdate.PhaseThreads = 1
+
+MapUpdate.Threads = 2
+MapUpdate.PhaseThreads = 2
+
+MapUpdate.Threads = 7
+MapUpdate.PhaseThreads = 7

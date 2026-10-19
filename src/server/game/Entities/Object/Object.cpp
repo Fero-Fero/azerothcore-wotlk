@@ -1403,7 +1403,7 @@ void WorldObject::PublishSlot()
 
 void WorldObject::OnFirstRecordOfBeat(uint8 core)
 {
-    _writtenBy.fetch_or(1ull << core, std::memory_order_release);
+    _writtenBy[BeatContext::beat.load(std::memory_order_relaxed) & 1].fetch_or(1ull << core, std::memory_order_release);
 
     // Wake: the target's task root gets a task next beat so the record is applied (step 12).
     if (!_removing && IsInWorld())
@@ -1412,15 +1412,15 @@ void WorldObject::OnFirstRecordOfBeat(uint8 core)
 
 void WorldObject::ApplyInbox()
 {
-    uint64 mask = _writtenBy.exchange(0, std::memory_order_acquire);
+    // Records were written in the previous beat; this beat's own writes sit in the other parity word.
+    uint32 const beat = BeatContext::beat.load(std::memory_order_relaxed) - 1;
+    uint64 mask = _writtenBy[beat & 1].exchange(0, std::memory_order_acquire);
     if (!mask)
         return;
 
     thread_local std::vector<RecordHeader const*> collected;   // capacity kept across beats
     collected.clear();
 
-    // Records were written in the previous beat.
-    uint32 const beat = BeatContext::beat.load(std::memory_order_relaxed) - 1;
     uint32 const idx = SlotIndex();
     if (idx == ObjectSlotPair::NO_SLOT_INDEX)
         return;
@@ -2911,6 +2911,14 @@ TempSummon* Map::SummonCreature(uint32 entry, Position const& pos, SummonPropert
     {
         delete summon;
         return nullptr;
+    }
+
+    // Summoned from a unit task: AddToMap only queued the add, so the summon has no AI and no place yet. The
+    // hooks and the line-of-sight notification run when the seal adds it (Map::ApplyAddToMap).
+    if (!summon->IsInWorld())
+    {
+        summon->SetSummonInitPending(true);
+        return summon;
     }
 
     summon->InitSummon();

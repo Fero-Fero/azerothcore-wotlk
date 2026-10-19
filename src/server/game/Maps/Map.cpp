@@ -843,7 +843,22 @@ void Map::ApplyAddToMap(AddToMapDefer const& rec)
     if (Transport* transport = obj->ToGameObject() ? obj->ToGameObject()->ToTransport() : nullptr)
         AddToMap(transport, false);
     else if (Creature* creature = obj->ToCreature())
+    {
         AddToMap(creature, rec.checkTransport != 0);
+
+        // A summon made on a unit task: the hooks that need it in the world run now (Map::SummonCreature).
+        if (TempSummon* summon = creature->ToTempSummon())
+            if (summon->IsSummonInitPending())
+            {
+                summon->SetSummonInitPending(false);
+                if (summon->IsInWorld())
+                {
+                    summon->InitSummon();
+                    Acore::AIRelocationNotifier notifier(*summon, true);
+                    Cell::VisitObjects(summon, notifier, GetVisibilityRange());
+                }
+            }
+    }
     else if (GameObject* go = obj->ToGameObject())
         AddToMap(go, rec.checkTransport != 0);
     else if (DynamicObject* dyn = obj->ToDynObject())
@@ -929,8 +944,18 @@ void Map::ApplyUpdateListAdd(UpdateListDefer const& rec)
 void Map::ApplyUpdateListRemove(UpdateListDefer const& rec)
 {
     WorldObject* obj = GetWorldObjectForDefer(rec.guid);
-    if (obj)
-        RemoveObjectFromMapUpdateList(obj);
+    if (!obj)
+        return;
+
+    // The task went dormant in U1; a viewer's scan in U2 may have woken it (a player now sees it), and its add
+    // was refused because the object was still listed. Keep it and give it a task next beat.
+    if (obj->IsInWorld() && !obj->IsRemoving() && obj->IsDueNextBeat())
+    {
+        sBeatPool->Schedule(obj->TaskRoot());
+        return;
+    }
+
+    RemoveObjectFromMapUpdateList(obj);
 }
 
 void Map::InsertGameObjectModel(GameObjectModel const& model)
@@ -2447,6 +2472,19 @@ void Map::AddObjectToRemoveList(WorldObject* obj)
 {
     ASSERT(obj->GetMapId() == GetId() && obj->GetInstanceId() == GetInstanceId());
 
+    // A task asking for the removal of another task's object (a script despawning a neighbour, a summoner
+    // dropping a summon, a pool or event despawn): the own half of the cleanup (CombatStop, threat, auras)
+    // writes that object's lists, so it must not run here while the owner's task may be running on another
+    // core. The seal prepares it (ApplyRemoveFromMap) when no unit task is running.
+    if (BeatContext::InTask() && obj->IsForeignToTask())
+    {
+        RemoveFromMapDefer rec;
+        rec.guid = obj->GetGUID();
+        rec.prepared = 0;
+        AppendDefer(DeferKind::RemoveFromMap, rec);
+        return;
+    }
+
     // Own half of the cleanup now, foreign half as records; the removal itself waits for the tick's end.
     obj->PrepareRemoval();
 
@@ -3570,7 +3608,12 @@ void Map::ProcessCreatureRespawn(ObjectGuid::LowType spawnId)
     SpawnDefer rec;
     rec.spawnId = spawnId;
     rec.type = uint8(SPAWN_TYPE_CREATURE);
-    AppendDefer(DeferKind::Spawn, rec);
+    // ProcessRespawns runs from BeatEpilogue (S2), after the map-local defers were applied and the buffer was reset
+    // for the beat: a defer appended there would never be applied. Outside a task nothing runs concurrently.
+    if (BeatContext::InTask())
+        AppendDefer(DeferKind::Spawn, rec);
+    else
+        ApplySpawn(rec);
 }
 
 void Map::ProcessGameObjectRespawn(ObjectGuid::LowType spawnId)
@@ -3626,7 +3669,10 @@ void Map::ProcessGameObjectRespawn(ObjectGuid::LowType spawnId)
     SpawnDefer rec;
     rec.spawnId = spawnId;
     rec.type = uint8(SPAWN_TYPE_GAMEOBJECT);
-    AppendDefer(DeferKind::Spawn, rec);
+    if (BeatContext::InTask())
+        AppendDefer(DeferKind::Spawn, rec);
+    else
+        ApplySpawn(rec);
 }
 
 void Map::UpdateEncounterState(EncounterCreditType type, uint32 creditEntry, Unit* source)

@@ -3360,7 +3360,8 @@ DynObjAura::DynObjAura(SpellInfo const* spellproto, uint8 effMask, WorldObject* 
 {
     LoadScripts();
     ASSERT(GetDynobjOwner());
-    ASSERT(GetDynobjOwner()->IsInWorld());
+    // Created on a unit task, the dynobj is not in the world yet (the seal adds it); it is by every other path.
+    ASSERT(GetDynobjOwner()->IsInWorld() || BeatContext::InTask());
     ASSERT(GetDynobjOwner()->GetMap() == caster->GetMap());
     _InitEffects(effMask, caster, baseAmount);
     GetDynobjOwner()->SetAura(this);

@@ -205,6 +205,7 @@ public:
     void ApplyThreatBackRef(ObjectGuid const& ownerGuid);
     // ThreatRemove: drop guid from this.owner's threat list and from its threatened-by-me set
     void ApplyThreatRemove(ObjectGuid const& guid);
+    void ApplyThreatUnlink(ObjectGuid const& ownerGuid);
     // Threat: AddThreat against this.owner from a foreign task
     void ApplyThreat(ObjectGuid const& attackerGuid, float amount, uint32 spellId, bool ignoreModifiers, bool ignoreRedirects);
 

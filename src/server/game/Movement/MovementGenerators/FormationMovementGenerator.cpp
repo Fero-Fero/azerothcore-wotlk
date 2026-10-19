@@ -154,7 +154,9 @@ void FormationMovementGenerator::LaunchMovement(Creature* owner, Unit* target)
         _hasPredictedDestination = false;
     }
 
-    if (velocity == 0.0f)
+    // A follower already at its slot (velocityMod near 0) or a leader spline read at the wrong moment gives a speed
+    // the spline validation rejects (<= 0.01); fall back to the leader's walk speed for that short hop.
+    if (velocity <= 0.01f)
         velocity = target->GetSpeed(MOVE_WALK);
 
     Movement::MoveSplineInit init(owner);

@@ -31,6 +31,7 @@
 #include "ThreatManager.h"
 #include "UnitDefines.h"
 #include "UnitUtils.h"
+#include <atomic>
 #include <boost/container/flat_map.hpp>
 #include <functional>
 #include <utility>
@@ -718,6 +719,7 @@ public:
 
     void AddToWorld() override;
     void RemoveFromWorld() override;
+    void RemoveFromWorldOwn(bool prepared);
 
     void CleanupBeforeRemoveFromMap(bool finalCleanup);
     void CleanupsBeforeDelete(bool finalCleanup = true) override;                        // used in ~Creature/~Player (or before mass creature delete to remove cross-references to already deleted units)
@@ -2257,6 +2259,8 @@ protected:
     float m_createStats[MAX_STATS];
 
     AttackerSet m_attackers;
+    std::atomic_flag m_attackersLock = ATOMIC_FLAG_INIT;
+    bool m_attackersClosed{false}; // guarded by m_attackersLock
     Unit* m_attacking;
 
     DeathState m_deathState;
@@ -2335,8 +2339,13 @@ private:
 
     [[nodiscard]] float processDummyAuras(float TakenTotalMod) const;
 
-    void _addAttacker(Unit* pAttacker) { m_attackers.insert(pAttacker); }   ///@note: Call only in Unit::Attack()
-    void _removeAttacker(Unit* pAttacker) { m_attackers.erase(pAttacker); } ///@note: Call only in Unit::AttackStop()
+    // The attacker link is two-sided: an attacker's task writes the victim's set, so insert/erase/drain are
+    // serialised by m_attackersLock. Once the victim has prepared its removal the set is closed for good and
+    // _addAttacker refuses, so an Attack() that lands after (or races with) RemoveAllAttackers cannot leave
+    // a link that outlives the victim.
+    bool _addAttacker(Unit* pAttacker);   ///@note: Call only in Unit::Attack(); false when the victim is closed
+    void _removeAttacker(Unit* pAttacker); ///@note: Call only in Unit::AttackStop()
+    void CloseAttackers();
 
     //----------- Private variables ----------//
     uint32 m_state;                                     // Even derived shouldn't modify

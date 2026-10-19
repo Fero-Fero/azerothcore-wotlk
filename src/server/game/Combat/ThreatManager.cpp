@@ -1057,10 +1057,16 @@ void ThreatManager::UnlinkThreatenedByMe(ObjectGuid const& victimGuid)
     {
         ThreatRemoveRecord record;
         record.deadGuid = _owner->GetGUID();
+        record.backRefOnly = 1; // we stopped threatening it; its own threat on us is not ours to drop
         sRecordLogs->Append(_owner->GetGUID(), victim, RecordKind::ThreatRemove, record);
         return;
     }
     victim->GetThreatMgr().PurgeThreatenedByMeRef(_owner->GetGUID());
+}
+
+void ThreatManager::ApplyThreatUnlink(ObjectGuid const& ownerGuid)
+{
+    PurgeThreatenedByMeRef(ownerGuid);
 }
 
 void ThreatManager::ApplyThreatBackRef(ObjectGuid const& ownerGuid)

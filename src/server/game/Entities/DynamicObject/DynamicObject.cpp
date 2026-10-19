@@ -23,7 +23,8 @@
 #include "Transport.h"
 
 DynamicObject::DynamicObject() : WorldObject(), MovableMapObject(),
-    _aura(nullptr), _removedAura(nullptr), _caster(nullptr), _duration(0), _isViewpoint(false), _updateViewerVisibilityTimer(0)
+    _aura(nullptr), _removedAura(nullptr), _caster(nullptr), _duration(0), _isViewpoint(false),
+    _viewpointPending(false), _viewpointPendingUpdateVisibility(false), _updateViewerVisibilityTimer(0)
 {
     m_objectType |= TYPEMASK_DYNAMICOBJECT;
     m_objectTypeId = TYPEID_DYNAMICOBJECT;
@@ -65,6 +66,13 @@ void DynamicObject::AddToWorld()
         WorldObject::AddToWorld();
 
         BindToCaster();
+
+        // Requested on a unit task, where the object was not in the world yet: the caster is bound now.
+        if (_viewpointPending)
+        {
+            _viewpointPending = false;
+            SetCasterViewpoint(_viewpointPendingUpdateVisibility);
+        }
     }
 }
 
@@ -225,6 +233,14 @@ void DynamicObject::RemoveAura()
 
 void DynamicObject::SetCasterViewpoint(bool updateViewerVisibility)
 {
+    // A dynobj created on a unit task is added to the world by the seal; it has no caster binding until then.
+    if (!_caster)
+    {
+        _viewpointPending = true;
+        _viewpointPendingUpdateVisibility = updateViewerVisibility;
+        return;
+    }
+
     if (Player* caster = _caster->ToPlayer())
     {
         // Remove old farsight viewpoint

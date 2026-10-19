@@ -538,7 +538,11 @@ public:
     // Record inbox. Records written to this object in the previous beat are collected from every core's log
     // named in _writtenBy, sorted by (source, sequence) and handed to ApplyRecords before this object's Update.
     void ApplyInbox();
-    [[nodiscard]] bool HasInbox() const { return _writtenBy.load(std::memory_order_relaxed) != 0; }
+    // True when a record was written to this object in the current beat (applied at its next task).
+    [[nodiscard]] bool HasInbox() const
+    {
+        return _writtenBy[BeatContext::beat.load(std::memory_order_relaxed) & 1].load(std::memory_order_relaxed) != 0;
+    }
     // Called by UnitRecordLog::Append for the first record of a (core, target, beat). Sets the mask bit and
     // wakes the target so its inbox is scanned next beat.
     void OnFirstRecordOfBeat(uint8 core);
@@ -967,9 +971,11 @@ private:
     // Duration of this root's last task body, for the heavy ring.
     uint32 _lastTaskNs{0};
 
-    // Bit per core that appended a record to this object in the current beat. Written only by
-    // OnFirstRecordOfBeat (fetch_or) and ApplyInbox (exchange to 0).
-    std::atomic<uint64> _writtenBy{0};
+    // Bit per core that appended a record to this object, one word per beat parity like the logs: a record
+    // written in beat k is read in beat k+1, and a task that runs later in beat k than the writer must not
+    // consume (and clear) the bits of records written in the very beat it is running. Written only by
+    // OnFirstRecordOfBeat (fetch_or into the current parity) and ApplyInbox (exchange of the previous parity).
+    std::atomic<uint64> _writtenBy[2]{};
 
     friend struct BeatContext;
     friend class BeatPool;

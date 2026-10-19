@@ -118,10 +118,12 @@ struct KnockbackRecord
     float speedZ;
 };
 
-// "Drop deadGuid from your threat list and from your threatened-by-me set."
+// "Drop deadGuid from your threat list and from your threatened-by-me set." With backRefOnly the sender only
+// stopped threatening you (ClearThreat, evade): drop the threatened-by-me entry and keep your own threat on it.
 struct ThreatRemoveRecord
 {
     ObjectGuid deadGuid;
+    uint8 backRefOnly = 0;
 };
 
 enum MinionUnlinkFlags : uint8

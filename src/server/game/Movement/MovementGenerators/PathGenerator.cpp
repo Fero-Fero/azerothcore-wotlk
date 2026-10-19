@@ -653,7 +653,12 @@ dtStatus PathGenerator::FindPathBudgeted(dtPolyRef startPoly, dtPolyRef endPoly,
     // closest to the goal. The movement generator walks that leg and re-paths on arrival, from closer, with a
     // fresh budget. No slice state outlives this call, so the per-core query is reused freely.
     int const budget = int(sWorld->getIntConfig(CONFIG_PATH_ITER_BUDGET));
-    if (budget <= 0)
+
+    // A forced destination turns an incomplete path into a straight line through the terrain (evade home), and
+    // pets / player-controlled units treat an incomplete path as "cannot reach": they get the full search.
+    Unit const* sourceUnit = _source->ToUnit();
+    bool const needsFullPath = _forceDestination || (sourceUnit && (sourceUnit->IsPet() || sourceUnit->IsControlledByPlayer()));
+    if (budget <= 0 || needsFullPath)
         return _navMeshQuery->findPath(startPoly, endPoly, startPoint, endPoint, &_filter, path, pathCount, maxPath);
 
     // The sliced query mutates the dtNavMeshQuery; it is this core's own (BeatPool::NavQueryFor).
