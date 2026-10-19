@@ -57,6 +57,9 @@ public:
     [[nodiscard]] ObjectGuid GetCharmerOrOwnerGUID() const;
     [[nodiscard]] Position GetPosition() const;
 
+    [[nodiscard]] uint32 GetCreatureType() const;
+    [[nodiscard]] uint32 GetCreatureTypeMask() const;
+
     [[nodiscard]] bool HasAura(uint32 spellId, ObjectGuid casterGuid = ObjectGuid::Empty) const;
     [[nodiscard]] int32 GetTotalAuraModifier(AuraType type) const;
 

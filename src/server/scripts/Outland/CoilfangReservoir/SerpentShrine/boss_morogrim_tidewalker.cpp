@@ -127,12 +127,6 @@ class spell_morogrim_tidewalker_watery_grave : public SpellScript
 {
     PrepareSpellScript(spell_morogrim_tidewalker_watery_grave);
 
-    bool Load() override
-    {
-        _targetNumber = 0;
-        return true;
-    }
-
     void FilterTargets(std::list<WorldObject*>& targets)
     {
         uint8 maxSize = 4;
@@ -153,9 +147,10 @@ class spell_morogrim_tidewalker_watery_grave : public SpellScript
     void HandleDummy(SpellEffIndex effIndex)
     {
         PreventHitDefaultEffect(effIndex);
+        // One grave per target, in launch order; each hit lands with its own script instance.
         if (Unit* target = GetHitUnit())
-            if (_targetNumber < 4)
-                GetCaster()->CastSpell(target, wateryGraveIds[_targetNumber++], true);
+            if (uint32 targetNumber = GetUnitTargetIndexForEffect(EFFECT_0); targetNumber < 4)
+                GetCaster()->CastSpell(target, wateryGraveIds[targetNumber], true);
     }
 
     void Register() override
@@ -163,9 +158,6 @@ class spell_morogrim_tidewalker_watery_grave : public SpellScript
         OnObjectAreaTargetSelect += SpellObjectAreaTargetSelectFn(spell_morogrim_tidewalker_watery_grave::FilterTargets, EFFECT_ALL, TARGET_UNIT_SRC_AREA_ENEMY);
         OnEffectHitTarget += SpellEffectFn(spell_morogrim_tidewalker_watery_grave::HandleDummy, EFFECT_0, SPELL_EFFECT_DUMMY);
     }
-
-private:
-    uint8 _targetNumber;
 };
 
 class spell_morogrim_tidewalker_water_globule_new_target : public SpellScript

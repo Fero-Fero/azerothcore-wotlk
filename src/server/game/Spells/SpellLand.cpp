@@ -20,16 +20,22 @@
 // (Spell::Spell(SpellHitRecord const&, ...) + Spell::Land), whose caster-side writes travel back as a
 // SpellLandedRecord (Unit::ApplySpellLanded).
 //
-// Slice 1 (this file): the record is built and consumed on the spot, same tick, same thread. Feedback goes
-// through the step 06 log when a task is running and is applied at the start of the caster's next update.
+// Inside a task (a unit's update in Map::Update) the hit record goes through the step 06 log and lands at the
+// start of the target's next update; feedback goes back the same way and is applied at the start of the
+// caster's update after that. Outside a task (unit tests, casts between beats) the record is consumed on the
+// spot with the launch spell's scripts. Spells in the Deferred table land at the end of Map::Update with no
+// task running.
 
 #include "BeatContext.h"
 #include "Creature.h"
 #include "CreatureAI.h"
+#include "GameTime.h"
 #include "Log.h"
+#include "Map.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "Spell.h"
+#include "SpellAuras.h"
 #include "SpellHitRecord.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
@@ -37,6 +43,7 @@
 #include "Unit.h"
 #include "UnitRecordLog.h"
 #include "UnitView.h"
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 
@@ -44,6 +51,30 @@ uint32 Spell::NextCastSerial()
 {
     static std::atomic<uint32> serial{0};
     return ++serial;
+}
+
+// ---- SpellDestRecord ----
+
+void SpellDestRecord::Set(SpellDestination const& dest)
+{
+    x = dest._position.GetPositionX();
+    y = dest._position.GetPositionY();
+    z = dest._position.GetPositionZ();
+    o = dest._position.GetOrientation();
+    mapId = dest._position.GetMapId();
+    transportGuid = dest._transportGUID;
+    tx = dest._transportOffset.GetPositionX();
+    ty = dest._transportOffset.GetPositionY();
+    tz = dest._transportOffset.GetPositionZ();
+    to = dest._transportOffset.GetOrientation();
+}
+
+SpellDestination SpellDestRecord::Get() const
+{
+    SpellDestination dest(x, y, z, o, mapId);
+    dest._transportGUID = transportGuid;
+    dest._transportOffset.Relocate(tx, ty, tz, to);
+    return dest;
 }
 
 // ---- land-side Spell ----
@@ -101,6 +132,13 @@ Spell::Spell(SpellHitRecord const& hit, Unit* target, WorldObject* casterHandle,
     if (m_castItemGUID)
         if (Player* casterPlayer = m_caster->ToPlayer())
             m_CastItem = casterPlayer->GetItemByGuid(m_castItemGUID);
+
+    // Procs run at land until slice 5 and read procSpell->m_appliedMods for the caster's mod auras
+    // (PROC_ATTR_REQ_SPELLMOD). Resolve the ids on the caster handle; slice 5 moves this to the actor side.
+    if (Unit* casterUnit = m_caster->ToUnit())
+        for (uint8 i = 0; i < hit.appliedModCount && i < MAX_SPELL_APPLIED_MODS; ++i)
+            if (Aura* mod = casterUnit->GetAura(hit.appliedModAuraIds[i]))
+                m_appliedMods.insert(mod);
     m_weaponItem = nullptr;
 
     unitTarget = nullptr;
@@ -116,6 +154,7 @@ Spell::Spell(SpellHitRecord const& hit, Unit* target, WorldObject* casterHandle,
     m_damage = 0;
     m_healing = 0;
     m_damageBeforeTakenMods = 0;
+    m_pendingTakenKind = TAKEN_NONE;
     m_procAttacker = hit.procAttacker;
     m_procVictim = hit.procVictim;
     m_procEx = hit.procEx;
@@ -176,10 +215,19 @@ Spell::Spell(SpellHitRecord const& hit, Unit* target, WorldObject* casterHandle,
     info.scaleAura = hit.scaleAura != 0;
     info.damage = hit.damage;
     info.damageBeforeTakenMods = hit.damageBeforeTakenMods;
+    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+    {
+        info.effDamage[i] = hit.effDamage[i];
+        info.takenKind[i] = hit.takenKind[i];
+        _landUnitTargetCount[i] = hit.unitTargetCount[i];
+        _landUnitTargetIndex[i] = hit.unitTargetIndex[i];
+    }
+    info.aura = hit.aura;
     m_UniqueTargetInfo.push_back(info);
 
-    // Scripts: borrowed from the launch spell (BorrowScripts) or loaded fresh in Land(). A fresh instance does
-    // not see state set in cast hooks; that is the slice 3/4 question for asynchronous landing (plan §15).
+    // Scripts: borrowed from the launch spell (BorrowScripts, inline landing) or loaded fresh in Land() (record
+    // landing next beat). A fresh instance does not see state set in cast hooks or on other targets' hits; the
+    // scripts that rely on it are listed in plan 07 §16 and move to the Deferred table or to Feedback() in slice 4.
 }
 
 void Spell::Land()
@@ -216,9 +264,77 @@ void Spell::ReturnScripts(Spell& to)
     _launchSpell = nullptr;
 }
 
+void Spell::ApplyTakenBonuses(TargetInfo const* target, Unit* victim, Unit* caster)
+{
+    bool any = false;
+    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        if (target->takenKind[i] != TAKEN_NONE)
+            any = true;
+    if (!any || !victim)
+        return;
+
+    int32 total = 0;
+    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+    {
+        int32 part = target->effDamage[i];
+        switch (SpellTakenKind(target->takenKind[i]))
+        {
+            case TAKEN_SPELL_DAMAGE:
+                if (part > 0)
+                    part = int32(victim->SpellDamageBonusTaken(caster, m_spellInfo, uint32(part), SPELL_DIRECT_DAMAGE));
+                break;
+            case TAKEN_MELEE_DAMAGE:
+                if (part > 0 && caster)
+                    part = int32(victim->MeleeDamageBonusTaken(caster, uint32(part), m_attackType, m_spellInfo, m_spellSchoolMask));
+                break;
+            case TAKEN_HEAL:
+                if (part < 0)
+                    part = -int32(victim->SpellHealingBonusTaken(caster, m_spellInfo, uint32(-part), HEAL));
+                break;
+            default:
+                break;
+        }
+        total += part;
+    }
+
+    m_damage = total;
+    m_healing = -total;
+}
+
 UnitView Spell::CasterView() const
 {
     return UnitView(m_originalCaster ? m_originalCaster : m_caster->ToUnit());
+}
+
+uint32 Spell::GetUnitTargetCountForEffect(SpellEffIndex effIndex) const
+{
+    if (_landSide && !_launchSpell)
+        return _landUnitTargetCount[effIndex];
+
+    std::list<TargetInfo> const& targets = _launchSpell ? _launchSpell->m_UniqueTargetInfo : m_UniqueTargetInfo;
+    return uint32(std::count_if(targets.begin(), targets.end(), [effIndex](TargetInfo const& info)
+    {
+        return (info.effectMask & (1 << effIndex)) != 0;
+    }));
+}
+
+uint32 Spell::GetUnitTargetIndexForEffect(SpellEffIndex effIndex) const
+{
+    if (_landSide && !_launchSpell)
+        return _landUnitTargetIndex[effIndex];
+
+    ObjectGuid const self = _landSide ? m_UniqueTargetInfo.front().targetGUID : (unitTarget ? unitTarget->GetGUID() : ObjectGuid::Empty);
+    std::list<TargetInfo> const& targets = _launchSpell ? _launchSpell->m_UniqueTargetInfo : m_UniqueTargetInfo;
+    uint32 index = 0;
+    for (TargetInfo const& info : targets)
+    {
+        if (!(info.effectMask & (1 << effIndex)))
+            continue;
+        if (info.targetGUID == self)
+            return index;
+        ++index;
+    }
+    return 0;
 }
 
 // ---- launch side: emission ----
@@ -237,11 +353,31 @@ void Spell::LandOrEmit(TargetInfo& target)
 
     Unit* unit = ObjectAccessor::GetUnit(*m_caster, target.targetGUID);
 
-    // Far target (cross-map player), spell in the Deferred table, or target not on this map: today's path with
-    // both units live. From slice 3 on these go to the coordinator as DeferredSpellHit (plan §11).
-    if (!unit || m_spellInfo->Id == 45927 || sSpellMgr->IsDeferredHit(m_spellInfo->Id))
+    // Far target (cross-map player, spell 45927) or target not on this map: today's far-effect path, inline.
+    // Step 09's defer buffer takes these.
+    if (!unit || m_spellInfo->Id == 45927)
     {
         DoAllEffectOnTarget(&target);
+        return;
+    }
+
+    bool const inTask = BeatContext::InTask() && unit->IsInWorld();
+
+    // Spell in the Deferred table (plan §11): lands at the end of Map::Update with both units live and no task
+    // running, so CasterView() is live and Feedback() applies inline. Outside a task there is nothing to wait for.
+    if (sSpellMgr->IsDeferredHit(m_spellInfo->Id))
+    {
+        if (!inTask)
+        {
+            DoAllEffectOnTarget(&target);
+            return;
+        }
+
+        target.processed = true;
+        HandleComboPointsOnMiss(target.missCondition, target.targetGUID);
+        DeferredSpellHitRecord deferred;
+        BuildHitRecord(target, deferred.hit);
+        unit->GetMap()->DeferSpellHit(deferred);
         return;
     }
 
@@ -253,9 +389,16 @@ void Spell::LandOrEmit(TargetInfo& target)
     SpellHitRecord hit;
     BuildHitRecord(target, hit);
 
-    // Slice 1: consumed immediately on the target. Slice 3 appends instead:
-    //   sRecordLogs->Append(m_caster->GetGUID(), unit, RecordKind::SpellHit, hit);
-    unit->ApplySpellHit(hit, this);
+    // Inside a task: the target's inbox, landed at the start of its next update; feedback the update after.
+    // No task (unit tests, casts between beats): consumed now on the target with this spell's scripts.
+    if (inTask)
+    {
+        target.landPending = true;
+        target.landEmittedMs = GameTime::GetGameTimeMS().count();
+        sRecordLogs->Append(m_caster->GetGUID(), unit, RecordKind::SpellHit, hit);
+    }
+    else
+        unit->ApplySpellHit(hit, this);
 }
 
 void Spell::BuildHitRecord(TargetInfo const& target, SpellHitRecord& out) const
@@ -264,12 +407,41 @@ void Spell::BuildHitRecord(TargetInfo const& target, SpellHitRecord& out) const
 
     out.spellId = m_spellInfo->Id;
     out.castSerial = m_castSerial;
+    out.target = target.targetGUID;
     out.caster = m_caster->GetGUID();
     out.originalCaster = m_originalCasterGUID;
     out.castItemGuid = m_castItemGUID;
     out.casterTypeId = uint8(m_caster->GetTypeId());
     out.triggerFlags = uint32(_triggeredCastFlags);
     out.spellFlags = m_spellFlags;
+
+    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+    {
+        uint8 count = 0;
+        uint8 index = 0;
+        for (TargetInfo const& other : m_UniqueTargetInfo)
+        {
+            if (!(other.effectMask & (1 << i)))
+                continue;
+            if (other.targetGUID == target.targetGUID)
+                index = count;
+            if (count < 0xFF)
+                ++count;
+        }
+        out.unitTargetCount[i] = count;
+        out.unitTargetIndex[i] = index;
+    }
+
+    out.appliedModCount = 0;
+    for (Aura* mod : m_appliedMods)
+    {
+        if (out.appliedModCount >= MAX_SPELL_APPLIED_MODS)
+        {
+            LOG_DEBUG("spells", "Spell {}: more than {} applied spell mods, rest dropped from the hit record", m_spellInfo->Id, uint32(MAX_SPELL_APPLIED_MODS));
+            break;
+        }
+        out.appliedModAuraIds[out.appliedModCount++] = mod->GetId();
+    }
 
     out.effectMask = target.effectMask;
     out.missCondition = uint8(target.missCondition);
@@ -280,6 +452,12 @@ void Spell::BuildHitRecord(TargetInfo const& target, SpellHitRecord& out) const
     out.wasDelayed = m_spellState == SPELL_STATE_DELAYED ? 1 : 0;
     out.damage = target.damage;
     out.damageBeforeTakenMods = target.damageBeforeTakenMods;
+    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+    {
+        out.effDamage[i] = target.effDamage[i];
+        out.takenKind[i] = target.takenKind[i];
+    }
+    out.aura = target.aura;
     out.timeDelay = target.timeDelay;
 
     out.schoolMask = uint32(m_spellSchoolMask);
@@ -430,13 +608,17 @@ void Unit::ApplySpellHit(SpellHitRecord const& hit, Spell* launchSpell)
     WorldObject* casterHandle = hit.caster == GetGUID() ? this : ObjectAccessor::GetWorldObject(*this, hit.caster);
     if (!casterHandle)
     {
-        // Landing without a caster handle needs CasterView over the record snapshot (slice 3).
+        // Landing without a caster handle needs m_caster to be nullable through the hit path and the handlers;
+        // that is the slice 4 audit. Until then a hit whose caster left the map between launch and land is
+        // dropped (today the caster's SpellEvent is cancelled with it).
         LOG_DEBUG("spells", "{} dropped SpellHit {} from {}: caster not in world", GetGUID().ToString(), hit.spellId, hit.caster.ToString());
         return;
     }
 
     SpellLandedRecord feedback;
     Spell land(hit, this, casterHandle, &feedback);
+    // Inline landing (no task running) borrows the launch spell's scripts so cast-hook state is visible to hit
+    // hooks, as before the split. A record landing next beat has no launch spell and loads its own scripts.
     if (launchSpell)
         land.BorrowScripts(*launchSpell);
     land.Land();

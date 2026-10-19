@@ -16,14 +16,18 @@
  */
 
 #include "KillRewarder.h"
+#include "BeatContext.h"
+#include "CombatRecords.h"
 #include "Creature.h"
 #include "Formulas.h"
 #include "Group.h"
+#include "ObjectMgr.h"
 #include "Pet.h"
 #include "Player.h"
 #include "ScriptMgr.h"
 #include "SpellAuraDefines.h"
 #include "SpellAuraEffects.h"
+#include "UnitRecordLog.h"
 
 // KillRewarder incapsulates logic of rewarding player upon kill with:
 // * XP;
@@ -69,7 +73,8 @@ KillRewarder::KillRewarder(Player* killer, Unit* victim, bool isBattleGround) :
 // 1. Initialize internal variables to default values.
         _killer(killer), _victim(victim), _group(killer->GetGroup()),
         _groupRate(1.0f), _maxNotGrayMember(nullptr), _maxNotGrayMemberLevel(0), _count(0), _aliveSumLevel(0), _sumLevel(0), _xp(0),
-        _isFullXP(false), _maxLevel(0), _isBattleGround(isBattleGround), _isPvP(false)
+        _isFullXP(false), _maxLevel(0), _isBattleGround(isBattleGround), _isPvP(false),
+        _fromCredit(false), _creditInGroup(false), _creditVictimEntry(victim->GetEntry()), _creditVictimLevel(victim->GetLevel())
 {
     // mark the credit as pvp if victim is player
     if (victim->IsPlayer())
@@ -79,6 +84,58 @@ KillRewarder::KillRewarder(Player* killer, Unit* victim, bool isBattleGround) :
         _isPvP = !victim->IsVehicle();
 
     _InitGroupData();
+}
+
+KillRewarder::KillRewarder(Player* member, Unit* victim, KillCreditRecord const& credit) :
+        _killer(member), _victim(victim), _group(nullptr),
+        _groupRate(credit.groupRate), _maxNotGrayMember(nullptr), _maxNotGrayMemberLevel(credit.maxNotGrayMemberLevel),
+        _count(credit.count), _aliveSumLevel(credit.aliveSumLevel), _sumLevel(0), _xp(credit.xp),
+        _isFullXP(credit.isFullXP != 0), _maxLevel(credit.maxLevel), _isBattleGround(credit.isBattleGround != 0), _isPvP(credit.isPvP != 0),
+        _fromCredit(true), _creditInGroup(credit.inGroup != 0), _creditVictimEntry(credit.victimEntry), _creditVictimLevel(credit.victimLevel)
+{
+    // _maxNotGrayMember is only compared for null in _RewardXP; the member stands in for "there is one".
+    if (credit.hasMaxNotGrayMember)
+        _maxNotGrayMember = member;
+}
+
+void KillRewarder::RewardFromCredit(Player* member, Unit* victim, KillCreditRecord const& credit)
+{
+    KillRewarder rewarder(member, victim, credit);
+    rewarder._RewardPlayer(member, credit.isDungeon != 0);
+}
+
+void KillRewarder::_FillCredit(KillCreditRecord& credit, bool isDungeon) const
+{
+    credit.victim = _victim ? _victim->GetGUID() : ObjectGuid::Empty;
+    credit.killer = _killer->GetGUID();
+    credit.victimEntry = _creditVictimEntry;
+    credit.victimLevel = _creditVictimLevel;
+    credit.xp = _xp;
+    credit.aliveSumLevel = _aliveSumLevel;
+    credit.count = _count;
+    credit.groupRate = _groupRate;
+    credit.maxLevel = _maxLevel;
+    credit.maxNotGrayMemberLevel = _maxNotGrayMemberLevel;
+    credit.hasMaxNotGrayMember = _maxNotGrayMember != nullptr;
+    credit.isFullXP = _isFullXP;
+    credit.isDungeon = isDungeon;
+    credit.isBattleGround = _isBattleGround;
+    credit.isPvP = _isPvP;
+    credit.inGroup = _fromCredit ? _creditInGroup : _group != nullptr;
+}
+
+void KillRewarder::_RewardOrRecord(Player* player, bool isDungeon)
+{
+    // Kill runs on the victim's task; a member outside it gets its share as a KillCreditRecord (plan §7.3a).
+    if (!_victim || !BeatContext::IsForeign(player))
+    {
+        _RewardPlayer(player, isDungeon);
+        return;
+    }
+
+    KillCreditRecord credit;
+    _FillCredit(credit, isDungeon);
+    sRecordLogs->Append(_victim->GetGUID(), player, RecordKind::KillCredit, credit);
 }
 
 void KillRewarder::_InitGroupData()
@@ -142,14 +199,15 @@ void KillRewarder::_InitXP(Player* player)
 void KillRewarder::_RewardHonor(Player* player)
 {
     // Rewarded player must be alive.
-    if (player->IsAlive())
+    if (player->IsAlive() && _victim)
         player->RewardHonor(_victim, _count, -1);
 }
 
 void KillRewarder::_RewardXP(Player* player, float rate)
 {
+    bool const inGroup = _fromCredit ? _creditInGroup : _group != nullptr;
     uint32 xp(_xp);
-    if (_group)
+    if (inGroup)
     {
         // 4.2.1. If player is in group, adjust XP:
         //        * set to 0 if player's level is more than maximum level of not gray member;
@@ -166,10 +224,10 @@ void KillRewarder::_RewardXP(Player* player, float rate)
     // An ungrouped helper who out-levels everyone eligible for the kill and for
     // whom the victim is gray halves the tagger's XP, matching the group
     // gray-member penalty. Closes a power-leveling exploit.
-    if (xp)
+    if (xp && _victim)
         if (Creature* creature = _victim->ToCreature())
         {
-            uint8 const referenceLevel = _group ? _maxLevel : player->GetLevel();
+            uint8 const referenceLevel = inGroup ? _maxLevel : player->GetLevel();
             uint8 const highestLevel = creature->GetHighestPlayerAttackerLevel();
             if (highestLevel > referenceLevel && creature->GetLevel() <= Acore::XP::GetGrayLevel(highestLevel))
                 xp = xp / 2 + 1;
@@ -185,7 +243,7 @@ void KillRewarder::_RewardXP(Player* player, float rate)
         player->GiveXP(xp, _victim, _groupRate);
         if (Pet* pet = player->GetPet())
             // 4.2.4. If player has pet, reward pet with XP (100% for single player, 50% for group case).
-            pet->GivePetXP(_group ? xp / 2 : xp);
+            pet->GivePetXP(inGroup ? xp / 2 : xp);
     }
 }
 
@@ -193,29 +251,46 @@ void KillRewarder::_RewardReputation(Player* player)
 {
     // 4.3. Give reputation (player must not be on BG).
     // Even dead players and corpses are rewarded.
-    player->RewardReputation(_victim);
+    // A KillCredit whose victim already left the world (a summon despawning on death) gives no reputation.
+    if (_victim)
+        player->RewardReputation(_victim);
 }
 
 void KillRewarder::_RewardKillCredit(Player* player)
 {
+    bool const inGroup = _fromCredit ? _creditInGroup : _group != nullptr;
     // 4.4. Give kill credit (player must not be in group, or he must be alive or without corpse).
-    if (!_group || player->IsAlive() || !player->GetCorpse())
+    if (!inGroup || player->IsAlive() || !player->GetCorpse())
+    {
+        if (!_victim)
+        {
+            // KillCredit with the victim gone: credit by entry and the guid the record carries.
+            if (CreatureTemplate const* ct = sObjectMgr->GetCreatureTemplate(_creditVictimEntry))
+            {
+                player->KilledMonster(ct, ObjectGuid::Empty);
+                player->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_KILL_CREATURE_TYPE, ct->type, 1, nullptr);
+            }
+            return;
+        }
+
         if (Creature* target = _victim->ToCreature())
         {
             player->KilledMonster(target->GetCreatureTemplate(), target->GetGUID());
             player->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_KILL_CREATURE_TYPE, target->GetCreatureType(), 1, target);
         }
+    }
 }
 
 void KillRewarder::_RewardPlayer(Player* player, bool isDungeon)
 {
+    bool const inGroup = _fromCredit ? _creditInGroup : _group != nullptr;
     // 4. Reward player.
     if (!_isBattleGround)
     {
         // 4.1. Give honor (player must be alive and not on BG).
         _RewardHonor(player);
         // 4.1.1 Send player killcredit for quests with PlayerSlain
-        if (_victim->IsPlayer())
+        if (_victim ? _victim->IsPlayer() : _isPvP)
             player->KilledPlayerCredit();
     }
 
@@ -223,7 +298,7 @@ void KillRewarder::_RewardPlayer(Player* player, bool isDungeon)
     // Give reputation and kill credit only in PvE.
     if (!_isPvP || _isBattleGround)
     {
-        float xpRate = _group ? _groupRate * float(_GetPlayerLevel(player)) / _aliveSumLevel : /*Personal rate is 100%.*/ 1.0f; // Group rate depends on the sum of levels.
+        float xpRate = inGroup && _aliveSumLevel ? _groupRate * float(_GetPlayerLevel(player)) / _aliveSumLevel : /*Personal rate is 100%.*/ 1.0f; // Group rate depends on the sum of levels.
         sScriptMgr->OnPlayerRewardKillRewarder(player, this, isDungeon, xpRate);                                                // Personal rate is 100%.
 
         if (_xp)
@@ -268,7 +343,7 @@ void KillRewarder::_RewardGroup()
                 {
                     if (_killer == member || member->IsAtGroupRewardDistance(_victim))
                     {
-                        _RewardPlayer(member, isDungeon);
+                        _RewardOrRecord(member, isDungeon);
                         // Xinef: only count players
                         //if (_victim->IsPlayer())
                         //    member->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_SPECIAL_PVP_KILL, 1, 0, _victim);
@@ -303,7 +378,7 @@ void KillRewarder::Reward()
         if (!_isBattleGround || _xp)
             // 3.2.2. Reward killer.
             if (_killer->IsInMap(_victim)) // pussywizard: killer may be on other map (crashfix), when killing in a group same map is required, so its not a problem
-                _RewardPlayer(_killer, false);
+                _RewardOrRecord(_killer, false);
     }
 
     // 5. Credit instance encounter.

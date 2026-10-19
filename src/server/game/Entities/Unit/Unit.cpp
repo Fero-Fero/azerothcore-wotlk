@@ -31,6 +31,7 @@
 #include "ChatPackets.h"
 #include "ChatTextBuilder.h"
 #include "CombatPackets.h"
+#include "CombatRecords.h"
 #include "Common.h"
 #include "ConditionMgr.h"
 #include "Creature.h"
@@ -43,6 +44,7 @@
 #include "GameTime.h"
 #include "GridNotifiersImpl.h"
 #include "Group.h"
+#include "KillRewarder.h"
 #include "Log.h"
 #include "MapMgr.h"
 #include "MoveSpline.h"
@@ -79,6 +81,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <optional>
 
 float baseMoveSpeed[MAX_MOVE_TYPE] =
 {
@@ -1033,13 +1036,47 @@ uint32 Unit::DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage
     // Xinef: its rare to modify damage in hooks, however training dummy's sets damage to 0
     uint32 rage_damage = damage + ((cleanDamage != nullptr) ? cleanDamage->absorbed_damage : 0);
 
+    // Step 07 slice 5 (plan §7.3): this runs on the victim's task. The attacker's half (AI hook, rage, score,
+    // durability, damage shields) is applied inline when the attacker is the owner or in its task group, and
+    // goes to the attacker's inbox as a DamageDealtRecord otherwise. Appended on every exit path.
+    bool const attackerForeign = attacker && attacker != victim && BeatContext::IsForeign(attacker);
+    DamageDealtRecord dealt;
+    dealt.victim = victim->GetGUID();
+    dealt.rageDamage = rage_damage;
+    dealt.absorbed = cleanDamage ? cleanDamage->absorbed_damage : 0;
+    dealt.spellId = spellProto ? spellProto->Id : 0;
+    dealt.schoolMask = damageSchoolMask;
+    dealt.damageType = uint8(damagetype);
+    dealt.attackType = uint8(cleanDamage ? cleanDamage->attackType : BASE_ATTACK);
+    dealt.hitOutcome = uint8(cleanDamage ? cleanDamage->hitOutCome : MELEE_HIT_NORMAL);
+    struct DealtFlush
+    {
+        Unit* attacker;
+        Unit* victim;
+        DamageDealtRecord& record;
+        bool on;
+        ~DealtFlush()
+        {
+            if (on && record.Any())
+                sRecordLogs->Append(victim->GetGUID(), attacker, RecordKind::DamageDealt, record);
+        }
+    } dealtFlush{ attacker, victim, dealt, attackerForeign };
+
     //if (attacker)
     {
         if (victim->IsAIEnabled)
             victim->GetAI()->DamageTaken(attacker, damage, damagetype, damageSchoolMask);
 
         if (attacker && attacker->IsAIEnabled)
-            attacker->GetAI()->DamageDealt(victim, damage, damagetype, damageSchoolMask);
+        {
+            if (attackerForeign)
+            {
+                dealt.aiHook = 1;
+                dealt.damage = damage;
+            }
+            else
+                attacker->GetAI()->DamageDealt(victim, damage, damagetype, damageSchoolMask);
+        }
     }
 
     // Hook for OnDamage Event
@@ -1074,7 +1111,12 @@ uint32 Unit::DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage
         if (spellProto)
         {
             if (attacker && damagetype != DOT && spellProto->DmgClass == SPELL_DAMAGE_CLASS_MELEE && !(spellProto->GetSchoolMask() & SPELL_SCHOOL_MASK_HOLY))
-                attacker->DealDamageShieldDamage(victim);
+            {
+                if (attackerForeign)
+                    dealt.damageShield = 1;
+                else
+                    attacker->DealDamageShieldDamage(victim);
+            }
 
             if (!spellProto->HasAttribute(SPELL_ATTR4_DAMAGE_DOESNT_BREAK_AURAS))
                 victim->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_TAKE_DAMAGE, spellProto->Id);
@@ -1163,6 +1205,12 @@ uint32 Unit::DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage
             case BASE_ATTACK:
             case OFF_ATTACK:
                 {
+                    if (attackerForeign)
+                    {
+                        dealt.rageFromDamage = 1;
+                        break;
+                    }
+
                     weaponSpeedHitFactor = attacker->GetRageWeaponSpeedHitFactor(cleanDamage->attackType);
                     if (cleanDamage->hitOutCome == MELEE_HIT_CRIT)
                         weaponSpeedHitFactor *= 2;
@@ -1184,7 +1232,12 @@ uint32 Unit::DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage
                 victim->RewardRage(cleanDamage->absorbed_damage, 0, false);
 
             if (attacker && attacker->HasActivePowerType(POWER_RAGE))
-                attacker->RewardRage(cleanDamage->absorbed_damage, 0, true);
+            {
+                if (attackerForeign)
+                    dealt.rageFromAbsorb = 1;
+                else
+                    attacker->RewardRage(cleanDamage->absorbed_damage, 0, true);
+            }
         }
 
         return 0;
@@ -1230,7 +1283,13 @@ uint32 Unit::DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage
     }
 
     if (attacker && attacker != victim)
-        if (Player* killer = attacker->GetCharmerOrOwnerPlayerOrPlayerItself())
+    {
+        if (attackerForeign)
+        {
+            dealt.bgScore = 1;
+            dealt.damage = damage;
+        }
+        else if (Player* killer = attacker->GetCharmerOrOwnerPlayerOrPlayerItself())
         {
             // pussywizard: don't allow GMs to deal damage in normal way (this leaves no evidence in logs!), they have commands to do so
             //if (!allowGM && killer->GetSession()->GetSecurity() && killer->GetSession()->GetSecurity() <= SEC_ADMINISTRATOR)
@@ -1243,6 +1302,7 @@ uint32 Unit::DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage
             }
             //killer->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_HIGHEST_HIT_DEALT, damage); // pussywizard: optimization
         }
+    }
 
     if (victim->IsPlayer())
         ;//victim->ToPlayer()->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_HIGHEST_HIT_RECEIVED, damage); // pussywizard: optimization
@@ -1332,8 +1392,10 @@ uint32 Unit::DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage
 
         if (attacker && attacker->IsPlayer())
         {
+            if (attackerForeign)
+                dealt.durabilityRoll = 1;
             // random durability for items (HIT DONE)
-            if (roll_chance_f(sWorld->getRate(RATE_DURABILITY_LOSS_DAMAGE)))
+            else if (roll_chance_f(sWorld->getRate(RATE_DURABILITY_LOSS_DAMAGE)))
             {
                 EquipmentSlots slot = EquipmentSlots(urand(0, EQUIPMENT_SLOT_END - 1));
                 attacker->ToPlayer()->DurabilityPointLossForEquipSlot(slot);
@@ -1552,7 +1614,6 @@ void Unit::CalculateSpellDamageTaken(SpellNonMeleeDamage* damageInfo, int32 dama
         return;
 
     SpellSchoolMask damageSchoolMask = SpellSchoolMask(damageInfo->schoolMask);
-    uint32 crTypeMask = victim->GetCreatureTypeMask();
 
      // Script Hook For CalculateSpellDamageTaken -- Allow scripts to change the Damage post class mitigation calculations
     sScriptMgr->ModifySpellDamageTaken(damageInfo->target, damageInfo->attacker, damage, spellInfo);
@@ -1585,37 +1646,10 @@ void Unit::CalculateSpellDamageTaken(SpellNonMeleeDamage* damageInfo, int32 dama
                     blocked = isSpellBlocked(victim, spellInfo, attackType);
                 }
 
+                // The crit bonus is applied by the caster at launch (Spell::DoAllEffectOnLaunchTarget, plan 07 §5.1);
+                // here crit only marks the log and drives resilience.
                 if (crit)
-                {
                     damageInfo->HitInfo |= SPELL_HIT_TYPE_CRIT;
-
-                    // Calculate crit bonus (100% for melee/ranged spells)
-                    int32 crit_bonus = damage;
-                    crit_bonus += damage;
-
-                    // Apply SPELL_AURA_MOD_ATTACKER_RANGED_CRIT_DAMAGE or SPELL_AURA_MOD_ATTACKER_MELEE_CRIT_DAMAGE
-                    float crit_mod = 0.0f;
-                    if (attackType == RANGED_ATTACK)
-                        crit_mod += victim->GetTotalAuraModifier(SPELL_AURA_MOD_ATTACKER_RANGED_CRIT_DAMAGE);
-                    else
-                        crit_mod += victim->GetTotalAuraModifier(SPELL_AURA_MOD_ATTACKER_MELEE_CRIT_DAMAGE);
-
-                    // Increase crit damage from SPELL_AURA_MOD_CRIT_DAMAGE_BONUS
-                    crit_mod += GetTotalAuraModifierByMiscMask(SPELL_AURA_MOD_CRIT_DAMAGE_BONUS, spellInfo->GetSchoolMask());
-                    // Increase crit damage from SPELL_AURA_MOD_CRIT_PERCENT_VERSUS
-                    crit_mod += GetTotalAuraModifierByMiscMask(SPELL_AURA_MOD_CRIT_PERCENT_VERSUS, crTypeMask);
-
-                    if (crit_bonus != 0 && crit_mod != 0.0f)
-                        AddPct(crit_bonus, crit_mod);
-
-                    crit_bonus -= damage;
-
-                    // adds additional damage to critBonus (from talents)
-                    if (Player* modOwner = GetSpellModOwner())
-                        modOwner->ApplySpellMod(spellInfo->Id, SPELLMOD_CRIT_DAMAGE_BONUS, crit_bonus);
-
-                    damage = crit_bonus + damage;
-                }
 
                 // Spell weapon based damage CAN BE crit & blocked at same time
                 if (blocked)
@@ -1653,12 +1687,9 @@ void Unit::CalculateSpellDamageTaken(SpellNonMeleeDamage* damageInfo, int32 dama
         case SPELL_DAMAGE_CLASS_NONE:
         case SPELL_DAMAGE_CLASS_MAGIC:
             {
-                // If crit add critical bonus
+                // crit bonus already in damage (launch side, plan 07 §5.1)
                 if (crit)
-                {
                     damageInfo->HitInfo |= SPELL_HIT_TYPE_CRIT;
-                    damage = Unit::SpellCriticalDamageBonus(this, spellInfo, damage, victim);
-                }
 
                 int32 resilienceReduction = damage;
                 if (CanApplyResilience())
@@ -4434,7 +4465,7 @@ bool Unit::IsHighestExclusiveAuraEffect(SpellInfo const* spellInfo, AuraType aur
     return true;
 }
 
-Aura* Unit::_TryStackingOrRefreshingExistingAura(SpellInfo const* newAura, uint8 effMask, Unit* caster, int32* baseAmount /*= nullptr*/, Item* castItem /*= nullptr*/, ObjectGuid casterGUID /*= ObjectGuid::Empty*/, bool periodicReset /*= false*/)
+Aura* Unit::_TryStackingOrRefreshingExistingAura(SpellInfo const* newAura, uint8 effMask, Unit* caster, int32* baseAmount /*= nullptr*/, Item* castItem /*= nullptr*/, ObjectGuid casterGUID /*= ObjectGuid::Empty*/, bool periodicReset /*= false*/, AuraLaunchData const* launch /*= nullptr*/)
 {
     ASSERT(casterGUID || caster);
     if (!casterGUID)
@@ -4484,7 +4515,10 @@ Aura* Unit::_TryStackingOrRefreshingExistingAura(SpellInfo const* newAura, uint8
             }
 
             // try to increase stack amount
-            foundAura->ModStackAmount(1, AURA_REMOVE_BY_DEFAULT, periodicReset);
+            if (launch && launch->IsSet())
+                foundAura->ModStackAmountFromLaunch(*launch, periodicReset);   // step 07 §5.3: caster numbers from launch
+            else
+                foundAura->ModStackAmount(1, AURA_REMOVE_BY_DEFAULT, periodicReset);
             sScriptMgr->OnAuraApply(this, foundAura);
             return foundAura;
         }
@@ -6616,6 +6650,84 @@ void Unit::SendSpellNonMeleeDamageLog(Unit* target, SpellInfo const* spellInfo, 
 
 void Unit::ProcSkillsAndAuras(Unit* actor, Unit* victim, uint32 procAttacker, uint32 procVictim, uint32 procExtra, uint32 amount, WeaponAttackType attType, SpellInfo const* procSpellInfo, SpellInfo const* procAura, int8 procAuraEffectIndex, Spell const* procSpell, DamageInfo* damageInfo, HealInfo* healInfo, uint32 procPhase)
 {
+    // Calculate spellTypeMask based on phase and actual damage/heal info
+    uint32 spellTypeMask = 0;
+    if (procPhase == PROC_SPELL_PHASE_CAST || procPhase == PROC_SPELL_PHASE_FINISH)
+    {
+        // At CAST phase, no damage/heal has occurred yet - use MASK_ALL to allow
+        // procs that check for damage/heal type based on spell info (like Backlash)
+        // At FINISH phase, damageInfo may be null but spell did do damage - use MASK_ALL
+        // to match TrinityCore behavior (see TC Spell.cpp PROC_SPELL_PHASE_FINISH call)
+        spellTypeMask = PROC_SPELL_TYPE_MASK_ALL;
+    }
+    else if (healInfo && healInfo->GetHeal())
+        spellTypeMask = PROC_SPELL_TYPE_HEAL;
+    else if (damageInfo && (damageInfo->GetDamage() || damageInfo->GetAbsorb()))
+        spellTypeMask = PROC_SPELL_TYPE_DAMAGE;
+    else if (procSpellInfo)
+        spellTypeMask = PROC_SPELL_TYPE_NO_DMG_HEAL;
+
+    // Step 07 slice 5 (plan §8.1): on the victim's task the actor is foreign. Its half (skills, reactives, its
+    // own aura procs and its mod owner's) goes to its inbox as a ProcActorRecord; the victim half runs here with
+    // the actor read through the handle.
+    bool const actorForeign = actor && victim && BeatContext::IsForeign(actor) && !BeatContext::IsForeign(victim);
+    if (actorForeign)
+    {
+        if (victim->IsAlive() && procVictim)
+            victim->ProcSkillsAndReactives(true, actor, procVictim, procExtra, attType, procSpellInfo, amount, procAura, procAuraEffectIndex, procSpell, damageInfo, healInfo, procPhase);
+
+        if (procVictim)
+            actor->TriggerAurasProcOnEvent(nullptr, nullptr, victim, 0, procVictim, spellTypeMask, procPhase, procExtra, const_cast<Spell*>(procSpell), damageInfo, healInfo);
+
+        ProcActorRecord record;
+        record.target = victim->GetGUID();
+        record.procAttacker = procAttacker;
+        record.procExtra = procExtra;
+        record.amount = amount;
+        record.spellTypeMask = spellTypeMask;
+        record.procPhase = procPhase;
+        record.procSpellId = procSpellInfo ? procSpellInfo->Id : 0;
+        record.procAuraId = procAura ? procAura->Id : 0;
+        record.procAuraIdx = procAuraEffectIndex;
+        record.attType = uint8(attType);
+        record.procDisabled = procSpell && procSpell->IsProcDisabled();
+        if (damageInfo)
+        {
+            record.hasDamage = 1;
+            record.dmgDamage = damageInfo->GetDamage();
+            record.dmgAbsorb = damageInfo->GetAbsorb();
+            record.dmgResist = damageInfo->GetResist();
+            record.dmgBlock = damageInfo->GetBlock();
+            record.dmgClean = damageInfo->GetUnmitigatedDamage() - damageInfo->GetDamage() - damageInfo->GetAbsorb() - damageInfo->GetResist();
+            record.dmgSchoolMask = damageInfo->GetSchoolMask();
+            record.dmgSpellId = damageInfo->GetSpellInfo() ? damageInfo->GetSpellInfo()->Id : 0;
+            record.dmgHitMask = damageInfo->GetHitMask();
+            record.dmgType = uint8(damageInfo->GetDamageType());
+            record.dmgAttackType = uint8(damageInfo->GetAttackType());
+        }
+        if (healInfo)
+        {
+            record.hasHeal = 1;
+            record.healHeal = healInfo->GetHeal();
+            record.healBeforeTakenMods = healInfo->GetHealBeforeTakenMods();
+            record.healEffective = healInfo->GetEffectiveHeal();
+            record.healAbsorb = healInfo->GetAbsorb();
+            record.healSpellId = healInfo->GetSpellInfo() ? healInfo->GetSpellInfo()->Id : 0;
+            record.healSchoolMask = healInfo->GetSchoolMask();
+            record.healHitMask = healInfo->GetHitMask();
+        }
+        if (procSpell)
+            for (Aura* mod : procSpell->m_appliedMods)
+            {
+                if (record.appliedModCount >= MAX_PROC_APPLIED_MODS)
+                    break;
+                record.appliedModAuraIds[record.appliedModCount++] = mod->GetId();
+            }
+
+        sRecordLogs->Append(victim->GetGUID(), actor, RecordKind::ProcActor, record);
+        return;
+    }
+
     // Handle skills and reactives for actor
     if (procAttacker && actor)
         actor->ProcSkillsAndReactives(false, victim, procAttacker, procExtra, attType, procSpellInfo, amount, procAura, procAuraEffectIndex, procSpell, damageInfo, healInfo, procPhase);
@@ -6626,26 +6738,156 @@ void Unit::ProcSkillsAndAuras(Unit* actor, Unit* victim, uint32 procAttacker, ui
 
     // Handle aura procs via new proc system (TriggerAurasProcOnEvent)
     if (actor)
-    {
-        // Calculate spellTypeMask based on phase and actual damage/heal info
-        uint32 spellTypeMask = 0;
-        if (procPhase == PROC_SPELL_PHASE_CAST || procPhase == PROC_SPELL_PHASE_FINISH)
-        {
-            // At CAST phase, no damage/heal has occurred yet - use MASK_ALL to allow
-            // procs that check for damage/heal type based on spell info (like Backlash)
-            // At FINISH phase, damageInfo may be null but spell did do damage - use MASK_ALL
-            // to match TrinityCore behavior (see TC Spell.cpp PROC_SPELL_PHASE_FINISH call)
-            spellTypeMask = PROC_SPELL_TYPE_MASK_ALL;
-        }
-        else if (healInfo && healInfo->GetHeal())
-            spellTypeMask = PROC_SPELL_TYPE_HEAL;
-        else if (damageInfo && (damageInfo->GetDamage() || damageInfo->GetAbsorb()))
-            spellTypeMask = PROC_SPELL_TYPE_DAMAGE;
-        else if (procSpellInfo)
-            spellTypeMask = PROC_SPELL_TYPE_NO_DMG_HEAL;
-
         actor->TriggerAurasProcOnEvent(nullptr, nullptr, victim, procAttacker, procVictim, spellTypeMask, procPhase, procExtra, const_cast<Spell*>(procSpell), damageInfo, healInfo);
+}
+
+void Unit::ApplyProcActor(ProcActorRecord const& proc)
+{
+    if (!IsInWorld())
+        return;
+
+    Unit* target = proc.target == GetGUID() ? this : ObjectAccessor::GetUnit(*this, proc.target);
+    if (!target)
+    {
+        // Proc handlers dereference the action target; without it the actor's procs for this event are dropped.
+        LOG_DEBUG("spells", "{} dropped ProcActor for {}: target {} not in world", GetGUID().ToString(), proc.procSpellId, proc.target.ToString());
+        return;
     }
+
+    SpellInfo const* procSpellInfo = proc.procSpellId ? sSpellMgr->GetSpellInfo(proc.procSpellId) : nullptr;
+    SpellInfo const* procAura = proc.procAuraId ? sSpellMgr->GetSpellInfo(proc.procAuraId) : nullptr;
+    WeaponAttackType const attType = WeaponAttackType(proc.attType);
+
+    std::optional<DamageInfo> damageInfo;
+    if (proc.hasDamage)
+    {
+        SpellInfo const* dmgSpell = proc.dmgSpellId ? sSpellMgr->GetSpellInfo(proc.dmgSpellId) : nullptr;
+        damageInfo.emplace(this, target, proc.dmgDamage + proc.dmgAbsorb + proc.dmgResist + proc.dmgBlock, dmgSpell,
+            SpellSchoolMask(proc.dmgSchoolMask), DamageEffectType(proc.dmgType), proc.dmgClean);
+        damageInfo->AbsorbDamage(proc.dmgAbsorb);
+        damageInfo->ResistDamage(proc.dmgResist);
+        damageInfo->BlockDamage(proc.dmgBlock);
+        damageInfo->AddHitMask(proc.dmgHitMask);
+        damageInfo->SetAttackType(WeaponAttackType(proc.dmgAttackType));
+    }
+
+    std::optional<HealInfo> healInfo;
+    if (proc.hasHeal)
+    {
+        SpellInfo const* healSpell = proc.healSpellId ? sSpellMgr->GetSpellInfo(proc.healSpellId) : nullptr;
+        healInfo.emplace(this, target, proc.healHeal + proc.healAbsorb, healSpell, SpellSchoolMask(proc.healSchoolMask));
+        healInfo->SetHealBeforeTakenMods(proc.healBeforeTakenMods);
+        healInfo->SetEffectiveHeal(proc.healEffective + proc.healAbsorb);
+        healInfo->AbsorbHeal(proc.healAbsorb);
+        healInfo->AddHitMask(proc.healHitMask);
+    }
+
+    std::set<Aura*> appliedMods;
+    for (uint8 i = 0; i < proc.appliedModCount && i < MAX_PROC_APPLIED_MODS; ++i)
+        if (Aura* mod = GetAura(proc.appliedModAuraIds[i]))
+            appliedMods.insert(mod);
+
+    if (proc.procDisabled)
+        SetCantProc(true);
+
+    if (proc.procAttacker)
+        ProcSkillsAndReactives(false, target, proc.procAttacker, proc.procExtra, attType, procSpellInfo, proc.amount, procAura, proc.procAuraIdx, nullptr,
+            damageInfo ? &*damageInfo : nullptr, healInfo ? &*healInfo : nullptr, proc.procPhase);
+
+    TriggerAurasProcOnEvent(nullptr, nullptr, target, proc.procAttacker, 0, proc.spellTypeMask, proc.procPhase, proc.procExtra, nullptr,
+        damageInfo ? &*damageInfo : nullptr, healInfo ? &*healInfo : nullptr, &appliedMods);
+
+    if (proc.procDisabled)
+        SetCantProc(false);
+}
+
+void Unit::ApplyDamageDealt(DamageDealtRecord const& dealt)
+{
+    if (!IsInWorld())
+        return;
+
+    Unit* victim = ObjectAccessor::GetUnit(*this, dealt.victim);   // may be gone; the hooks below accept null where today's code does
+    SpellInfo const* spellProto = dealt.spellId ? sSpellMgr->GetSpellInfo(dealt.spellId) : nullptr;
+    DamageEffectType const damagetype = DamageEffectType(dealt.damageType);
+    WeaponAttackType const attackType = WeaponAttackType(dealt.attackType);
+
+    if (dealt.aiHook && IsAIEnabled && victim)
+        GetAI()->DamageDealt(victim, dealt.damage, damagetype, SpellSchoolMask(dealt.schoolMask));
+
+    if (dealt.damageShield && victim && spellProto)
+        DealDamageShieldDamage(victim);
+
+    if (dealt.rageFromDamage && HasActivePowerType(POWER_RAGE))
+    {
+        uint32 weaponSpeedHitFactor = GetRageWeaponSpeedHitFactor(attackType);
+        if (dealt.hitOutcome == MELEE_HIT_CRIT)
+            weaponSpeedHitFactor *= 2;
+        RewardRage(dealt.rageDamage, weaponSpeedHitFactor, true);
+    }
+
+    if (dealt.rageFromAbsorb && HasActivePowerType(POWER_RAGE))
+        RewardRage(dealt.absorbed, 0, true);
+
+    if (dealt.bgScore)
+        if (Player* killer = GetCharmerOrOwnerPlayerOrPlayerItself())
+            if (Battleground* bg = killer->GetBattleground())
+            {
+                bg->UpdatePlayerScore(killer, SCORE_DAMAGE_DONE, dealt.damage);
+                killer->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_DAMAGE_DONE, dealt.damage, 0, victim);
+            }
+
+    if (dealt.durabilityRoll && IsPlayer())
+        if (roll_chance_f(sWorld->getRate(RATE_DURABILITY_LOSS_DAMAGE)))
+        {
+            EquipmentSlots slot = EquipmentSlots(urand(0, EQUIPMENT_SLOT_END - 1));
+            ToPlayer()->DurabilityPointLossForEquipSlot(slot);
+        }
+}
+
+void Unit::ApplyHealDone(HealDoneRecord const& healed)
+{
+    if (!IsInWorld())
+        return;
+
+    Unit* target = ObjectAccessor::GetUnit(*this, healed.target);
+
+    if (healed.aiHook && IsAIEnabled && target)
+        GetAI()->HealDone(target, healed.heal);
+
+    if (healed.bgScore)
+        if (Player* player = ToPlayer())
+        {
+            if (Battleground* bg = player->GetBattleground())
+                bg->UpdatePlayerScore(player, SCORE_HEALING_DONE, healed.gain);
+
+            if (healed.gain && player->InBattleground())
+                player->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_HEALING_DONE, healed.gain, 0, target);
+        }
+}
+
+void Unit::ApplyKillingBlow(KillingBlowRecord const& blow)
+{
+    if (!IsInWorld())
+        return;
+
+    Unit* victim = ObjectAccessor::GetUnit(*this, blow.victim);
+
+    if (blow.killingBlowAchievement)
+        if (Player* player = ToPlayer())
+            player->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_GET_KILLING_BLOWS, 1, 0, victim);
+
+    if (blow.aiKilledUnit && victim && IsCreature() && IsAIEnabled)
+        ToCreature()->AI()->KilledUnit(victim);
+}
+
+void Unit::ApplyKillCredit(KillCreditRecord const& credit)
+{
+    Player* player = ToPlayer();
+    if (!player || !IsInWorld())
+        return;
+
+    Unit* victim = ObjectAccessor::GetUnit(*this, credit.victim);
+    KillRewarder::RewardFromCredit(player, victim, credit);
 }
 
 void Unit::SendPeriodicAuraLog(SpellPeriodicAuraLogInfo* pInfo)
@@ -7904,12 +8146,15 @@ int32 Unit::DealHeal(Unit* healer, Unit* victim, uint32 addhealth)
 {
     int32 gain = 0;
 
+    // Step 07 slice 5 (plan §7.3): the healer's half goes to its inbox when it is foreign to this task.
+    bool const healerForeign = healer && healer != victim && BeatContext::IsForeign(healer);
+
     if (healer)
     {
         if (victim->IsAIEnabled)
             victim->GetAI()->HealReceived(healer, addhealth);
 
-        if (healer->IsAIEnabled)
+        if (healer->IsAIEnabled && !healerForeign)
             healer->GetAI()->HealDone(victim, addhealth);
     }
 
@@ -7918,6 +8163,34 @@ int32 Unit::DealHeal(Unit* healer, Unit* victim, uint32 addhealth)
 
     // Hook for OnHeal Event
     sScriptMgr->OnHeal(healer, victim, (uint32&)gain);
+
+    if (healerForeign)
+    {
+        HealDoneRecord healed;
+        healed.target = victim->GetGUID();
+        healed.heal = addhealth;
+        healed.gain = uint32(std::max(gain, 0));
+        if (healer->IsAIEnabled)
+        {
+            healed.aiHook = 1;
+            sRecordLogs->Append(victim->GetGUID(), healer, RecordKind::HealDone, healed);
+            healed.aiHook = 0;
+        }
+
+        // Battleground score goes to the player credited with the heal: the healer or a totem's owner.
+        Unit* credited = healer;
+        if (healer->IsCreature() && healer->ToCreature()->IsTotem())
+            credited = healer->GetOwner();
+        if (credited && credited->IsPlayer())
+        {
+            healed.bgScore = 1;
+            if (BeatContext::IsForeign(credited))
+                sRecordLogs->Append(victim->GetGUID(), credited, RecordKind::HealDone, healed);
+            else
+                credited->ApplyHealDone(healed);
+        }
+        return gain;
+    }
 
     Unit* unit = healer;
 
@@ -9224,6 +9497,14 @@ float Unit::SpellTakenCritChance(Unit const* caster, SpellInfo const* spellProto
 
 uint32 Unit::SpellCriticalDamageBonus(Unit const* caster, SpellInfo const* spellProto, uint32 damage, Unit const* victim)
 {
+    if (!victim)
+        return SpellCriticalDamageBonus(caster, spellProto, damage, static_cast<UnitView const*>(nullptr));
+    UnitView view(victim);
+    return SpellCriticalDamageBonus(caster, spellProto, damage, &view);
+}
+
+uint32 Unit::SpellCriticalDamageBonus(Unit const* caster, SpellInfo const* spellProto, uint32 damage, UnitView const* victim, WeaponAttackType attackType /*= MAX_ATTACK*/)
+{
     // Calculate critical bonus
     int32 crit_bonus = damage;
     float crit_mod = 0.0f;
@@ -9233,6 +9514,9 @@ uint32 Unit::SpellCriticalDamageBonus(Unit const* caster, SpellInfo const* spell
         case SPELL_DAMAGE_CLASS_MELEE:                      // for melee based spells is 100%
         case SPELL_DAMAGE_CLASS_RANGED:
             crit_bonus += damage;
+            // direct weapon-class spell hits (attackType given): SPELL_AURA_MOD_ATTACKER_*_CRIT_DAMAGE on the victim
+            if (victim && attackType != MAX_ATTACK)
+                crit_mod += victim->GetTotalAuraModifier(attackType == RANGED_ATTACK ? SPELL_AURA_MOD_ATTACKER_RANGED_CRIT_DAMAGE : SPELL_AURA_MOD_ATTACKER_MELEE_CRIT_DAMAGE);
             break;
         default:
             crit_bonus += damage / 2;                       // for spells is 50%
@@ -9257,6 +9541,8 @@ uint32 Unit::SpellCriticalDamageBonus(Unit const* caster, SpellInfo const* spell
 
         crit_bonus += damage;
     }
+    else if (crit_bonus != 0 && crit_mod != 0.0f)
+        AddPct(crit_bonus, crit_mod);
 
     return crit_bonus;
 }
@@ -10808,12 +11094,26 @@ int32 Unit::ModifyHealth(int32 dVal)
     if (dVal == 0)
         return 0;
 
+    // Inside a batch the write is deferred to EndHealthBatch; GetHealth() already includes the pending delta,
+    // so the arithmetic below is the same in both modes.
+    auto writeHealth = [this](int32 val)
+    {
+        if (!_healthBatchDepth)
+        {
+            SetHealth(uint32(val));
+            return;
+        }
+        if (getDeathState() == DeathState::JustDied)
+            val = 0;
+        _pendingHealthDelta = val - int32(GetUInt32Value(UNIT_FIELD_HEALTH));
+    };
+
     int32 curHealth = (int32)GetHealth();
 
     int32 val = dVal + curHealth;
     if (val <= 0)
     {
-        SetHealth(0);
+        writeHealth(0);
         return -curHealth;
     }
 
@@ -10821,16 +11121,30 @@ int32 Unit::ModifyHealth(int32 dVal)
 
     if (val < maxHealth)
     {
-        SetHealth(val);
+        writeHealth(val);
         gain = val - curHealth;
     }
     else if (curHealth != maxHealth)
     {
-        SetHealth(maxHealth);
+        writeHealth(maxHealth);
         gain = maxHealth - curHealth;
     }
 
     return gain;
+}
+
+void Unit::EndHealthBatch()
+{
+    ASSERT(_healthBatchDepth > 0);
+    if (--_healthBatchDepth)
+        return;
+
+    if (!_pendingHealthDelta)
+        return;
+
+    // GetHealth() is the batched value until SetHealth clears the delta below.
+    uint32 const health = GetHealth();
+    SetHealth(health);
 }
 
 int32 Unit::GetHealthGain(int32 dVal)
@@ -12032,6 +12346,10 @@ void Unit::SetLevel(uint8 lvl, bool showLevelChange)
 
 void Unit::SetHealth(uint32 val)
 {
+    // Authoritative write: whatever a health batch had pending is superseded (death, duel end, max clamp, flush).
+    // Cleared first so prevHealthPct below is the last written value.
+    _pendingHealthDelta = 0;
+
     if (getDeathState() == DeathState::JustDied)
         val = 0;
     else if (IsPlayer() && getDeathState() == DeathState::Dead)
@@ -12350,8 +12668,17 @@ void Unit::ApplyRecords(std::vector<RecordHeader const*> const& records)
     if (!IsInWorld())
         return;
 
-    // Two-pass health (one ModifyHealth per beat for SpellHit / MeleeHit / PeriodicLanded) needs the victim-side
-    // DealDamage split of step 07 slice 5 and step 08; until then every record applies its own damage in order.
+    // Two-pass health (plan 06): records apply in order and each sees the health the ones before it produced,
+    // but UNIT_FIELD_HEALTH is written once for the whole inbox (EndHealthBatch), or once by SetHealth(0) when
+    // a record kills. Death is decided at the record whose damage reaches zero, so the killer is that record's
+    // source and later records land on a dead unit as they do today.
+    struct HealthBatchScope
+    {
+        Unit* unit;
+        explicit HealthBatchScope(Unit* u) : unit(u) { unit->BeginHealthBatch(); }
+        ~HealthBatchScope() { unit->EndHealthBatch(); }
+    } healthBatch(this);
+
     for (RecordHeader const* hdr : records)
         ApplyRecord(*hdr, reinterpret_cast<uint8 const*>(hdr) + RECORD_HEADER_SIZE);
 }
@@ -12364,11 +12691,26 @@ void Unit::ApplyRecord(RecordHeader const& header, uint8 const* payload)
             ApplySpellHit(RecordPayload<SpellHitRecord>(payload));
             break;
         case RecordKind::DeferredSpellHit:
-            // No coordinator on this step: a deferred hit that reaches an inbox lands like any other.
+            // Deferred hits normally go to Map::DeferSpellHit (end of Map::Update); one that reaches an inbox lands like any other.
             ApplySpellHit(RecordPayload<DeferredSpellHitRecord>(payload).hit);
             break;
         case RecordKind::SpellLanded:
             ApplySpellLanded(RecordPayload<SpellLandedRecord>(payload));
+            break;
+        case RecordKind::DamageDealt:
+            ApplyDamageDealt(RecordPayload<DamageDealtRecord>(payload));
+            break;
+        case RecordKind::HealDone:
+            ApplyHealDone(RecordPayload<HealDoneRecord>(payload));
+            break;
+        case RecordKind::KillingBlow:
+            ApplyKillingBlow(RecordPayload<KillingBlowRecord>(payload));
+            break;
+        case RecordKind::KillCredit:
+            ApplyKillCredit(RecordPayload<KillCreditRecord>(payload));
+            break;
+        case RecordKind::ProcActor:
+            ApplyProcActor(RecordPayload<ProcActorRecord>(payload));
             break;
         case RecordKind::ThreatBackRef:
             GetThreatMgr().ApplyThreatBackRef(RecordPayload<ThreatBackRefRecord>(payload).victimGuid);
@@ -12843,22 +13185,26 @@ void Unit::TriggerAurasProcOnEvent(CalcDamageInfo& damageInfo)
     TriggerAurasProcOnEvent(nullptr, nullptr, damageInfo.target, damageInfo.procAttacker, damageInfo.procVictim, 0, 0, dmgInfo.GetHitMask(), nullptr, &dmgInfo, nullptr);
 }
 
-void Unit::TriggerAurasProcOnEvent(std::list<AuraApplication*>* myProcAuras, std::list<AuraApplication*>* targetProcAuras, Unit* actionTarget, uint32 typeMaskActor, uint32 typeMaskActionTarget, uint32 spellTypeMask, uint32 spellPhaseMask, uint32 hitMask, Spell* spell, DamageInfo* damageInfo, HealInfo* healInfo)
+void Unit::TriggerAurasProcOnEvent(std::list<AuraApplication*>* myProcAuras, std::list<AuraApplication*>* targetProcAuras, Unit* actionTarget, uint32 typeMaskActor, uint32 typeMaskActionTarget, uint32 spellTypeMask, uint32 spellPhaseMask, uint32 hitMask, Spell* spell, DamageInfo* damageInfo, HealInfo* healInfo, std::set<Aura*> const* appliedMods /*= nullptr*/)
 {
     // prepare data for self trigger
     ProcEventInfo myProcEventInfo = ProcEventInfo(this, actionTarget, actionTarget, typeMaskActor, spellTypeMask, spellPhaseMask, hitMask, spell, damageInfo, healInfo);
     AuraApplicationProcContainer myAurasTriggeringProc;
-    GetProcAurasTriggeredOnEvent(myAurasTriggeringProc, myProcAuras, myProcEventInfo);
+    // typeMaskActor == 0: the actor half went to the actor's inbox (ProcActorRecord); only the target half runs here.
+    if (typeMaskActor)
+        GetProcAurasTriggeredOnEvent(myAurasTriggeringProc, myProcAuras, myProcEventInfo);
 
     // needed for example for Cobra Strikes, pet does the attack, but aura is on owner
-    if (Player* modOwner = GetSpellModOwner())
+    if (!appliedMods && spell)
+        appliedMods = &spell->m_appliedMods;
+    if (Player* modOwner = typeMaskActor ? GetSpellModOwner() : nullptr)
     {
-        if (modOwner != this && spell)
+        if (modOwner != this && appliedMods)
         {
             std::list<AuraApplication*> modAuras;
             for (auto itr = modOwner->GetAppliedAuras().begin(); itr != modOwner->GetAppliedAuras().end(); ++itr)
             {
-                if (spell->m_appliedMods.count(itr->second->GetBase()) != 0)
+                if (appliedMods->count(itr->second->GetBase()) != 0)
                     modAuras.push_back(itr->second);
             }
 
@@ -12873,7 +13219,8 @@ void Unit::TriggerAurasProcOnEvent(std::list<AuraApplication*>* myProcAuras, std
     if (typeMaskActionTarget && actionTarget)
         actionTarget->GetProcAurasTriggeredOnEvent(targetAurasTriggeringProc, targetProcAuras, targetProcEventInfo);
 
-    TriggerAurasProcOnEvent(myProcEventInfo, myAurasTriggeringProc);
+    if (typeMaskActor)
+        TriggerAurasProcOnEvent(myProcEventInfo, myAurasTriggeringProc);
 
     if (typeMaskActionTarget && actionTarget)
         actionTarget->TriggerAurasProcOnEvent(targetProcEventInfo, targetAurasTriggeringProc);
@@ -14048,11 +14395,31 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
     // Proc auras on death - must be before aura/combat remove
     Unit::ProcSkillsAndAuras(victim, nullptr, PROC_FLAG_DEATH, PROC_FLAG_NONE, PROC_EX_NONE, 0, attackType, nullptr, nullptr, -1, nullptr);
 
+    // Step 07 slice 5 (plan §7.3): Kill runs on the victim's task. Killer-side writes that are not rewards
+    // (KillRewarder routes those per member) go to the writing unit's inbox when it is foreign.
+    auto killerWrite = [victim](Unit* who, bool achievement, bool aiKilledUnit, auto&& inline_)
+    {
+        if (!who)
+            return;
+        if (!BeatContext::IsForeign(who))
+        {
+            inline_();
+            return;
+        }
+        KillingBlowRecord blow;
+        blow.victim = victim->GetGUID();
+        blow.victimEntry = victim->GetEntry();
+        blow.victimIsPlayer = victim->IsPlayer();
+        blow.killingBlowAchievement = achievement;
+        blow.aiKilledUnit = aiKilledUnit;
+        sRecordLogs->Append(victim->GetGUID(), who, RecordKind::KillingBlow, blow);
+    };
+
     // update get killing blow achievements, must be done before setDeathState to be able to require auras on target
     // and before Spirit of Redemption as it also removes auras
     if (killer)
         if (Player* killerPlayer = killer->GetCharmerOrOwnerPlayerOrPlayerItself())
-            killerPlayer->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_GET_KILLING_BLOWS, 1, 0, victim);
+            killerWrite(killerPlayer, true, false, [&]() { killerPlayer->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_GET_KILLING_BLOWS, 1, 0, victim); });
 
     // Spirit of Redemption
     // if talent known but not triggered (check priest class for speedup check)
@@ -14107,7 +14474,7 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
     {
         Pet* pet = player->GetPet();
         if (pet && pet->IsAlive() && pet->isControlled())
-            pet->AI()->KilledUnit(victim);
+            killerWrite(pet, false, true, [&]() { pet->AI()->KilledUnit(victim); });
     }
 
     // 10% durability loss on death
@@ -14128,7 +14495,7 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
         }
         // Call KilledUnit for creatures
         if (killer && killer->IsCreature() && killer->IsAIEnabled)
-            killer->ToCreature()->AI()->KilledUnit(victim);
+            killerWrite(killer, false, true, [&]() { killer->ToCreature()->AI()->KilledUnit(victim); });
 
         // last damage from non duel opponent or opponent controlled creature
         if (plrVictim->duel)
@@ -14157,7 +14524,7 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
 
         // Call KilledUnit for creatures, this needs to be called after the lootable flag is set
         if (killer && killer->IsCreature() && killer->IsAIEnabled)
-            killer->ToCreature()->AI()->KilledUnit(victim);
+            killerWrite(killer, false, true, [&]() { killer->ToCreature()->AI()->KilledUnit(victim); });
 
         // Call creature just died function
         if (CreatureAI* ai = creature->AI())

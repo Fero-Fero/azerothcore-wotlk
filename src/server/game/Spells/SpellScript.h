@@ -387,6 +387,9 @@ public:
     //
     // methods useable during all spell handling phases
     Unit* GetCaster();
+    // read-only view of the caster for hit hooks: live in cast/launch hooks and inline hits, the slot when the
+    // hit lands on the target's task (plan 07 §9). Hit hooks that read the caster should prefer this.
+    UnitView GetCasterView() const;
     GameObject* GetGObjCaster();
     Unit* GetOriginalCaster();
     SpellInfo const* GetSpellInfo();
@@ -444,6 +447,10 @@ public:
     void SetHitHeal(int32 heal);
     void PreventHitHeal() { SetHitHeal(0); }
     Spell* GetSpell() { return m_spell; }
+    // number of unit targets selected for an effect, and this hit's position among them (launch order).
+    // Usable in hit hooks: a hit landing on the target's task has no access to the target-select hook's state.
+    uint32 GetUnitTargetCountForEffect(SpellEffIndex effIndex) const;
+    uint32 GetUnitTargetIndexForEffect(SpellEffIndex effIndex) const;
     // returns current spell hit target aura
     Aura* GetHitAura();
     // prevents applying aura on current spell hit target

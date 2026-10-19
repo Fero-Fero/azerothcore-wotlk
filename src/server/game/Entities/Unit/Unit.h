@@ -53,6 +53,13 @@ struct SpellValue;
 struct SpellHitRecord;
 struct SpellLandedRecord;
 struct FollowUpCast;
+struct DamageDealtRecord;
+struct HealDoneRecord;
+struct KillingBlowRecord;
+struct KillCreditRecord;
+struct ProcActorRecord;
+struct AuraLaunchData;
+class UnitView;
 
 class AuraApplication;
 class Aura;
@@ -375,6 +382,7 @@ public:
     [[nodiscard]] SpellSchoolMask GetSchoolMask() const { return m_schoolMask; };
     [[nodiscard]] DamageEffectType GetDamageType() const { return m_damageType; };
     [[nodiscard]] WeaponAttackType GetAttackType() const { return m_attackType; };
+    void SetAttackType(WeaponAttackType attackType) { m_attackType = attackType; }
     [[nodiscard]] uint32 GetDamage() const { return m_damage; };
     [[nodiscard]] uint32 GetAbsorb() const { return m_absorb; };
     [[nodiscard]] uint32 GetResist() const { return m_resist; };
@@ -715,6 +723,13 @@ public:
     void ApplySpellHit(SpellHitRecord const& hit, Spell* launchSpell = nullptr);
     void ApplySpellLanded(SpellLandedRecord const& landed);
     void CastFollowUp(FollowUpCast const& follow);
+    // Slice 5: the attacker / healer / killer / proc-actor half of DealDamage, DealHeal, Kill and
+    // ProcSkillsAndAuras, applied on this unit's own task (CombatRecords.h).
+    void ApplyDamageDealt(DamageDealtRecord const& dealt);
+    void ApplyHealDone(HealDoneRecord const& healed);
+    void ApplyKillingBlow(KillingBlowRecord const& blow);
+    void ApplyKillCredit(KillCreditRecord const& credit);
+    void ApplyProcActor(ProcActorRecord const& proc);
 
     [[nodiscard]] Unit* GetControlled(ObjectGuid const& guid) const;
 
@@ -1130,7 +1145,17 @@ public:
     void SetLevel(uint8 lvl, bool showLevelChange = true);
 
     // Health methods
-    [[nodiscard]] uint32 GetHealth()    const { return GetUInt32Value(UNIT_FIELD_HEALTH); }
+    // Inside a health batch (ApplyRecords, step 06 two-pass health) this is the field plus the beat's pending
+    // delta, so every per-record check sees the health the records before it produced; the field itself is
+    // written once when the batch ends.
+    [[nodiscard]] uint32 GetHealth() const
+    {
+        uint32 const health = GetUInt32Value(UNIT_FIELD_HEALTH);
+        if (!_healthBatchDepth)
+            return health;
+        int64 const batched = int64(health) + _pendingHealthDelta;
+        return batched <= 0 ? 0 : uint32(batched);
+    }
     [[nodiscard]] uint32 GetMaxHealth() const { return GetUInt32Value(UNIT_FIELD_MAXHEALTH); }
     [[nodiscard]] float GetHealthPct() const { return GetMaxHealth() ? 100.f * GetHealth() / GetMaxHealth() : 0.0f; }
     int32 GetHealthGain(int32 dVal);
@@ -1150,6 +1175,11 @@ public:
     void SetMaxHealth(uint32 val);
     inline void SetFullHealth() { SetHealth(GetMaxHealth()); }
     int32 ModifyHealth(int32 val);
+    // Two-pass health (plan 06): while a batch is open ModifyHealth accumulates into _pendingHealthDelta and
+    // GetHealth() reports the batched value; SetHealth (death, duel end, max health clamp) is authoritative and
+    // drops the pending delta; EndHealthBatch writes the field once. Re-entrant through the depth counter.
+    void BeginHealthBatch() { ++_healthBatchDepth; }
+    void EndHealthBatch();
     void SetCreateHealth(uint32 val) { SetUInt32Value(UNIT_FIELD_BASE_HEALTH, val); }
 
     // Power methods
@@ -1290,6 +1320,9 @@ public:
 
     // Critic damages - For resilience: player or player's pet resilience (-1%)
     static uint32 SpellCriticalDamageBonus(Unit const* caster, SpellInfo const* spellProto, uint32 damage, Unit const* victim);
+    // Launch-side form (plan 07 §5.1): the victim is a view; attackType != MAX_ATTACK adds the victim's
+    // SPELL_AURA_MOD_ATTACKER_*_CRIT_DAMAGE for weapon-class direct hits (what CalculateSpellDamageTaken did).
+    static uint32 SpellCriticalDamageBonus(Unit const* caster, SpellInfo const* spellProto, uint32 damage, UnitView const* victim, WeaponAttackType attackType = MAX_ATTACK);
 
     [[nodiscard]] float GetMeleeCritChanceReduction() const { return GetCombatRatingReduction(CR_CRIT_TAKEN_MELEE); }
     [[nodiscard]] float GetRangedCritChanceReduction() const { return GetCombatRatingReduction(CR_CRIT_TAKEN_RANGED); }
@@ -1381,7 +1414,7 @@ public:
     bool IsHighestExclusiveAuraEffect(SpellInfo const* spellInfo, AuraType auraType, int32 effectAmount, uint8 auraEffectMask, bool removeOtherAuraApplications = false);
 
     // aura apply/remove helpers - you should better not use these
-    Aura* _TryStackingOrRefreshingExistingAura(SpellInfo const* newAura, uint8 effMask, Unit* caster, int32* baseAmount = nullptr, Item* castItem = nullptr, ObjectGuid casterGUID = ObjectGuid::Empty, bool periodicReset = false);
+    Aura* _TryStackingOrRefreshingExistingAura(SpellInfo const* newAura, uint8 effMask, Unit* caster, int32* baseAmount = nullptr, Item* castItem = nullptr, ObjectGuid casterGUID = ObjectGuid::Empty, bool periodicReset = false, AuraLaunchData const* launch = nullptr);
     void _AddAura(UnitAura* aura, Unit* caster);
     AuraApplication* _CreateAuraApplication(Aura* aura, uint8 effMask);
     void _ApplyAuraEffect(Aura* aura, uint8 effIndex);
@@ -1587,7 +1620,8 @@ public:
     void GetProcAurasTriggeredOnEvent(AuraApplicationProcContainer& aurasTriggeringProc, std::list<AuraApplication*>* procAuras, ProcEventInfo eventInfo);
 
     void TriggerAurasProcOnEvent(CalcDamageInfo& damageInfo);
-    void TriggerAurasProcOnEvent(std::list<AuraApplication*>* myProcAuras, std::list<AuraApplication*>* targetProcAuras, Unit* actionTarget, uint32 typeMaskActor, uint32 typeMaskActionTarget, uint32 spellTypeMask, uint32 spellPhaseMask, uint32 hitMask, Spell* spell, DamageInfo* damageInfo, HealInfo* healInfo);
+    // appliedMods: the proc spell's m_appliedMods when the Spell itself is not available (ProcActorRecord).
+    void TriggerAurasProcOnEvent(std::list<AuraApplication*>* myProcAuras, std::list<AuraApplication*>* targetProcAuras, Unit* actionTarget, uint32 typeMaskActor, uint32 typeMaskActionTarget, uint32 spellTypeMask, uint32 spellPhaseMask, uint32 hitMask, Spell* spell, DamageInfo* damageInfo, HealInfo* healInfo, std::set<Aura*> const* appliedMods = nullptr);
     void TriggerAurasProcOnEvent(ProcEventInfo& eventInfo, AuraApplicationProcContainer& procAuras);
 
     [[nodiscard]] float GetWeaponProcChance() const;
@@ -1882,6 +1916,9 @@ public:
     DiminishingLevels GetDiminishing(DiminishingGroup group);
     void IncrDiminishing(DiminishingGroup group);
     float ApplyDiminishingToDuration(DiminishingGroup group, int32& duration, Unit* caster, DiminishingLevels Level, int32 limitduration);
+    // The target's half of WorldObject::ModSpellDuration (mechanic / dispel duration mods on this unit). Step 07:
+    // the land step calls this on the hit unit; the caster's self-cast glyph part stays in ModSpellDuration.
+    [[nodiscard]] int32 ModSpellDurationTakenSide(SpellInfo const* spellProto, int32 duration, bool positive, uint32 effectMask) const;
     void ApplyDiminishingAura(DiminishingGroup group, bool apply);
     void ClearDiminishings() { m_Diminishing.clear(); }
 
@@ -2126,6 +2163,10 @@ public:
 
     // Safe mover
     std::set<SafeUnitPointer*> SafeUnitPointerSet;
+
+    // Health batch state (BeginHealthBatch / EndHealthBatch)
+    uint8 _healthBatchDepth = 0;
+    int32 _pendingHealthDelta = 0;
 
     // Relocation Nofier optimization
     Position m_last_notify_position;

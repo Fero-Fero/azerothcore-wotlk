@@ -3534,6 +3534,53 @@ int32 WorldObject::ModSpellDuration(SpellInfo const* spellProto, Unit const* tar
     if (spellProto->HasAttribute(SPELL_ATTR7_NO_TARGET_DURATION_MOD))
         return duration;
 
+    // the target's own part (step 07: this is what runs on the land step for a foreign target)
+    duration = target->ModSpellDurationTakenSide(spellProto, duration, positive, effectMask);
+
+    // Glyphs which increase duration of selfcasted buffs
+    if (target == this)
+    {
+        switch (spellProto->SpellFamilyName)
+        {
+            case SPELLFAMILY_DRUID:
+                if (spellProto->SpellFamilyFlags[0] & 0x100)
+                {
+                    // Glyph of Thorns
+                    if (AuraEffect* aurEff = target->GetAuraEffect(57862, 0))
+                        duration += aurEff->GetAmount() * MINUTE * IN_MILLISECONDS;
+                }
+                break;
+            case SPELLFAMILY_PALADIN:
+                if ((spellProto->SpellFamilyFlags[0] & 0x00000002) && spellProto->SpellIconID == 298)
+                {
+                    // Glyph of Blessing of Might
+                    if (AuraEffect* aurEff = target->GetAuraEffect(57958, 0))
+                        duration += aurEff->GetAmount() * MINUTE * IN_MILLISECONDS;
+                }
+                else if ((spellProto->SpellFamilyFlags[0] & 0x00010000) && spellProto->SpellIconID == 306)
+                {
+                    // Glyph of Blessing of Wisdom
+                    if (AuraEffect* aurEff = target->GetAuraEffect(57979, 0))
+                        duration += aurEff->GetAmount() * MINUTE * IN_MILLISECONDS;
+                }
+                break;
+        }
+    }
+    return std::max(duration, 0);
+}
+
+int32 Unit::ModSpellDurationTakenSide(SpellInfo const* spellProto, int32 duration, bool positive, uint32 effectMask) const
+{
+    // don't mod permanent auras duration
+    if (duration < 0)
+        return duration;
+
+    // some auras are not affected by duration modifiers
+    if (spellProto->HasAttribute(SPELL_ATTR7_NO_TARGET_DURATION_MOD))
+        return duration;
+
+    Unit const* target = this;
+
     // cut duration only of negative effects
     // xinef: also calculate self casts, spell can be reflected for example
     if (!positive)
@@ -3592,35 +3639,6 @@ int32 WorldObject::ModSpellDuration(SpellInfo const* spellProto, Unit const* tar
         // when there will be, change GetTotalAuraModifierByMiscValue to GetTotalPositiveAuraModifierByMiscValue
     }
 
-    // Glyphs which increase duration of selfcasted buffs
-    if (target == this)
-    {
-        switch (spellProto->SpellFamilyName)
-        {
-            case SPELLFAMILY_DRUID:
-                if (spellProto->SpellFamilyFlags[0] & 0x100)
-                {
-                    // Glyph of Thorns
-                    if (AuraEffect* aurEff = target->GetAuraEffect(57862, 0))
-                        duration += aurEff->GetAmount() * MINUTE * IN_MILLISECONDS;
-                }
-                break;
-            case SPELLFAMILY_PALADIN:
-                if ((spellProto->SpellFamilyFlags[0] & 0x00000002) && spellProto->SpellIconID == 298)
-                {
-                    // Glyph of Blessing of Might
-                    if (AuraEffect* aurEff = target->GetAuraEffect(57958, 0))
-                        duration += aurEff->GetAmount() * MINUTE * IN_MILLISECONDS;
-                }
-                else if ((spellProto->SpellFamilyFlags[0] & 0x00010000) && spellProto->SpellIconID == 306)
-                {
-                    // Glyph of Blessing of Wisdom
-                    if (AuraEffect* aurEff = target->GetAuraEffect(57979, 0))
-                        duration += aurEff->GetAmount() * MINUTE * IN_MILLISECONDS;
-                }
-                break;
-        }
-    }
     return std::max(duration, 0);
 }
 

@@ -48,6 +48,7 @@
 
 class Unit;
 class WorldPacket;
+struct DeferredSpellHitRecord;
 class InstanceScript;
 class Group;
 class InstanceSave;
@@ -197,6 +198,10 @@ public:
     void MarkNearbyCellsOf(WorldObject* obj);
 
     virtual void Update(const uint32, const uint32, bool thread = true);
+
+    // Step 07 §11: a hit whose spell is in the Deferred table (duel, summon player, teleport, ...) lands at the
+    // end of this map's update with no task running, so both units are live. Step 09's defer buffer takes over.
+    void DeferSpellHit(DeferredSpellHitRecord const& hit);
 
     [[nodiscard]] float GetVisibilityRange() const { return m_VisibleDistance; }
     void SetVisibilityRange(float range) { m_VisibleDistance = range; }
@@ -651,6 +656,8 @@ private:
     // Applies last beat's records to every listed object with a non-zero writtenBy mask, before any Update.
     // Step 12 replaces this scan with the wake rule.
     void ApplyInboxes();
+    void ApplyDeferredSpellHits();
+    std::vector<std::unique_ptr<DeferredSpellHitRecord>> _deferredSpellHits;    // record type is complete in Map.cpp only
 
     void _AddObjectToUpdateList(WorldObject* obj);
     void _RemoveObjectFromUpdateList(WorldObject* obj);

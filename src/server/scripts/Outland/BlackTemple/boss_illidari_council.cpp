@@ -604,26 +604,36 @@ class spell_illidari_council_balance_of_power_aura : public AuraScript
     }
 };
 
+// Council members the cast reaches (effect 0, not missed). Hits land after the cast, so AfterCast reads the
+// launch's target list rather than counting in the hit hook.
+static uint8 IllidariCouncilHitCount(Spell* spell)
+{
+    uint8 count = 0;
+    for (TargetInfo const& info : *spell->GetUniqueTargetInfo())
+        if ((info.effectMask & (1 << EFFECT_0)) && info.missCondition == SPELL_MISS_NONE)
+            ++count;
+    return count;
+}
+
 class spell_illidari_council_empyreal_balance : public SpellScript
 {
     PrepareSpellScript(spell_illidari_council_empyreal_balance);
 
     bool Load() override
     {
-        _targetCount = 0;
         return GetCaster()->IsCreature();
     }
 
     void HandleDummy(SpellEffIndex effIndex)
     {
         PreventHitDefaultEffect(effIndex);
-        if (GetHitUnit())
-            _targetCount++;
     }
 
     void HandleAfterCast()
     {
-        if (_targetCount != 4)
+        // Hits land after the cast finishes; count the hitting targets from the launch list instead.
+        uint8 targetCount = IllidariCouncilHitCount(GetSpell());
+        if (targetCount != 4)
         {
             GetCaster()->ToCreature()->AI()->EnterEvadeMode();
             return;
@@ -633,8 +643,8 @@ class spell_illidari_council_empyreal_balance : public SpellScript
         for (std::list<TargetInfo>::const_iterator ihit = targetsInfo->begin(); ihit != targetsInfo->end(); ++ihit)
             if (Creature* target = ObjectAccessor::GetCreature(*GetCaster(), ihit->targetGUID))
             {
-                target->SetMaxHealth(GetCaster()->GetMaxHealth() / _targetCount);
-                target->SetHealth(GetCaster()->GetHealth() / _targetCount);
+                target->SetMaxHealth(GetCaster()->GetMaxHealth() / targetCount);
+                target->SetHealth(GetCaster()->GetHealth() / targetCount);
                 target->LowerPlayerDamageReq(target->GetMaxHealth());
             }
     }
@@ -644,9 +654,6 @@ class spell_illidari_council_empyreal_balance : public SpellScript
         OnEffectHitTarget += SpellEffectFn(spell_illidari_council_empyreal_balance::HandleDummy, EFFECT_0, SPELL_EFFECT_DUMMY);
         AfterCast += SpellCastFn(spell_illidari_council_empyreal_balance::HandleAfterCast);
     }
-
-private:
-    uint8 _targetCount;
 };
 
 class spell_illidari_council_empyreal_equivalency : public SpellScript
@@ -655,26 +662,24 @@ class spell_illidari_council_empyreal_equivalency : public SpellScript
 
     bool Load() override
     {
-        _targetCount = 0;
         return GetCaster()->IsCreature();
     }
 
     void HandleDummy(SpellEffIndex effIndex)
     {
         PreventHitDefaultEffect(effIndex);
-        if (GetHitUnit())
-            _targetCount++;
     }
 
     void HandleAfterCast()
     {
-        if (_targetCount != 4)
+        uint8 targetCount = IllidariCouncilHitCount(GetSpell());
+        if (targetCount != 4)
             return;
 
         auto const* targetsInfo = GetSpell()->GetUniqueTargetInfo();
         for (std::list<TargetInfo>::const_iterator ihit = targetsInfo->begin(); ihit != targetsInfo->end(); ++ihit)
             if (Creature* target = ObjectAccessor::GetCreature(*GetCaster(), ihit->targetGUID))
-                target->SetHealth(GetCaster()->GetHealth() / _targetCount);
+                target->SetHealth(GetCaster()->GetHealth() / targetCount);
     }
 
     void Register() override
@@ -682,9 +687,6 @@ class spell_illidari_council_empyreal_equivalency : public SpellScript
         OnEffectHitTarget += SpellEffectFn(spell_illidari_council_empyreal_equivalency::HandleDummy, EFFECT_0, SPELL_EFFECT_DUMMY);
         AfterCast += SpellCastFn(spell_illidari_council_empyreal_equivalency::HandleAfterCast);
     }
-
-private:
-    uint8 _targetCount;
 };
 
 class spell_illidari_council_reflective_shield_aura : public AuraScript

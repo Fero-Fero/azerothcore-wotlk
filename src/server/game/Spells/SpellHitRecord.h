@@ -18,6 +18,7 @@
 #ifndef ACORE_SPELL_HIT_RECORD_H
 #define ACORE_SPELL_HIT_RECORD_H
 
+#include "AuraLaunchData.h"
 #include "Define.h"
 #include "ObjectGuid.h"
 #include "SharedDefines.h"
@@ -31,43 +32,7 @@
 // SpellHitRecord carries everything the land step reads from the cast and from the launch-side TargetInfo.
 // SpellLandedRecord carries every write the land step wants to do on the caster. Both are plain values;
 // a pointer never crosses. SpellValue (Spell.h) is already plain and is embedded by value; SpellDestination
-// is not (Position has a user-provided copy constructor) and travels as SpellDestRecord.
-
-struct SpellDestRecord
-{
-    float x = 0.0f;
-    float y = 0.0f;
-    float z = 0.0f;
-    float o = 0.0f;
-    uint32 mapId = MAPID_INVALID;
-    ObjectGuid transportGuid;
-    float tx = 0.0f;
-    float ty = 0.0f;
-    float tz = 0.0f;
-    float to = 0.0f;
-
-    void Set(SpellDestination const& dest)
-    {
-        x = dest._position.GetPositionX();
-        y = dest._position.GetPositionY();
-        z = dest._position.GetPositionZ();
-        o = dest._position.GetOrientation();
-        mapId = dest._position.GetMapId();
-        transportGuid = dest._transportGUID;
-        tx = dest._transportOffset.GetPositionX();
-        ty = dest._transportOffset.GetPositionY();
-        tz = dest._transportOffset.GetPositionZ();
-        to = dest._transportOffset.GetOrientation();
-    }
-
-    [[nodiscard]] SpellDestination Get() const
-    {
-        SpellDestination dest(x, y, z, o, mapId);
-        dest._transportGUID = transportGuid;
-        dest._transportOffset.Relocate(tx, ty, tz, to);
-        return dest;
-    }
-};
+// travels as SpellDestRecord (AuraLaunchData.h).
 
 enum FollowUpMode : uint8
 {
@@ -108,18 +73,24 @@ struct SpellHitTrigger
 
 constexpr uint8 MAX_SPELL_HIT_TRIGGERS = 6;
 constexpr uint8 MAX_SPELL_FOLLOWUPS = 8;     // pre-cast aura + interrupt + up to MAX_SPELL_HIT_TRIGGERS target triggers
+constexpr uint8 MAX_SPELL_APPLIED_MODS = 8;  // Spell::m_appliedMods entries carried as ids
 
 struct SpellHitRecord
 {
     // identity
     uint32 spellId = 0;                     // difficulty-resolved id (m_spellInfo->Id)
     uint32 castSerial = 0;                  // Spell::m_castSerial, per-process atomic
+    ObjectGuid target;                      // TargetInfo::targetGUID (the log keys by target; the Deferred list needs it)
     ObjectGuid caster;                      // m_caster
     ObjectGuid originalCaster;              // m_originalCasterGUID
     ObjectGuid castItemGuid;                // m_castItemGUID
     uint8 casterTypeId = 0;                 // TYPEID_PLAYER / UNIT / GAMEOBJECT
     uint32 triggerFlags = 0;                // _triggeredCastFlags
     uint8 spellFlags = 0;                   // m_spellFlags (SPELL_FLAG_REFLECTED, ...)
+    uint32 appliedModAuraIds[MAX_SPELL_APPLIED_MODS] = {};   // m_appliedMods as aura spell ids (procs: PROC_ATTR_REQ_SPELLMOD)
+    uint8 appliedModCount = 0;
+    uint8 unitTargetCount[MAX_SPELL_EFFECTS] = {};   // launch unit targets per effect (Spell::GetUnitTargetCountForEffect)
+    uint8 unitTargetIndex[MAX_SPELL_EFFECTS] = {};   // this target's position among them, launch order
 
     // rolled at launch (TargetInfo)
     uint8 effectMask = 0;
@@ -129,8 +100,10 @@ struct SpellHitRecord
     uint8 aliveAtLaunch = 0;
     uint8 scaleAura = 0;
     uint8 wasDelayed = 0;                   // getState() == SPELL_STATE_DELAYED at emission (Sanctuary windows)
-    int32 damage = 0;                       // TargetInfo::damage: > 0 damage, < 0 heal
+    int32 damage = 0;                       // TargetInfo::damage: > 0 damage, < 0 heal; done-side + crit (§5.1)
     int32 damageBeforeTakenMods = 0;        // Beacon of Light
+    int32 effDamage[MAX_SPELL_EFFECTS] = {};   // TargetInfo::effDamage: per-effect share of damage
+    uint8 takenKind[MAX_SPELL_EFFECTS] = {};   // TargetInfo::takenKind: SpellTakenKind, taken-side bonus at land (§5.2)
     uint64 timeDelay = 0;                   // TargetInfo::timeDelay
 
     // cast data
@@ -156,7 +129,8 @@ struct SpellHitRecord
     uint8 needComboPoints = 0;              // m_needComboPoints at emission
     uint8 comboPoints = 0;                  // the caster's combo points at emission, refunded on a land-side evade
 
-    // Aura amounts, amplitude and caster-side duration computed at launch arrive with slice 2 (plan §5.3).
+    // Aura amounts, amplitude, charges and caster-side duration computed at launch (§5.3).
+    AuraLaunchData aura;
 
     SpellHitRecord() = default;
 };

@@ -47,6 +47,11 @@ char const* RecordKindName(RecordKind kind)
         case RecordKind::VisibilityUnlink:  return "VisibilityUnlink";
         case RecordKind::Wake:              return "Wake";
         case RecordKind::Threat:            return "Threat";
+        case RecordKind::DamageDealt:       return "DamageDealt";
+        case RecordKind::HealDone:          return "HealDone";
+        case RecordKind::KillingBlow:       return "KillingBlow";
+        case RecordKind::KillCredit:        return "KillCredit";
+        case RecordKind::ProcActor:         return "ProcActor";
         default:                            return "Unknown";
     }
 }

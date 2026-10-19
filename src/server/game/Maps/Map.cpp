@@ -38,6 +38,7 @@
 #include "Pet.h"
 #include "PoolMgr.h"
 #include "ScriptMgr.h"
+#include "SpellHitRecord.h"
 #include "TC9Sidecar.h"
 #include "Transport.h"
 #include "VMapFactory.h"
@@ -561,6 +562,9 @@ void Map::Update(const uint32 t_diff, const uint32 s_diff, bool  /*thread*/)
 
     sScriptMgr->OnMapUpdate(this, t_diff);
 
+    // Deferred spell hits: both units live, no task running (step 07 §11)
+    ApplyDeferredSpellHits();
+
     METRIC_VALUE("map_creatures", uint64(GetObjectsStore().Size<Creature>()),
         METRIC_TAG("map_id", std::to_string(GetId())),
         METRIC_TAG("map_instanceid", std::to_string(GetInstanceId())));
@@ -600,6 +604,34 @@ void Map::ApplyInboxes()
 
         TaskScope task(obj, obj);
         obj->ApplyInbox();
+    }
+}
+
+void Map::DeferSpellHit(DeferredSpellHitRecord const& hit)
+{
+    _deferredSpellHits.push_back(std::make_unique<DeferredSpellHitRecord>(hit));
+}
+
+void Map::ApplyDeferredSpellHits()
+{
+    // A landing can cast and defer again; take the list first.
+    std::vector<std::unique_ptr<DeferredSpellHitRecord>> hits;
+    hits.swap(_deferredSpellHits);
+
+    ASSERT(!BeatContext::InTask());
+    for (std::unique_ptr<DeferredSpellHitRecord> const& deferred : hits)
+    {
+        SpellHitRecord const& hit = deferred->hit;
+        Unit* target = nullptr;
+        if (hit.target.IsPlayer())
+            target = ObjectAccessor::GetPlayer(this, hit.target);
+        else if (hit.target.IsPet())
+            target = GetPet(hit.target);
+        else
+            target = GetCreature(hit.target);
+        if (!target || !target->IsInWorld())
+            continue;
+        target->ApplySpellHit(hit);
     }
 }
 

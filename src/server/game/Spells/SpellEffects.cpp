@@ -681,7 +681,7 @@ void Spell::EffectSchoolDMG(SpellEffIndex effIndex)
                 damage = 0;
 
             damage = m_originalCaster->SpellDamageBonusDone(unitTarget, m_spellInfo, (uint32)damage, SPELL_DIRECT_DAMAGE, effIndex);
-            damage = unitTarget->SpellDamageBonusTaken(m_originalCaster, m_spellInfo, (uint32)damage, SPELL_DIRECT_DAMAGE);
+            m_pendingTakenKind = TAKEN_SPELL_DAMAGE;    // SpellDamageBonusTaken runs on the target at land (plan 07 §5.2)
         }
 
         m_damage += damage;
@@ -1642,13 +1642,13 @@ void Spell::EffectHeal(SpellEffIndex effIndex)
         {
             addhealth = caster->SpellHealingBonusDone(unitTarget, m_spellInfo, int32(caster->CountPctFromMaxHealth(damage)), HEAL, effIndex);
             m_damageBeforeTakenMods -= addhealth;
-            addhealth = unitTarget->SpellHealingBonusTaken(caster, m_spellInfo, addhealth, HEAL);
+            m_pendingTakenKind = TAKEN_HEAL;            // SpellHealingBonusTaken runs on the target at land (plan 07 §5.2)
         }
         else if (m_spellInfo->Id != 33778) // not lifebloom
         {
             addhealth = caster->SpellHealingBonusDone(unitTarget, m_spellInfo, addhealth, HEAL, effIndex);
             m_damageBeforeTakenMods -= addhealth;
-            addhealth = unitTarget->SpellHealingBonusTaken(caster, m_spellInfo, addhealth, HEAL);
+            m_pendingTakenKind = TAKEN_HEAL;
         }
 
         // Implemented this way as there is no other way to do it currently (that I know :P)...
@@ -1680,7 +1680,7 @@ void Spell::EffectHealPct(SpellEffIndex effIndex)
 
     uint32 heal = m_originalCaster->SpellHealingBonusDone(unitTarget, m_spellInfo, unitTarget->CountPctFromMaxHealth(damage), HEAL, effIndex);
     m_damageBeforeTakenMods -= heal;
-    heal = unitTarget->SpellHealingBonusTaken(m_originalCaster, m_spellInfo, heal, HEAL);
+    m_pendingTakenKind = TAKEN_HEAL;                    // taken-side at land (plan 07 §5.2)
 
     m_damage -= heal;
 }
@@ -1699,8 +1699,9 @@ void Spell::EffectHealMechanical(SpellEffIndex effIndex)
 
     uint32 heal = m_originalCaster->SpellHealingBonusDone(unitTarget, m_spellInfo, uint32(damage), HEAL, effIndex);
     m_damageBeforeTakenMods -= heal;
+    m_pendingTakenKind = TAKEN_HEAL;                    // taken-side at land (plan 07 §5.2)
 
-    m_damage -= unitTarget->SpellHealingBonusTaken(m_originalCaster, m_spellInfo, heal, HEAL);
+    m_damage -= heal;
 }
 
 void Spell::EffectHealthLeech(SpellEffIndex  effIndex)
@@ -3870,7 +3871,7 @@ void Spell::EffectWeaponDmg(SpellEffIndex effIndex)
 
     // Add melee damage bonuses (also check for negative)
     eff_damage = unitCaster->MeleeDamageBonusDone(unitTarget, eff_damage, m_attackType, m_spellInfo, m_spellSchoolMask);
-    eff_damage = unitTarget->MeleeDamageBonusTaken(unitCaster, eff_damage, m_attackType, m_spellInfo, m_spellSchoolMask);
+    m_pendingTakenKind = TAKEN_MELEE_DAMAGE;            // MeleeDamageBonusTaken runs on the target at land (plan 07 §5.2)
 
     // Meteor like spells (divided damage to targets)
     if (m_spellInfo->HasAttribute(SPELL_ATTR0_CU_SHARE_DAMAGE))

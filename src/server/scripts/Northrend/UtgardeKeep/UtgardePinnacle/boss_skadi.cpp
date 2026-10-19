@@ -668,15 +668,14 @@ class spell_skadi_reset_check : public SpellScript
 {
     PrepareSpellScript(spell_skadi_reset_check);
 
-    void CountTargets(std::list<WorldObject*>& targets)
+    void FilterTargets(std::list<WorldObject*>& targets)
     {
         targets.remove_if(Acore::UnitAuraCheck(false, SPELL_GAUNTLET_EFFECT));
-        _targetCount = targets.size();
     }
 
     void HandleDummy(SpellEffIndex /*effIndex*/)
     {
-        if (_targetCount)
+        if (GetUnitTargetCountForEffect(EFFECT_0))
             return;
 
         Creature* target = GetHitCreature();
@@ -691,12 +690,9 @@ class spell_skadi_reset_check : public SpellScript
 
     void Register() override
     {
-        OnObjectAreaTargetSelect += SpellObjectAreaTargetSelectFn(spell_skadi_reset_check::CountTargets, EFFECT_0, TARGET_UNIT_SRC_AREA_ENTRY);
+        OnObjectAreaTargetSelect += SpellObjectAreaTargetSelectFn(spell_skadi_reset_check::FilterTargets, EFFECT_0, TARGET_UNIT_SRC_AREA_ENTRY);
         OnEffectHitTarget += SpellEffectFn(spell_skadi_reset_check::HandleDummy, EFFECT_1, SPELL_EFFECT_DUMMY);
     }
-
-private:
-    uint32 _targetCount = 0;
 };
 
 void AddSC_boss_skadi()

@@ -18,6 +18,7 @@
 #ifndef ACORE_SPELLAURAS_H
 #define ACORE_SPELLAURAS_H
 
+#include "AuraLaunchData.h"
 #include "SpellAuraDefines.h"
 #include "Unit.h"
 
@@ -86,17 +87,29 @@ public:
 
 class Aura
 {
-    friend Aura* Unit::_TryStackingOrRefreshingExistingAura(SpellInfo const* newAura, uint8 effMask, Unit* caster, int32* baseAmount, Item* castItem, ObjectGuid casterGUID, bool noPeriodicReset);
+    friend Aura* Unit::_TryStackingOrRefreshingExistingAura(SpellInfo const* newAura, uint8 effMask, Unit* caster, int32* baseAmount, Item* castItem, ObjectGuid casterGUID, bool noPeriodicReset, AuraLaunchData const* launch);
 public:
     typedef std::map<ObjectGuid, AuraApplication*> ApplicationMap;
 
     static uint8 BuildEffectMaskForOwner(SpellInfo const* spellProto, uint8 avalibleEffectMask, WorldObject* owner);
     static Aura* TryRefreshStackOrCreate(SpellInfo const* spellproto, uint8 tryEffMask, WorldObject* owner, Unit* caster, int32* baseAmount = nullptr, Item* castItem = nullptr, ObjectGuid casterGUID = ObjectGuid::Empty, bool* refresh = nullptr, bool periodicReset = false);
     static Aura* TryCreate(SpellInfo const* spellproto, uint8 effMask, WorldObject* owner, Unit* caster, int32* baseAmount = nullptr, Item* castItem = nullptr, ObjectGuid casterGUID = ObjectGuid::Empty, ObjectGuid itemGUID = ObjectGuid::Empty);
-    static Aura* Create(SpellInfo const* spellproto, uint8 effMask, WorldObject* owner, Unit* caster, int32* baseAmount, Item* castItem, ObjectGuid casterGUID, ObjectGuid itemGUID = ObjectGuid::Empty);
-    explicit Aura(SpellInfo const* spellproto, WorldObject* owner, Unit* caster, Item* castItem, ObjectGuid casterGUID, ObjectGuid itemGUID = ObjectGuid::Empty);
-    void _InitEffects(uint8 effMask, Unit* caster, int32* baseAmount);
+    static Aura* Create(SpellInfo const* spellproto, uint8 effMask, WorldObject* owner, Unit* caster, int32* baseAmount, Item* castItem, ObjectGuid casterGUID, ObjectGuid itemGUID = ObjectGuid::Empty, AuraLaunchData const* launch = nullptr);
+    explicit Aura(SpellInfo const* spellproto, WorldObject* owner, Unit* caster, Item* castItem, ObjectGuid casterGUID, ObjectGuid itemGUID = ObjectGuid::Empty, AuraLaunchData const* launch = nullptr);
+    void _InitEffects(uint8 effMask, Unit* caster, int32* baseAmount, AuraLaunchData const* launch = nullptr);
     virtual ~Aura();
+
+    // Step 07 §5.3: the caster computes amounts, amplitude, charges and duration at launch, the target builds
+    // the aura from them at land without reading the caster.
+    //  - ComputeLaunchData runs on the caster: a scratch aura over the target handle runs today's
+    //    AuraEffect::CalculateAmount / CalculatePeriodic / CalculatePeriodicData and Aura::CalcMaxDuration /
+    //    CalcMaxCharges once, and the results are copied out. Target reads inside those are live reads.
+    //  - TryRefreshStackOrCreateFromHit is TryRefreshStackOrCreate with the launch numbers instead of the caster.
+    static void ComputeLaunchData(AuraLaunchData& out, SpellInfo const* spellproto, uint8 tryEffMask, Unit* owner, Unit* caster, int32* baseAmount, Item* castItem, ObjectGuid casterGUID);
+    static Aura* TryRefreshStackOrCreateFromHit(SpellInfo const* spellproto, uint8 tryEffMask, WorldObject* owner, Unit* caster, AuraLaunchData const& launch, Item* castItem, ObjectGuid casterGUID, bool* refresh, bool periodicReset);
+    // ModStackAmount(1) / SetStackAmount with the launch numbers in place of CalcMaxDuration / CalculateAmount(caster)
+    bool ModStackAmountFromLaunch(AuraLaunchData const& launch, bool periodicReset);
+    void SetStackAmountFromLaunch(uint8 stackAmount, AuraLaunchData const& launch);
 
     SpellInfo const* GetSpellInfo() const { return m_spellInfo; }
     uint32 GetId() const;
@@ -288,10 +301,10 @@ private:
 
 class UnitAura : public Aura
 {
-    friend Aura* Aura::Create(SpellInfo const* spellproto, uint8 effMask, WorldObject* owner, Unit* caster, int32* baseAmount, Item* castItem, ObjectGuid casterGUID, ObjectGuid itemGUID);
+    friend Aura* Aura::Create(SpellInfo const* spellproto, uint8 effMask, WorldObject* owner, Unit* caster, int32* baseAmount, Item* castItem, ObjectGuid casterGUID, ObjectGuid itemGUID, AuraLaunchData const* launch);
 
 protected:
-    explicit UnitAura(SpellInfo const* spellproto, uint8 effMask, WorldObject* owner, Unit* caster, int32* baseAmount, Item* castItem, ObjectGuid casterGUID, ObjectGuid itemGUID = ObjectGuid::Empty);
+    explicit UnitAura(SpellInfo const* spellproto, uint8 effMask, WorldObject* owner, Unit* caster, int32* baseAmount, Item* castItem, ObjectGuid casterGUID, ObjectGuid itemGUID = ObjectGuid::Empty, AuraLaunchData const* launch = nullptr);
 
 public:
     void _ApplyForTarget(Unit* target, Unit* caster, AuraApplication* aurApp) override;
@@ -311,7 +324,7 @@ private:
 
 class DynObjAura : public Aura
 {
-    friend Aura* Aura::Create(SpellInfo const* spellproto, uint8 effMask, WorldObject* owner, Unit* caster, int32* baseAmount, Item* castItem, ObjectGuid casterGUID, ObjectGuid itemGUID);
+    friend Aura* Aura::Create(SpellInfo const* spellproto, uint8 effMask, WorldObject* owner, Unit* caster, int32* baseAmount, Item* castItem, ObjectGuid casterGUID, ObjectGuid itemGUID, AuraLaunchData const* launch);
 
 protected:
     explicit DynObjAura(SpellInfo const* spellproto, uint8 effMask, WorldObject* owner, Unit* caster, int32* baseAmount, Item* castItem, ObjectGuid casterGUID, ObjectGuid itemGUID = ObjectGuid::Empty);

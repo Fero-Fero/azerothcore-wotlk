@@ -686,27 +686,25 @@ class spell_pal_divine_storm_dummy : public SpellScript
         return ValidateSpellInfo({ SPELL_PALADIN_DIVINE_STORM_HEAL });
     }
 
-    void CountTargets(std::list<WorldObject*>& targetList)
+    void FilterTargets(std::list<WorldObject*>& targetList)
     {
         Acore::Containers::RandomResize(targetList, GetSpellValue()->MaxAffectedTargets);
-        _targetCount = targetList.size();
     }
 
     void HandleDummy(SpellEffIndex /*effIndex*/)
     {
-        if (!_targetCount || ! GetHitUnit())
+        uint32 targetCount = GetUnitTargetCountForEffect(EFFECT_0);
+        if (!targetCount || ! GetHitUnit())
             return;
 
-        int32 heal = GetEffectValue() / _targetCount;
+        int32 heal = GetEffectValue() / targetCount;
         GetCaster()->CastCustomSpell(GetHitUnit(), SPELL_PALADIN_DIVINE_STORM_HEAL, &heal, nullptr, nullptr, true);
     }
-private:
-    uint32 _targetCount;
 
     void Register() override
     {
         OnEffectHitTarget += SpellEffectFn(spell_pal_divine_storm_dummy::HandleDummy, EFFECT_0, SPELL_EFFECT_DUMMY);
-        OnObjectAreaTargetSelect += SpellObjectAreaTargetSelectFn(spell_pal_divine_storm_dummy::CountTargets, EFFECT_0, TARGET_UNIT_CASTER_AREA_RAID);
+        OnObjectAreaTargetSelect += SpellObjectAreaTargetSelectFn(spell_pal_divine_storm_dummy::FilterTargets, EFFECT_0, TARGET_UNIT_CASTER_AREA_RAID);
     }
 };
 

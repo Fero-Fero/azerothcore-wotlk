@@ -305,27 +305,23 @@ class spell_ahn_kahet_swarmer_aura : public SpellScript
 {
     PrepareSpellScript(spell_ahn_kahet_swarmer_aura)
 
-    void CountTargets(std::list<WorldObject*>& targets)
-    {
-        _targetCount = static_cast<uint32>(targets.size());
-    }
-
     void HandleDummy(SpellEffIndex /*effIndex*/)
     {
         Unit* caster = GetCaster();
-        if (_targetCount)
+        uint32 targetCount = GetUnitTargetCountForEffect(EFFECT_0);
+        if (targetCount)
         {
             if (Aura *aur = caster->GetAura(SPELL_SWARM))
             {
-                aur->SetStackAmount(static_cast<uint8>(_targetCount));
+                aur->SetStackAmount(static_cast<uint8>(targetCount));
             }
-            else if (_targetCount)
+            else
             {
                 /// @todo: move spell id to enum
-                caster->CastCustomSpell(SPELL_SWARM, SPELLVALUE_AURA_STACK, _targetCount, caster, true);
+                caster->CastCustomSpell(SPELL_SWARM, SPELLVALUE_AURA_STACK, targetCount, caster, true);
                 if (Aura *aur = caster->GetAura(SPELL_SWARM))
                 {
-                    aur->SetStackAmount(static_cast<uint8>(_targetCount));
+                    aur->SetStackAmount(static_cast<uint8>(targetCount));
                 }
             }
         }
@@ -335,11 +331,8 @@ class spell_ahn_kahet_swarmer_aura : public SpellScript
         }
     }
 
-    uint32 _targetCount;
-
     void Register() override
     {
-        OnObjectAreaTargetSelect += SpellObjectAreaTargetSelectFn(spell_ahn_kahet_swarmer_aura::CountTargets, EFFECT_0, TARGET_UNIT_SRC_AREA_ALLY);
         OnEffectHitTarget += SpellEffectFn(spell_ahn_kahet_swarmer_aura::HandleDummy, EFFECT_0, SPELL_EFFECT_DUMMY);
     }
 };

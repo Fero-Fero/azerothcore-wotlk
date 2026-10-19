@@ -23,6 +23,7 @@
 class Group;
 class Player;
 class Unit;
+struct KillCreditRecord;
 
 class AC_GAME_API KillRewarder
 {
@@ -33,9 +34,17 @@ public:
     Unit* GetVictim();
     Player* GetKiller();
 
+    // Step 07 slice 5 (plan §7.3a): a member's share, applied on the member's own task from a KillCreditRecord.
+    // victim is a handle (dead, still in the world until the seal) or nullptr when it is already gone.
+    static void RewardFromCredit(Player* member, Unit* victim, KillCreditRecord const& credit);
+
 private:
+    KillRewarder(Player* member, Unit* victim, KillCreditRecord const& credit);
+
     void _InitXP(Player* player);
     void _InitGroupData();
+    void _RewardOrRecord(Player* player, bool isDungeon);
+    void _FillCredit(KillCreditRecord& credit, bool isDungeon) const;
 
     void _RewardHonor(Player* player);
     void _RewardXP(Player* player, float rate);
@@ -59,6 +68,11 @@ private:
     uint8 _maxLevel;
     bool _isBattleGround;
     bool _isPvP;
+    // From a KillCreditRecord: group facts without the Group, victim facts for when the handle is gone.
+    bool _fromCredit;
+    bool _creditInGroup;
+    uint32 _creditVictimEntry;
+    uint8 _creditVictimLevel;
 };
 
 #endif

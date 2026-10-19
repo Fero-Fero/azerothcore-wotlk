@@ -37,6 +37,8 @@ enum class RecordKind : uint8
     VisibilityLink, VisibilityUnlink,                 // 10
     Wake,                                             // 06: empty record, only forces a task
     Threat,                                           // 06: AddThreat against a foreign unit
+    DamageDealt, HealDone, KillingBlow, KillCredit,   // 07 slice 5: attacker/healer/killer half of DealDamage/DealHeal/Kill
+    ProcActor,                                        // 07 slice 5: actor half of ProcSkillsAndAuras
 
     Max
 };

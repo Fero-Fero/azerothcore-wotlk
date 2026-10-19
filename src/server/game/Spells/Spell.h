@@ -18,6 +18,7 @@
 #ifndef __SPELL_H
 #define __SPELL_H
 
+#include "AuraLaunchData.h"
 #include "ConditionMgr.h"
 #include "GridDefines.h"
 #include "LootMgr.h"
@@ -268,6 +269,16 @@ struct ChannelTargetData
     SpellDestination spellDst;
 };
 
+// Which taken-side bonus a launch-side effect handler left for the land step (plan 07 §5.2). The handler used
+// to call it on the target at launch; the land step applies it on the target to the effect's share of damage.
+enum SpellTakenKind : uint8
+{
+    TAKEN_NONE          = 0,
+    TAKEN_SPELL_DAMAGE  = 1,    // Unit::SpellDamageBonusTaken(SPELL_DIRECT_DAMAGE)
+    TAKEN_MELEE_DAMAGE  = 2,    // Unit::MeleeDamageBonusTaken
+    TAKEN_HEAL          = 3     // Unit::SpellHealingBonusTaken(HEAL)
+};
+
  // Targets store structures and data
 struct TargetInfo
 {
@@ -280,9 +291,18 @@ struct TargetInfo
     bool   alive:1;
     bool   crit:1;
     bool   scaleAura:1;
-    int32  damage;
+    bool   landPending:1;                       // hit went to the target's inbox and has not been seen landed yet
+    uint32 landEmittedMs;                       // game time the record was appended, for the channel grace
+    int32  damage;                              // done-side number, crit bonus included (§5.1); taken-side at land
     int32  damageBeforeTakenMods;
+    int32  effDamage[MAX_SPELL_EFFECTS];        // per-effect share of damage, for the taken-side bonus per kind
+    uint8  takenKind[MAX_SPELL_EFFECTS];        // SpellTakenKind per effect
+    AuraLaunchData aura;                        // §5.3
 };
+
+// How long a channel keeps a target whose hit record has not landed yet (the inbox is applied at the start of the
+// target's next update, one beat at most; the grace covers a slow beat).
+static constexpr uint32 SPELL_LAND_PENDING_GRACE_MS = 1000;
 
 static const uint32 SPELL_INTERRUPT_NONPLAYER = 32747;
 
@@ -320,6 +340,11 @@ public:
     void ReturnScripts(Spell& to);
     [[nodiscard]] bool IsLandSide() const { return _landSide; }
     [[nodiscard]] uint32 GetCastSerial() const { return m_castSerial; }
+    // Number of unit targets the launch selected for an effect, and this hit's position among them in launch
+    // order. Valid at launch and at land (carried in the SpellHitRecord); scripts use them instead of counting
+    // in target-select hooks, whose instance a next-beat landing does not see.
+    [[nodiscard]] uint32 GetUnitTargetCountForEffect(SpellEffIndex effIndex) const;
+    [[nodiscard]] uint32 GetUnitTargetIndexForEffect(SpellEffIndex effIndex) const;
     // Every write to the caster that the land step wants goes through this record (plan §7.2).
     SpellLandedRecord& Feedback();
     // Every read of a caster field on the land step (plan §9). On this slice it wraps the live caster.
@@ -724,6 +749,7 @@ public:
     int32 m_damage;           // Damge   in effects count here
     int32 m_healing;          // Healing in effects count here
     int32 m_damageBeforeTakenMods;
+    uint8 m_pendingTakenKind; // SpellTakenKind a LAUNCH_TARGET handler leaves for the land step (§5.2)
 
     // ******************************************
     // Spell trigger system
@@ -782,6 +808,10 @@ public:
     bool IsValidDeadOrAliveTarget(Unit const* target) const;
     void HandleLaunchPhase();
     void DoAllEffectOnLaunchTarget(TargetInfo& targetInfo, float* multiplier);
+    // Launch side (plan 07 §5.3): aura amounts/amplitude/charges/duration for the hit's aura, from the caster.
+    void ComputeAuraLaunchData(TargetInfo& targetInfo, Unit* unit);
+    // Land side (plan 07 §5.2): the target's taken-side bonus per effect kind, into m_damage / m_healing.
+    void ApplyTakenBonuses(TargetInfo const* target, Unit* victim, Unit* caster);
 
     void PrepareTargetProcessing();
     void FinishTargetProcessing();
@@ -854,8 +884,11 @@ public:
     Unit* _landTarget = nullptr;                        // the task owner that is landing the hit
     SpellLandedRecord* _landFeedback = nullptr;         // caller-owned on the land side
     std::unique_ptr<SpellLandedRecord> _ownFeedback;    // inline path (self-hit at launch): applied at the end of the hit
-    Spell* _launchSpell = nullptr;                      // slice 1 only: the launch spell whose scripts are borrowed
+    Spell* _launchSpell = nullptr;                      // inline landing only: the launch spell whose scripts are borrowed
+    uint8 _landUnitTargetCount[MAX_SPELL_EFFECTS] = {}; // SpellHitRecord::unitTargetCount, for GetUnitTargetCountForEffect on the land side
+    uint8 _landUnitTargetIndex[MAX_SPELL_EFFECTS] = {}; // SpellHitRecord::unitTargetIndex
     uint8 _launchComboPoints = 0;                       // SpellHitRecord::comboPoints, for the land-side refund
+    AuraLaunchData const* m_hitAuraLaunch = nullptr;    // TargetInfo::aura of the target being hit, during DoSpellHitOnUnit
 };
 
 namespace Acore

@@ -17,6 +17,7 @@
 
 #include "UnitView.h"
 #include "BeatContext.h"
+#include "Creature.h"
 #include "DBCStores.h"
 #include "Unit.h"
 #include "UpdateFields.h"
@@ -128,6 +129,31 @@ Position UnitView::GetPosition() const
     if (!_handle)
         return Position();
     return _live ? _handle->GetPosition() : _handle->ReadSlot().pos;
+}
+
+uint32 UnitView::GetCreatureType() const
+{
+    if (!_handle)
+        return CREATURE_TYPE_HUMANOID;
+    if (_live)
+        return _handle->GetCreatureType();
+    if (_handle->IsPlayer())
+    {
+        // Unit::GetShapeshiftForm reads UNIT_FIELD_BYTES_2 byte 3
+        ShapeshiftForm form = ShapeshiftForm(Slot().Byte(UNIT_FIELD_BYTES_2, 3));
+        SpellShapeshiftFormEntry const* ssEntry = sSpellShapeshiftFormStore.LookupEntry(form);
+        if (ssEntry && ssEntry->creatureType > 0)
+            return ssEntry->creatureType;
+        return CREATURE_TYPE_HUMANOID;
+    }
+    // template data is immutable while the creature exists
+    return _handle->ToCreature()->GetCreatureTemplate()->type;
+}
+
+uint32 UnitView::GetCreatureTypeMask() const
+{
+    uint32 creatureType = GetCreatureType();
+    return (creatureType >= 1) ? (1 << (creatureType - 1)) : 0;
 }
 
 bool UnitView::HasAura(uint32 spellId, ObjectGuid casterGuid) const

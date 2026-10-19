@@ -627,33 +627,21 @@ class spell_marrowgar_bone_slice : public SpellScript
 {
     PrepareSpellScript(spell_marrowgar_bone_slice);
 
-    bool Load() override
-    {
-        _targetCount = 0;
-        return true;
-    }
-
-    void CountTargets(std::list<WorldObject*>& targets)
-    {
-        _targetCount = std::min<uint32>(targets.size(), GetSpellInfo()->MaxAffectedTargets);
-    }
-
     void SplitDamage()
     {
-        if (!_targetCount)
+        // Selected targets (already capped by MaxAffectedTargets), read from the launch rather than counted in
+        // a target-select hook: the hit lands on the target's task with its own script instance.
+        uint32 targetCount = GetUnitTargetCountForEffect(EFFECT_0);
+        if (!targetCount)
             return; // This spell can miss all targets
 
-        SetHitDamage(GetHitDamage() / _targetCount);
+        SetHitDamage(GetHitDamage() / targetCount);
     }
 
     void Register() override
     {
-        OnObjectAreaTargetSelect += SpellObjectAreaTargetSelectFn(spell_marrowgar_bone_slice::CountTargets, EFFECT_0, TARGET_UNIT_DEST_AREA_ENEMY);
         OnHit += SpellHitFn(spell_marrowgar_bone_slice::SplitDamage);
     }
-
-private:
-    uint32 _targetCount;
 };
 
 void AddSC_boss_lord_marrowgar()

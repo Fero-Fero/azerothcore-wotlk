@@ -47,6 +47,7 @@
 #include "SpellScript.h"
 #include "TemporarySummon.h"
 #include "Unit.h"
+#include "UnitView.h"
 #include "Util.h"
 #include "VMapFactory.h"
 #include "Vehicle.h"
@@ -693,6 +694,7 @@ Spell::Spell(WorldObject* caster, SpellInfo const* info, TriggerCastFlags trigge
     m_damage = 0;
     m_healing = 0;
     m_damageBeforeTakenMods = 0;
+    m_pendingTakenKind = TAKEN_NONE;
     m_procAttacker = 0;
     m_procVictim = 0;
     m_procEx = 0;
@@ -2441,7 +2443,7 @@ void Spell::AddUnitTarget(Unit* target, uint32 effectMask, bool checkIfValid /*=
     // This is new target calculate data for him
 
     // Get spell hit result on target
-    TargetInfo targetInfo;
+    TargetInfo targetInfo = {};
     targetInfo.targetGUID = targetGUID;                         // Store target GUID
     targetInfo.effectMask = effectMask;                         // Store all effects not immune
     targetInfo.processed  = false;                              // Effects not apply on target
@@ -2726,6 +2728,11 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
         }
     }
 
+    // Taken-side bonuses on the unit being hit (plan 07 §5.2). The launch handlers left the done-side number per
+    // effect; this is the target's own read, so it runs here where the target is the task owner. After the
+    // reflect resolution so a reflected spell is modified by the caster's taken auras, as the launch did.
+    ApplyTakenBonuses(target, unitTarget, caster);
+
     if (spellHitTarget)
     {
         if (reflectionSource)
@@ -2741,7 +2748,9 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
             m_reflectionTargetPosition = Position();
         }
 
+        m_hitAuraLaunch = &target->aura;
         SpellMissInfo missInfo2 = DoSpellHitOnUnit(spellHitTarget, mask, target->scaleAura);
+        m_hitAuraLaunch = nullptr;
 
         m_reflectionTarget = nullptr;
         m_reflectionTargetGuid.Clear();
@@ -2841,21 +2850,14 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
         if (m_healing > 0)
         {
             bool crit = target->crit;
+            // crit bonus already applied at launch (plan 07 §5.1)
             uint32 addhealth = m_healing;
-
-            if (crit)
-                addhealth = Unit::SpellCriticalHealingBonus(caster, m_spellInfo, addhealth, nullptr);
 
             HealInfo healInfo(caster, unitTarget, addhealth, m_spellInfo, m_spellInfo->GetSchoolMask());
 
             // Heal amount before SpellHealingBonusTaken, used by Beacon of Light
             if (target->damageBeforeTakenMods != 0)
-            {
-                uint32 healBeforeTakenMods = uint32(-target->damageBeforeTakenMods);
-                if (crit)
-                    healBeforeTakenMods = Unit::SpellCriticalHealingBonus(caster, m_spellInfo, healBeforeTakenMods, nullptr);
-                healInfo.SetHealBeforeTakenMods(healBeforeTakenMods);
-            }
+                healInfo.SetHealBeforeTakenMods(uint32(-target->damageBeforeTakenMods));
             else
                 healInfo.SetHealBeforeTakenMods(addhealth);
 
@@ -3248,11 +3250,20 @@ SpellMissInfo Spell::DoSpellHitOnUnit(Unit* unit, uint32 effectMask, bool scaleA
 
     if (aura_effmask)
     {
+        // Step 07 §5.3: the launch computed amounts, amplitude, charges and duration on the caster (TargetInfo::aura).
+        // Without them (hits that did not go through DoAllEffectOnLaunchTarget) the aura is built as before.
+        AuraLaunchData const* launch = (m_hitAuraLaunch && m_hitAuraLaunch->IsSet()) ? m_hitAuraLaunch : nullptr;
+
         // Select rank for aura with level requirements only in specific cases
         // Unit has to be target only of aura effect, both caster and target have to be players, target has to be other than unit target
         SpellInfo const* aurSpellInfo = m_spellInfo;
         int32 basePoints[3];
-        if (scaleAura)
+        if (launch)
+        {
+            aurSpellInfo = sSpellMgr->GetSpellInfo(launch->spellId);
+            ASSERT(aurSpellInfo);
+        }
+        else if (scaleAura)
         {
             aurSpellInfo = m_spellInfo->GetAuraRankForLevel(unitTarget->GetLevel());
             ASSERT(aurSpellInfo);
@@ -3272,8 +3283,11 @@ SpellMissInfo Spell::DoSpellHitOnUnit(Unit* unit, uint32 effectMask, bool scaleA
 
         bool refresh = false;
         bool refreshPeriodic = m_spellInfo->StackAmount < 2 && !HasTriggeredCastFlag(TRIGGERED_NO_PERIODIC_RESET);
-        m_spellAura = Aura::TryRefreshStackOrCreate(aurSpellInfo, effectMask, unit, m_originalCaster,
-                      (aurSpellInfo == m_spellInfo) ? &m_spellValue->EffectBasePoints[0] : &basePoints[0], m_CastItem, caster->GetGUID(), &refresh, refreshPeriodic);
+        if (launch)
+            m_spellAura = Aura::TryRefreshStackOrCreateFromHit(aurSpellInfo, effectMask, unit, m_originalCaster, *launch, m_CastItem, caster->GetGUID(), &refresh, refreshPeriodic);
+        else
+            m_spellAura = Aura::TryRefreshStackOrCreate(aurSpellInfo, effectMask, unit, m_originalCaster,
+                          (aurSpellInfo == m_spellInfo) ? &m_spellValue->EffectBasePoints[0] : &basePoints[0], m_CastItem, caster->GetGUID(), &refresh, refreshPeriodic);
 
         // xinef: if aura was not refreshed, add proc ex
         if (!refresh)
@@ -3285,7 +3299,12 @@ SpellMissInfo Spell::DoSpellHitOnUnit(Unit* unit, uint32 effectMask, bool scaleA
             if (m_spellValue->AuraStackAmount > 1)
             {
                 if (!refresh)
-                    m_spellAura->SetStackAmount(m_spellValue->AuraStackAmount);
+                {
+                    if (launch)
+                        m_spellAura->SetStackAmountFromLaunch(m_spellValue->AuraStackAmount, *launch);
+                    else
+                        m_spellAura->SetStackAmount(m_spellValue->AuraStackAmount);
+                }
                 else
                     m_spellAura->ModStackAmount(m_spellValue->AuraStackAmount);
             }
@@ -3325,10 +3344,17 @@ SpellMissInfo Spell::DoSpellHitOnUnit(Unit* unit, uint32 effectMask, bool scaleA
                 if (AuraApplication* aurApp = m_spellAura->GetApplicationOfTarget(caster->GetGUID()))
                     positive = aurApp->IsPositive();
 
-                duration = caster->ModSpellDuration(aurSpellInfo, unit, duration, positive, effectMask);
+                // the caster's self-cast glyph part only applies when the hit unit is the caster (inline path);
+                // every other hit needs the target's half only (step 07)
+                if (unit == caster)
+                    duration = caster->ModSpellDuration(aurSpellInfo, unit, duration, positive, effectMask);
+                else
+                    duration = unit->ModSpellDurationTakenSide(aurSpellInfo, duration, positive, effectMask);
 
-                // xinef: haste affects duration of those spells twice
-                if (m_originalCaster && (m_originalCaster->HasAuraTypeWithAffectMask(SPELL_AURA_PERIODIC_HASTE, aurSpellInfo) || m_spellInfo->HasAttribute(SPELL_ATTR5_SPELL_HASTE_AFFECTS_PERIODIC)))
+                // xinef: haste affects duration of those spells twice (resolved on the caster at launch when available)
+                if (launch)
+                    duration = int32(duration * launch->hasteMultiplier);
+                else if (m_originalCaster && (m_originalCaster->HasAuraTypeWithAffectMask(SPELL_AURA_PERIODIC_HASTE, aurSpellInfo) || m_spellInfo->HasAttribute(SPELL_ATTR5_SPELL_HASTE_AFFECTS_PERIODIC)))
                     duration = int32(duration * m_originalCaster->GetFloatValue(UNIT_MOD_CAST_SPEED));
 
                 if (m_spellValue->AuraDuration != 0)
@@ -3551,7 +3577,22 @@ bool Spell::UpdateChanneledTargetList()
             {
                 if (channelAuraMask & ihit->effectMask)
                 {
-                    if (AuraApplication* aurApp = unit->GetAuraApplication(m_spellInfo->Id, m_originalCasterGUID))
+                    AuraApplication* aurApp = unit->GetAuraApplication(m_spellInfo->Id, m_originalCasterGUID);
+                    if (aurApp)
+                        ihit->landPending = false;
+                    else if (ihit->landPending)
+                    {
+                        // The hit record is still in the target's inbox: the aura is applied at the start of the
+                        // target's next update. Keep the target until then.
+                        if (GameTime::GetGameTimeMS().count() - ihit->landEmittedMs < SPELL_LAND_PENDING_GRACE_MS)
+                        {
+                            channelTargetEffectMask &= ~ihit->effectMask;
+                            continue;
+                        }
+                        ihit->landPending = false;
+                    }
+
+                    if (aurApp)
                     {
                         if (m_caster != unit)
                         {
@@ -8719,6 +8760,7 @@ void Spell::DoAllEffectOnLaunchTarget(TargetInfo& targetInfo, float* multiplier)
             m_damage = 0;
             m_healing = 0;
             m_damageBeforeTakenMods = 0;
+            m_pendingTakenKind = TAKEN_NONE;
 
             HandleEffects(unit, nullptr, nullptr, i, SPELL_EFFECT_HANDLE_LAUNCH_TARGET);
 
@@ -8745,6 +8787,8 @@ void Spell::DoAllEffectOnLaunchTarget(TargetInfo& targetInfo, float* multiplier)
             }
             targetInfo.damage += m_damage;
             targetInfo.damageBeforeTakenMods += m_damageBeforeTakenMods;
+            targetInfo.effDamage[i] = m_damage;
+            targetInfo.takenKind[i] = m_pendingTakenKind;
         }
     }
 
@@ -8763,7 +8807,63 @@ void Spell::DoAllEffectOnLaunchTarget(TargetInfo& targetInfo, float* multiplier)
         float critChance = caster->SpellDoneCritChance(unit, m_spellInfo, m_spellSchoolMask, m_attackType, false);
         critChance = unit->SpellTakenCritChance(caster, m_spellInfo, m_spellSchoolMask, critChance, m_attackType, false);
         targetInfo.crit = roll_chance_f(std::max(0.0f, critChance));
+
+        // Crit bonus at launch (plan 07 §5.1): it reads caster auras and spell mods, so the land step must not.
+        // The per-effect shares scale with the total so the taken-side bonus at land sees the critted numbers.
+        if (targetInfo.crit && targetInfo.damage != 0)
+        {
+            UnitView victim(unit);
+            int32 const before = targetInfo.damage;
+            int32 after;
+            if (before > 0)
+                after = int32(Unit::SpellCriticalDamageBonus(caster, m_spellInfo, uint32(before), &victim, m_attackType));
+            else
+                after = -int32(Unit::SpellCriticalHealingBonus(caster, m_spellInfo, uint32(-before), nullptr));
+
+            targetInfo.damage = after;
+            targetInfo.damageBeforeTakenMods = int32(int64(targetInfo.damageBeforeTakenMods) * after / before);
+            for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                targetInfo.effDamage[i] = int32(int64(targetInfo.effDamage[i]) * after / before);
+        }
     }
+
+    // Aura amounts, amplitude, charges and caster-side duration (plan 07 §5.3). Self-hits and reflects use the
+    // same data on the inline path, so one code path builds the aura everywhere.
+    ComputeAuraLaunchData(targetInfo, unit);
+}
+
+void Spell::ComputeAuraLaunchData(TargetInfo& targetInfo, Unit* unit)
+{
+    targetInfo.aura = AuraLaunchData();
+
+    uint8 auraEffMask = 0;
+    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        if ((targetInfo.effectMask & (1 << i)) && m_spellInfo->Effects[i].IsUnitOwnedAuraEffect())
+            auraEffMask |= 1 << i;
+    if (!auraEffMask)
+        return;
+
+    // Rank for the target's level (DoSpellHitOnUnit's scaleAura block); the level is a slot read.
+    SpellInfo const* aurSpellInfo = m_spellInfo;
+    int32 basePoints[MAX_SPELL_EFFECTS];
+    if (targetInfo.scaleAura)
+    {
+        aurSpellInfo = m_spellInfo->GetAuraRankForLevel(UnitView(unit).GetLevel());
+        ASSERT(aurSpellInfo);
+        for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        {
+            basePoints[i] = aurSpellInfo->Effects[i].BasePoints;
+            if (m_spellInfo->Effects[i].Effect != aurSpellInfo->Effects[i].Effect)
+            {
+                aurSpellInfo = m_spellInfo;
+                break;
+            }
+        }
+    }
+
+    WorldObject* casterObject = m_originalCaster ? static_cast<WorldObject*>(m_originalCaster) : m_caster;
+    Aura::ComputeLaunchData(targetInfo.aura, aurSpellInfo, auraEffMask, unit, m_originalCaster,
+        (aurSpellInfo == m_spellInfo) ? &m_spellValue->EffectBasePoints[0] : &basePoints[0], m_CastItem, casterObject->GetGUID());
 }
 
 SpellCastResult Spell::CanOpenLock(uint32 effIndex, uint32 lockId, SkillType& skillId, int32& reqSkillValue, int32& skillValue)

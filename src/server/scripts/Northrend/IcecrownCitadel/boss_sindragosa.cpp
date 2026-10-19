@@ -781,8 +781,6 @@ class spell_sindragosa_s_fury : public SpellScript
 
     bool Load() override
     {
-        _targetCount = 0;
-
         // This script should execute only in Icecrown Citadel
         if (InstanceMap* instance = GetCaster()->GetMap()->ToInstanceMap())
             if (instance->GetInstanceScript())
@@ -804,16 +802,12 @@ class spell_sindragosa_s_fury : public SpellScript
         }
     }
 
-    void CountTargets(std::list<WorldObject*>& targets)
-    {
-        _targetCount = targets.size();
-    }
-
     void HandleDummy(SpellEffIndex effIndex)
     {
         PreventHitDefaultEffect(effIndex);
 
-        if (!GetHitUnit()->IsAlive() || (GetHitUnit()->IsPlayer() && GetHitUnit()->ToPlayer()->IsGameMaster()) || !_targetCount)
+        uint32 targetCount = GetUnitTargetCountForEffect(EFFECT_1);
+        if (!GetHitUnit()->IsAlive() || (GetHitUnit()->IsPlayer() && GetHitUnit()->ToPlayer()->IsGameMaster()) || !targetCount)
             return;
 
         float resistance = float(GetHitUnit()->GetResistance(SpellSchoolMask(GetSpellInfo()->SchoolMask)));
@@ -821,7 +815,7 @@ class spell_sindragosa_s_fury : public SpellScript
         if (ResistFactor > 0.9f)
             ResistFactor = 0.9f;
 
-        uint32 damage = uint32( (GetEffectValue() / _targetCount) * (1.0f - ResistFactor));
+        uint32 damage = uint32( (GetEffectValue() / targetCount) * (1.0f - ResistFactor));
 
         SpellNonMeleeDamage damageInfo(GetCaster(), GetHitUnit(), GetSpellInfo(), GetSpellInfo()->SchoolMask);
         damageInfo.damage = damage;
@@ -832,12 +826,8 @@ class spell_sindragosa_s_fury : public SpellScript
     void Register() override
     {
         BeforeCast += SpellCastFn(spell_sindragosa_s_fury::SelectDest);
-        OnObjectAreaTargetSelect += SpellObjectAreaTargetSelectFn(spell_sindragosa_s_fury::CountTargets, EFFECT_1, TARGET_UNIT_DEST_AREA_ENTRY);
         OnEffectHitTarget += SpellEffectFn(spell_sindragosa_s_fury::HandleDummy, EFFECT_1, SPELL_EFFECT_DUMMY);
     }
-
-private:
-    uint32 _targetCount;
 };
 
 class UnchainedMagicTargetSelector

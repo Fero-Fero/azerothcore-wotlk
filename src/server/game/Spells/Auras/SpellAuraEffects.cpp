@@ -402,6 +402,88 @@ AuraEffect::AuraEffect(Aura* base, uint8 effIndex, int32* baseAmount, Unit* cast
             m_channelData = new ChannelTargetData(caster->GetGuidValue(UNIT_FIELD_CHANNEL_OBJECT), spell->m_targets.HasDst() ? spell->m_targets.GetDst() : nullptr);
 }
 
+AuraEffect::AuraEffect(Aura* base, uint8 effIndex, AuraLaunchData const& launch):
+    m_base(base), m_spellInfo(base->GetSpellInfo()),
+    m_baseAmount(launch.baseAmount[effIndex]), m_dieSides(m_spellInfo->Effects[effIndex].DieSides),
+    m_critChance(launch.critChance[effIndex]), m_pctMods(launch.pctMods[effIndex]), m_oldAmount(launch.oldAmount[effIndex]), m_isAuraEnabled(true), m_channelData(nullptr), m_spellmod(nullptr),
+    m_periodicTimer(launch.periodicTimer[effIndex]), m_amplitude(launch.amplitude[effIndex]), m_tickNumber(0), m_effIndex(effIndex),
+    m_canBeRecalculated((launch.canBeRecalculatedMask & (1 << effIndex)) != 0), m_isPeriodic((launch.periodicMask & (1 << effIndex)) != 0)
+{
+    // CalculateAmount ends with `amount *= stackAmount`; a created aura has stack 1.
+    m_amount = launch.amount[effIndex] * base->GetStackAmount();
+    m_casterLevel = launch.casterLevel;
+    m_applyResilience = launch.applyResilience != 0;
+
+    CalculateSpellMod();
+
+    if (launch.hasChannelData)
+    {
+        SpellDestination dst = launch.channelDst.Get();
+        m_channelData = new ChannelTargetData(launch.channelObject, &dst);
+    }
+}
+
+void AuraEffect::ExportLaunchData(AuraLaunchData& out) const
+{
+    uint8 const i = m_effIndex;
+    out.baseAmount[i] = m_baseAmount;
+    out.amount[i] = m_amount;
+    out.oldAmount[i] = m_oldAmount;
+    out.amplitude[i] = m_amplitude;
+    out.periodicTimer[i] = m_periodicTimer;
+    out.pctMods[i] = m_pctMods;
+    out.critChance[i] = m_critChance;
+    if (m_canBeRecalculated)
+        out.canBeRecalculatedMask |= 1 << i;
+    if (m_isPeriodic)
+        out.periodicMask |= 1 << i;
+    out.casterLevel = m_casterLevel;
+    out.applyResilience = m_applyResilience ? 1 : 0;
+    if (m_channelData)
+    {
+        out.hasChannelData = 1;
+        out.channelObject = m_channelData->channelGUID;
+        out.channelDst.Set(m_channelData->spellDst);
+    }
+}
+
+void AuraEffect::RefreshPeriodicFromLaunch(AuraLaunchData const& launch, bool periodicReset)
+{
+    // CalculatePeriodic(caster, create = periodicReset, load = false) without the caster: amplitude, periodic
+    // flag and spell mods were resolved at launch.
+    m_amplitude = launch.amplitude[m_effIndex];
+    m_isPeriodic = (launch.periodicMask & (1 << m_effIndex)) != 0;
+
+    if (m_isPeriodic)
+    {
+        m_tickNumber = 0;
+        bool resetPeriodicTimer = periodicReset
+                                  || ((GetAuraType() != SPELL_AURA_PERIODIC_DAMAGE) && (GetAuraType() != SPELL_AURA_PERIODIC_DAMAGE_PERCENT));
+        if (resetPeriodicTimer)
+        {
+            m_periodicTimer = 0;
+            if (m_amplitude)
+            {
+                if (!GetSpellInfo()->HasAttribute(SPELL_ATTR5_EXTRA_INITIAL_PERIOD))
+                    m_periodicTimer += m_amplitude;
+                else if (launch.casterIsTotem)
+                {
+                    m_periodicTimer = 100;
+                    if (!GetBase()->IsPassive())
+                        GetBase()->SetDuration(GetBase()->GetDuration() + 100);
+                }
+            }
+        }
+    }
+
+    // CalculatePeriodicData
+    if (launch.casterPresent)
+    {
+        m_pctMods = launch.pctMods[m_effIndex];
+        m_critChance = launch.critChance[m_effIndex];
+    }
+}
+
 AuraEffect::~AuraEffect()
 {
     delete m_spellmod;

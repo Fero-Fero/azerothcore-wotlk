@@ -37,13 +37,20 @@ enum BrewfestEntries
 
 class AuraEffect
 {
-    friend void Aura::_InitEffects(uint8 effMask, Unit* caster, int32* baseAmount);
-    friend Aura* Unit::_TryStackingOrRefreshingExistingAura(SpellInfo const* newAura, uint8 effMask, Unit* caster, int32* baseAmount, Item* castItem, ObjectGuid casterGUID, bool noPeriodicReset);
+    friend void Aura::_InitEffects(uint8 effMask, Unit* caster, int32* baseAmount, AuraLaunchData const* launch);
+    friend Aura* Unit::_TryStackingOrRefreshingExistingAura(SpellInfo const* newAura, uint8 effMask, Unit* caster, int32* baseAmount, Item* castItem, ObjectGuid casterGUID, bool noPeriodicReset, AuraLaunchData const* launch);
     friend Aura::~Aura();
 private:
     ~AuraEffect();
     explicit AuraEffect(Aura* base, uint8 effIndex, int32* baseAmount, Unit* caster);
+    // Step 07 §5.3: built from the launch numbers; CalculateAmount / CalculatePeriodic / CalculatePeriodicData
+    // ran on the caster at launch and are not run here. CalculateSpellMod still runs (the modifier is this aura's).
+    explicit AuraEffect(Aura* base, uint8 effIndex, AuraLaunchData const& launch);
 public:
+    // Copies the launch numbers out of a scratch effect (Aura::ComputeLaunchData).
+    void ExportLaunchData(AuraLaunchData& out) const;
+    // Refresh path: today's CalculatePeriodic(caster, periodicReset) + CalculatePeriodicData from the launch numbers.
+    void RefreshPeriodicFromLaunch(AuraLaunchData const& launch, bool periodicReset);
     Unit* GetCaster() const { return GetBase()->GetCaster(); }
     ObjectGuid GetCasterGUID() const { return GetBase()->GetCasterGUID(); }
     Aura* GetBase() const { return m_base; }

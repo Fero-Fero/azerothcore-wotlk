@@ -70,28 +70,19 @@ class spell_gahzranka_slam : public SpellScript
 {
     PrepareSpellScript(spell_gahzranka_slam);
 
-    void FilterTargets(std::list<WorldObject*>& targets)
-    {
-        if (Unit* caster = GetCaster())
-            _wipeThreat = targets.size() < caster->GetThreatMgr().GetThreatListSize();
-    }
-
     void HandleWipeThreat(SpellEffIndex /*effIndex*/)
     {
-        if (_wipeThreat)
-            if (Unit* caster = GetCaster())
+        // Wipe only when the slam did not reach the whole threat list (someone stayed out of range).
+        if (Unit* caster = GetCaster())
+            if (GetUnitTargetCountForEffect(EFFECT_1) < caster->GetThreatMgr().GetThreatListSize())
                 if (Unit* target = GetHitUnit())
                     caster->GetThreatMgr().ModifyThreatByPercent(target, -100);
     }
 
     void Register() override
     {
-        OnObjectAreaTargetSelect += SpellObjectAreaTargetSelectFn(spell_gahzranka_slam::FilterTargets, EFFECT_1, TARGET_UNIT_SRC_AREA_ENEMY);
         OnEffectHitTarget += SpellEffectFn(spell_gahzranka_slam::HandleWipeThreat, EFFECT_1, SPELL_EFFECT_KNOCK_BACK);
     }
-
-private:
-    bool _wipeThreat = false;
 };
 
 class spell_pagles_point_cast : public SpellScript

@@ -19,6 +19,7 @@
 #include "Spell.h"
 #include "SpellAuras.h"
 #include "SpellMgr.h"
+#include "UnitView.h"
 #include <string>
 
 bool _SpellScript::_Validate(SpellInfo const* entry)
@@ -403,6 +404,11 @@ Unit* SpellScript::GetCaster()
     return m_spell->GetCaster()->ToUnit();
 }
 
+UnitView SpellScript::GetCasterView() const
+{
+    return m_spell->CasterView();
+}
+
 GameObject* SpellScript::GetGObjCaster()
 {
     return m_spell->GetCaster()->ToGameObject();
@@ -554,6 +560,16 @@ void SpellScript::SetHitHeal(int32 heal)
         return;
     }
     m_spell->m_healing = heal;
+}
+
+uint32 SpellScript::GetUnitTargetCountForEffect(SpellEffIndex effIndex) const
+{
+    return m_spell->GetUnitTargetCountForEffect(effIndex);
+}
+
+uint32 SpellScript::GetUnitTargetIndexForEffect(SpellEffIndex effIndex) const
+{
+    return m_spell->GetUnitTargetIndexForEffect(effIndex);
 }
 
 Aura* SpellScript::GetHitAura()
