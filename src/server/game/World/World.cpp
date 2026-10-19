@@ -1263,6 +1263,12 @@ void World::Update(uint32 diff)
     }
 
     {
+        METRIC_TIMER("world_update_time", METRIC_TAG("type", "Process cli commands"));
+        // Before the beat so a hung or long map update cannot sit on a command queued last tick.
+        ProcessCliCommands();
+    }
+
+    {
         ///- Update objects when the timer has passed (maps, transport, creatures, ...)
         METRIC_TIMER("world_update_time", METRIC_TAG("type", "Update maps"));
         sMapMgr->Update(diff);

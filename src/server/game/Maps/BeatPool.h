@@ -23,8 +23,9 @@
 #include "ObjectGuid.h"
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <memory>
-#include <semaphore>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -280,8 +281,12 @@ private:
     uint32 _diff = 0;
     uint32 _published = 0;
     std::atomic<bool> _stop{false};
-    std::counting_semaphore<> _beatSem{0};
-    std::counting_semaphore<> _completionSem{0};
+    std::atomic<uint32> _phaseEpoch{0};
+    std::atomic<uint32> _workersRemaining{0};
+    std::atomic<uint32> _workersReady{0};
+    std::mutex _wakeMutex;
+    std::condition_variable _wakeCv;
+    std::condition_variable _doneCv;
 
     static inline thread_local uint64 _pathNs = 0;
     static inline thread_local uint32 _pathIncomplete = 0;

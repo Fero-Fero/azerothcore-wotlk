@@ -312,6 +312,10 @@ void MotionTransport::Update(uint32 diff)
 
 void MotionTransport::DelayedUpdate(uint32  /*diff*/)
 {
+    // U1 cannot create grids or AddToMap; passengers wait for this seal pass.
+    if (_staticPassengers.empty())
+        LoadStaticPassengers();
+
     if (GetKeyFrames().size() <= 1)
         return;
 
@@ -485,6 +489,10 @@ GameObject* MotionTransport::CreateGOPassenger(ObjectGuid::LowType guid, GameObj
 
 void MotionTransport::LoadStaticPassengers()
 {
+    // CreateNPCPassenger / AddToMap / terrain reads need a created grid; that is seal-only (step 14).
+    if (BeatContext::InTask())
+        return;
+
     if (PassengersLoaded())
         return;
     SetPassengersLoaded(true);

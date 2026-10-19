@@ -84,8 +84,7 @@ void MapMgr::StartBeatPool()
     // After the world loaded and the grid preloads finished: the workers exist from here to UnloadAll.
     if (m_updater.activated())
         m_updater.wait();
-    if (sBeatPool->Cores() > 1)
-        sBeatPool->Start();
+    sBeatPool->Start();
 }
 
 void MapMgr::InitializeVisibilityDistanceInfo()

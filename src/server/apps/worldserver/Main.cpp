@@ -525,8 +525,10 @@ void ShutdownCLIThread(std::thread* cliThread)
     if (cliThread)
     {
 #ifdef _WIN32
-        // First try to cancel any I/O in the CLI thread
-        if (!CancelSynchronousIo(cliThread->native_handle()))
+        // Unblock ReadConsole / WaitForSingleObject on stdin so this join cannot hang the process.
+        CancelIoEx(GetStdHandle(STD_INPUT_HANDLE), nullptr);
+        HANDLE const cliHandle = cliThread->native_handle();
+        if (!CancelSynchronousIo(cliHandle))
         {
             // if CancelSynchronousIo() fails, print the error and try with old way
             DWORD errorCode = GetLastError();
@@ -576,7 +578,18 @@ void ShutdownCLIThread(std::thread* cliThread)
             WriteConsoleInput(hStdIn, b, 4, &numb);
         }
 #endif
-        cliThread->join();
+        if (cliThread->joinable())
+        {
+#ifdef _WIN32
+            if (WaitForSingleObject(cliThread->native_handle(), 2000) != WAIT_OBJECT_0)
+            {
+                cliThread->detach();
+                delete cliThread;
+                return;
+            }
+#endif
+            cliThread->join();
+        }
         delete cliThread;
     }
 }
@@ -601,6 +614,8 @@ void WorldUpdateLoop()
     ///- While we have not World::m_stopEvent, update the world
     while (!World::IsStopped())
     {
+        sWorld->ProcessCliCommands();
+
         ++World::m_worldLoopCounter;
         realCurrTime = getMSTime();
 

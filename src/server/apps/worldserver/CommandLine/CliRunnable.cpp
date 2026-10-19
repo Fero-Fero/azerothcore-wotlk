@@ -162,40 +162,84 @@ void CliThread()
 
         static bool checkedConsole = false;
         static bool isRealConsole = false;
+        static std::wstring lineBuf;
 
         if (!checkedConsole)
         {
             DWORD mode = 0;
             isRealConsole = GetConsoleMode(hStdIn, &mode);
+            if (isRealConsole)
+            {
+                // Line-mode ReadConsoleW holds the console lock until Enter; worker logs then deadlock
+                // with the CLI thread, so Enter never completes and shutdown cannot join this thread.
+                mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+                mode |= ENABLE_PROCESSED_INPUT;
+                SetConsoleMode(hStdIn, mode);
+            }
             checkedConsole = true;
         }
 
         if (isRealConsole)
         {
-            // ===== Real Windows Console =====
-            wchar_t commandbuf[256];
-            DWORD charsRead = 0;
+            if (WaitForSingleObject(hStdIn, 200) != WAIT_OBJECT_0)
+                continue;
 
-            if (ReadConsoleW(hStdIn, commandbuf,
-                sizeof(commandbuf) / sizeof(wchar_t) - 1,
-                &charsRead, nullptr))
+            INPUT_RECORD recs[32];
+            DWORD recsRead = 0;
+            if (!ReadConsoleInputW(hStdIn, recs, 32, &recsRead))
+                continue;
+
+            bool lineReady = false;
+            for (DWORD i = 0; i < recsRead; ++i)
             {
-                if (charsRead > 0)
+                if (recs[i].EventType != KEY_EVENT || !recs[i].Event.KeyEvent.bKeyDown)
+                    continue;
+                WCHAR const ch = recs[i].Event.KeyEvent.uChar.UnicodeChar;
+                if (recs[i].Event.KeyEvent.wVirtualKeyCode == VK_RETURN || ch == L'\r')
                 {
-                    commandbuf[charsRead] = L'\0';
-                    if (!WStrToUtf8(commandbuf, charsRead, command))
+                    lineReady = true;
+                    break;
+                }
+                if (ch == L'\b')
+                {
+                    if (!lineBuf.empty())
                     {
-                        PrintCliPrefix();
-                        continue;
+                        lineBuf.pop_back();
+                        DWORD written = 0;
+                        wchar_t const erase[] = L"\b \b";
+                        WriteConsoleW(GetStdHandle(STD_OUTPUT_HANDLE), erase, 3, &written, nullptr);
                     }
+                    continue;
+                }
+                if (ch)
+                {
+                    lineBuf.push_back(ch);
+                    DWORD written = 0;
+                    WriteConsoleW(GetStdHandle(STD_OUTPUT_HANDLE), &ch, 1, &written, nullptr);
                 }
             }
+
+            if (!lineReady)
+                continue;
+
+            fmt::print("\n");
+            if (!lineBuf.empty() && !WStrToUtf8(lineBuf, command))
+            {
+                lineBuf.clear();
+                PrintCliPrefix();
+                continue;
+            }
+            lineBuf.clear();
         }
         else
         {
-            // ===== Redirected input (pipe) =====
+            // Redirected input (pipe): cannot block forever or CTRL+C never joins this thread.
+            if (WaitForSingleObject(hStdIn, 200) != WAIT_OBJECT_0)
+                continue;
             if (!std::getline(std::cin, command))
             {
+                if (World::IsStopped())
+                    break;
                 World::StopNow(SHUTDOWN_EXIT_CODE);
                 break;
             }

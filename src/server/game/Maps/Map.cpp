@@ -1766,7 +1766,8 @@ CrowdBuffer const* Map::FindCrowdBuffer(uint32 cellId) const
 std::shared_ptr<GridTerrainData> Map::GetGridTerrainDataSharedPtr(GridCoord const& gridCoord)
 {
     MapGridType* grid = _mapGridManager.GetGrid(gridCoord.x_coord, gridCoord.y_coord);
-    ASSERT(grid); // Grid should always exist during this call
+    if (!grid)
+        return {};
     return grid->GetTerrainDataSharedPtr();
 }
 
@@ -1775,9 +1776,10 @@ GridTerrainData* Map::GetGridTerrainData(GridCoord const& gridCoord)
     if (!MapGridManager::IsValidGridCoordinates(gridCoord.x_coord, gridCoord.y_coord))
         return nullptr;
 
-    // ensure GridMap is created
+    // May no-op inside a unit task (grid create is deferred to the seal). Callers already treat nullptr.
     EnsureGridCreated(gridCoord);
-    return _mapGridManager.GetGrid(gridCoord.x_coord, gridCoord.y_coord)->GetTerrainData();
+    MapGridType* grid = _mapGridManager.GetGrid(gridCoord.x_coord, gridCoord.y_coord);
+    return grid ? grid->GetTerrainData() : nullptr;
 }
 
 GridTerrainData* Map::GetGridTerrainData(float x, float y)
