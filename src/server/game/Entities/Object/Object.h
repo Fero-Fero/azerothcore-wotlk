@@ -957,8 +957,13 @@ private:
     std::vector<WorldObject*> _taskMembers;
     // Grid the S1a router tagged this object for. -1 unless it is in that grid's pending list.
     int32 _pendingInGrid{-1};
+public:
+    void SetPendingGrid(int32 grid) { _pendingInGrid = grid; }
+private:
     // Beat this root is scheduled for (BeatPool::Schedule CAS); 0 when not in any ring.
     std::atomic<uint32> _scheduledBeat{0};
+    // Beat in which this object already ran Update. A duplicate task in the same beat must not tick again.
+    uint32 _ranOnBeat{0};
     // Step 14: set by the core that popped this root's item for the duration of its task body. A duplicate
     // handle that loses the exchange is dropped (second line of defence behind _scheduledBeat).
     alignas(8) std::atomic<uint8> _claimed{0};

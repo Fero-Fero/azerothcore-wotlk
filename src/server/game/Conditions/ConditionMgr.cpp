@@ -16,6 +16,7 @@
  */
 
 #include "ConditionMgr.h"
+#include "UnitView.h"
 #include "AchievementMgr.h"
 #include "GameEventMgr.h"
 #include "GameObject.h"
@@ -60,7 +61,12 @@ bool Condition::Meets(ConditionSourceInfo& sourceInfo)
     case CONDITION_AURA:
     {
         if (Unit* unit = object->ToUnit())
-            condMeets = unit->HasAuraEffect(ConditionValue1, ConditionValue2);
+        {
+            if (unit->IsForeignToTask())
+                condMeets = UnitView(unit).HasAuraEffect(ConditionValue1, uint8(ConditionValue2));
+            else
+                condMeets = unit->HasAuraEffect(ConditionValue1, ConditionValue2);
+        }
         break;
     }
     case CONDITION_ITEM:
@@ -515,7 +521,12 @@ bool Condition::Meets(ConditionSourceInfo& sourceInfo)
     case CONDITION_HAS_AURA_TYPE:
     {
         if (Unit* unit = object->ToUnit())
-            condMeets = unit->HasAuraType(AuraType(ConditionValue1));
+        {
+            if (unit->IsForeignToTask())
+                condMeets = UnitView(unit).HasAuraType(AuraType(ConditionValue1));
+            else
+                condMeets = unit->HasAuraType(AuraType(ConditionValue1));
+        }
         break;
     }
     case CONDITION_STAND_STATE:

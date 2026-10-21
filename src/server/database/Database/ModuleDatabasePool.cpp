@@ -16,6 +16,8 @@
  */
 
 #include "ModuleDatabasePool.h"
+#include "DatabaseWorkerPool.h"
+#include "Errors.h"
 #include "Errors.h"
 #include "Log.h"
 #include "MySQLConnection.h"
@@ -239,6 +241,10 @@ void ModuleDatabasePool::KeepAlive()
 
 MySQLConnection* ModuleDatabasePool::GetFreeConnection()
 {
+#ifdef ACORE_DEBUG
+    ASSERT(!Acore::IsSyncQueryForbidden(), "Synchronous query on a unit task path");
+#endif
+
     uint8 i = 0;
     auto const num_cons = _connections.size();
     MySQLConnection* connection = nullptr;

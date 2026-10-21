@@ -47,7 +47,7 @@ class dtNavMeshQuery;
 // and the step 17 crowd item, chunk = cell id).
 struct WorkItem
 {
-    enum Kind : uint8 { None, Unit, View, MapSeal, Crowd };
+    enum Kind : uint8 { None, Unit, View, MapSeal, Crowd, Grid };
 
     void* ptr = nullptr;
     uint32 chunk = 0;
@@ -59,6 +59,7 @@ struct WorkItem
     static WorkItem ViewTask(WorldObject* viewer, uint32 chunk) { WorkItem w; w.ptr = viewer; w.chunk = chunk; w.kind = View; return w; }
     static WorkItem SealTask(Map* map) { WorkItem w; w.ptr = map; w.kind = MapSeal; return w; }
     static WorkItem CrowdTask(Map* map, uint32 cellId) { WorkItem w; w.ptr = map; w.chunk = cellId; w.kind = Crowd; return w; }
+    static WorkItem GridTask(Map* map, uint32 gridId) { WorkItem w; w.ptr = map; w.chunk = gridId; w.kind = Grid; return w; }
 
     explicit operator bool() const { return kind != None; }
 };
@@ -194,7 +195,9 @@ public:
 private:
     BeatPool() = default;
 
-    enum class Phase : uint8 { Unit, View, MapSeal };
+    enum class Phase : uint8 { Unit, View, MapSeal, Grid };
+
+    bool _gridLinkRound = false;
 
     // Owner (step 16 table): BeatPool::_cores, one per core, allocated in Init and alive until the process
     // exits (objects freed during MapMgr::UnloadAll still return slot indices through it after Stop). Every
@@ -217,10 +220,17 @@ private:
         std::unordered_map<dtNavMesh const*, MMAP::ManagedNavMeshQuery> navQueries;
         std::vector<SlowTask> slowTasks;          // ten largest of the running beat on this core
         std::vector<uint32> slotIndicesToReturn;
-        std::vector<WorldObject*> freeList;
+        // Deleted in S2 of the beat after the one that queued it, so a visibility record can still
+        // land on the object during the next U1.
+        struct QueuedFree
+        {
+            WorldObject* obj = nullptr;
+            uint32 beat = 0;
+        };
+        std::vector<QueuedFree> freeList;
 
         uint64 tTask = 0, tInbox = 0, tUpdate = 0, tPublish = 0, tPath = 0, tView = 0, tIdle = 0;
-        uint64 tailTask = 0, tailView = 0, tailSeal = 0;
+        uint64 tailTask = 0, tailView = 0, tailSeal = 0, tailGrid = 0;
         uint64 lastTaskEnd = 0;
         uint64 parkedAt = 0;
         uint32 tasks = 0;

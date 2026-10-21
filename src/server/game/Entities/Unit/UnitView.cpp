@@ -163,6 +163,20 @@ bool UnitView::HasAura(uint32 spellId, ObjectGuid casterGuid) const
     return _live ? _handle->HasAura(spellId, casterGuid) : Slot().HasAura(spellId, casterGuid);
 }
 
+bool UnitView::HasAuraEffect(uint32 spellId, uint8 effIndex) const
+{
+    if (!_handle)
+        return false;
+    return _live ? _handle->HasAuraEffect(spellId, effIndex) : Slot().HasAuraEffect(spellId, effIndex);
+}
+
+bool UnitView::HasAuraType(AuraType type) const
+{
+    if (!_handle)
+        return false;
+    return _live ? _handle->HasAuraType(type) : Slot().HasAuraType(type);
+}
+
 int32 UnitView::GetTotalAuraModifier(AuraType type) const
 {
     if (!_handle)

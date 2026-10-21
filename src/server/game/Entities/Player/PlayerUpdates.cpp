@@ -1944,11 +1944,16 @@ void Player::RunViewChunk(uint32 chunk)
         if (work.scanDue)
             ViewScan(work);
 
-        // Re-evaluate what asked for it (a scan that reached the object already decided; ViewCollect dedups).
-        for (ObjectGuid guid : work.pokes)
-            if (WorldObject* obj = ObjectAccessor::GetWorldObject(*this, guid))
-                ViewCollect(obj, work);
-        work.pokes.clear();
+        // ViewCollect pokes this viewer again (a visited player, a script). Iterating work.pokes directly
+        // keeps raw pointers into its buffer across that push, and the next growth reads a freed block.
+        while (!work.pokes.empty())
+        {
+            std::vector<ObjectGuid> pokes;
+            pokes.swap(work.pokes);
+            for (ObjectGuid const& guid : pokes)
+                if (WorldObject* obj = ObjectAccessor::GetWorldObject(*this, guid))
+                    ViewCollect(obj, work);
+        }
         work.scanDue = work.scanForced = work.gobjOnly = false;
     }
 

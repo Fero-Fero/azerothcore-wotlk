@@ -50,6 +50,7 @@ enum UnitHook
 enum ReputationRank : uint8;
 class ByteBuffer;
 struct BuildValuesCachePosPointers;
+struct UpdateValuesSource;
 
 class UnitScript : public ScriptObject
 {
@@ -93,7 +94,7 @@ public:
 
     [[nodiscard]] virtual bool ShouldTrackValuesUpdatePosByIndex(Unit const* /*unit*/, uint8 /*updateType*/, uint16 /*index*/) { return false; }
 
-    virtual void OnPatchValuesUpdate(Unit const* /*unit*/, ByteBuffer& /*valuesUpdateBuf*/, BuildValuesCachePosPointers& /*posPointers*/, Player* /*target*/) { }
+    virtual void OnPatchValuesUpdate(UpdateValuesSource const& /*src*/, ByteBuffer& /*valuesUpdateBuf*/, BuildValuesCachePosPointers& /*posPointers*/, Player* /*target*/) { }
 
     /**
      * @brief This hook runs in Unit::Update

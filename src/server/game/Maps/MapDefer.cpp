@@ -66,6 +66,7 @@ void DeferBuffer::Reset()
 {
     _highWater = std::max(_highWater, _size);
     _size = 0;
+    _applied = 0;
     _sequence = 0;
 }
 
@@ -108,4 +109,38 @@ void DeferBuffer::DrainInto(std::vector<DeferHeader const*>& out) const
         out.push_back(hdr);
         off += DEFER_HEADER_SIZE + DeferAlignUp8(hdr->size);
     }
+}
+
+void DeferBuffer::CollectUnapplied(std::vector<KeptDefer>& out) const
+{
+    std::size_t off = 0;
+    while (off < _size)
+    {
+        DeferHeader const* hdr = reinterpret_cast<DeferHeader const*>(_bytes.data() + off);
+        std::size_t const next = off + DEFER_HEADER_SIZE + DeferAlignUp8(hdr->size);
+        if (off >= _applied && !IsGlobalDefer(hdr->kind))
+        {
+            KeptDefer kept;
+            kept.map = hdr->map;
+            kept.kind = hdr->kind;
+            if (hdr->size)
+                kept.payload.assign(_bytes.data() + off + DEFER_HEADER_SIZE, _bytes.data() + off + DEFER_HEADER_SIZE + hdr->size);
+            out.push_back(std::move(kept));
+        }
+        off = next;
+    }
+}
+
+void DeferBufferSet::CollectUnapplied(std::vector<KeptDefer>& out) const
+{
+    for (DeferBuffer const& buffer : _buffers)
+        if (buffer.Size())
+            buffer.CollectUnapplied(out);
+}
+
+void DeferBufferSet::Restore(std::vector<KeptDefer> const& kept)
+{
+    DeferBuffer& buffer = _buffers[std::min<uint8>(BeatContext::core, MAX_CORES - 1)];
+    for (KeptDefer const& rec : kept)
+        buffer.AppendBytes(rec.map, rec.kind, rec.payload.empty() ? nullptr : rec.payload.data(), rec.payload.size());
 }

@@ -122,13 +122,14 @@ VisibleWorldObjectsMap::iterator ObjectVisibilityContainer::UnlinkVisibilityFrom
     return (*_visibleWorldObjectsMap).erase(itr);
 }
 
-// Step 10: the target's half of a link. The record form (VisibilityLink / VisibilityUnlink to a foreign unit,
-// applied from its inbox next beat) is wired but not used yet: an object removed at the end of this tick
-// would be freed before the record lands, leaving the viewer's map pointing at it. The write stays direct;
-// step 14 made it safe under concurrent view commits with the one-byte spinlock in the two Direct*Player* writers.
+// Step 10: the target's half of a link. VisibilityLink / VisibilityUnlink are applied from the target's
+// inbox next beat. The free list holds the object until the following S2, so that apply still has a live
+// object. The spinlock on the direct writers covers the path taken when the flag below is false.
 namespace
 {
-    constexpr bool USE_VISIBILITY_LINK_RECORDS = false;
+    // Frees wait until the next beat's S2 (BeatPool::SealSerial), so the target's next U1 can apply
+    // the link record before the object is deleted.
+    constexpr bool USE_VISIBILITY_LINK_RECORDS = true;
 }
 
 void ObjectVisibilityContainer::LinkTargetSide(WorldObject* worldObject)

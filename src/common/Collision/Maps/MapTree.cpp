@@ -383,6 +383,10 @@ namespace VMAP
             LOG_ERROR("maps", "StaticMapTree::LoadMapTile() : tree has not been initialized [{}, {}]", tileX, tileY);
             return false;
         }
+        // A grid that was unloaded and loaded again must not acquire another reference to every model.
+        if (iLoadedTiles.find(packTileID(tileX, tileY)) != iLoadedTiles.end())
+            return true;
+
         bool result = true;
 
         std::string tilefile = iBasePath + getTileFileName(iMapID, tileX, tileY);

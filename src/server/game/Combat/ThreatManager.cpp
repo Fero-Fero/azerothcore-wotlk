@@ -711,8 +711,20 @@ ThreatReference const* ThreatManager::ReselectVictim()
     if (_sortedThreatList->empty())
         return nullptr;
 
+    // UpdateOffline can drop refs (ClearThreat from an attackability check, a nested UpdateVictim).
+    // Walking the map across that invalidates its iterators, and top() on the emptied heap reads a
+    // null node. The worker then dies in the unit phase and the world thread waits until the process halts.
+    std::vector<ObjectGuid> refreshing;
+    refreshing.reserve(_myThreatListEntries.size());
     for (auto const& pair : _myThreatListEntries)
-        pair.second->UpdateOffline(); // AI notifies are processed in ::UpdateVictim caller
+        refreshing.push_back(pair.first);
+
+    for (ObjectGuid const& guid : refreshing)
+        if (ThreatReference* ref = Acore::Containers::MapGetValuePtr(_myThreatListEntries, guid))
+            ref->UpdateOffline(); // AI notifies are processed in ::UpdateVictim caller
+
+    if (_sortedThreatList->empty())
+        return nullptr;
 
     // fixated target is always preferred
     if (_fixateRef && _fixateRef->IsAvailable())

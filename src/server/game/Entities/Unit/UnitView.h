@@ -61,6 +61,8 @@ public:
     [[nodiscard]] uint32 GetCreatureTypeMask() const;
 
     [[nodiscard]] bool HasAura(uint32 spellId, ObjectGuid casterGuid = ObjectGuid::Empty) const;
+    [[nodiscard]] bool HasAuraEffect(uint32 spellId, uint8 effIndex) const;
+    [[nodiscard]] bool HasAuraType(AuraType type) const;
     [[nodiscard]] int32 GetTotalAuraModifier(AuraType type) const;
 
     // Reaction against the owner of the running task. Live: Unit::IsFriendlyTo. Slot: faction template only.

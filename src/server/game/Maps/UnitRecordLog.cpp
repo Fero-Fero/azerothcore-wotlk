@@ -159,6 +159,7 @@ char const* RecordKindName(RecordKind kind)
         case RecordKind::KillingBlow:       return "KillingBlow";
         case RecordKind::KillCredit:        return "KillCredit";
         case RecordKind::ProcActor:         return "ProcActor";
+        case RecordKind::FormationMove:     return "FormationMove";
         default:                            return "Unknown";
     }
 }

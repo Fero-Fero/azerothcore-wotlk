@@ -16,6 +16,7 @@
  */
 
 #include "Map.h"
+#include <cstring>
 #include "Battleground.h"
 #include "BeatContext.h"
 #include "BeatPool.h"
@@ -666,6 +667,9 @@ void Map::ApplyDefers()
             continue;
         ApplyDefer(*hdr, reinterpret_cast<uint8 const*>(hdr) + DEFER_HEADER_SIZE);
     }
+
+    // Epilogue appends (Spawn) land after this. S2 must not throw them away with the applied prefix.
+    _defers.MarkApplied();
 }
 
 uint32 Map::ApplyGlobalDefers()
@@ -674,6 +678,9 @@ uint32 Map::ApplyGlobalDefers()
 
     std::vector<DeferHeader const*> all;
     _defers.DrainInto(all);
+
+    std::vector<KeptDefer> kept;
+    _defers.CollectUnapplied(kept);
 
     std::stable_sort(all.begin(), all.end(), [](DeferHeader const* a, DeferHeader const* b)
     {
@@ -690,6 +697,7 @@ uint32 Map::ApplyGlobalDefers()
     }
 
     _defers.Reset();
+    _defers.Restore(kept);
     return applied;
 }
 
@@ -790,6 +798,145 @@ void Map::ApplyDefer(DeferHeader const& header, uint8 const* payload)
             LOG_DEBUG("maps.defers", "ApplyDefer: no applier for {}", DeferKindName(header.kind));
             break;
     }
+}
+
+bool Map::TryAppendGridOp(DeferKind kind, void const* payload, uint16 size)
+{
+    // Parallel unlink/link corrupts the intrusive grid lists: two relinks of one creature in a beat are
+    // applied by two grid tasks at once, and a link can AddToGrid while the object is still linked.
+    // Keep relinks and grid loads on the map seal (one thread per map) until each object is owned by a
+    // single grid task for the whole beat.
+    (void)kind;
+    (void)payload;
+    (void)size;
+    return false;
+}
+
+void Map::PartitionGridOps()
+{
+    _gridUnlink.clear();
+    _gridLink.clear();
+    for (std::vector<GridOp>& bucket : _gridIncoming)
+    {
+        for (GridOp const& op : bucket)
+        {
+            if (op.sameGrid || op.kind == DeferKind::GridLoad)
+                _gridLink[op.gridId].push_back(op);
+            else
+            {
+                // Cross-grid relink is two copies. The one whose grid is the old cell unlinks; the other links.
+                RelinkDefer const& rec = *reinterpret_cast<RelinkDefer const*>(op.payload);
+                Cell oldCell;
+                oldCell.data.All = rec.oldCell;
+                uint32 const oldGrid = oldCell.GridY() * MAX_NUMBER_OF_GRIDS + oldCell.GridX();
+                if (op.gridId == oldGrid)
+                    _gridUnlink[op.gridId].push_back(op);
+                else
+                    _gridLink[op.gridId].push_back(op);
+            }
+        }
+        bucket.clear();
+    }
+}
+
+void Map::CollectGridIds(bool linkRound, std::vector<uint32>& out) const
+{
+    auto const& rounds = linkRound ? _gridLink : _gridUnlink;
+    out.clear();
+    out.reserve(rounds.size());
+    for (auto const& [gridId, ops] : rounds)
+        if (!ops.empty())
+            out.push_back(gridId);
+}
+
+uint32 Map::LastGridNs(uint32 gridId) const
+{
+    auto it = _lastGridNs.find(gridId);
+    return it == _lastGridNs.end() ? 0 : it->second;
+}
+
+void Map::SetLastGridNs(uint32 gridId, uint32 ns)
+{
+    _lastGridNs[gridId] = ns;
+}
+
+void Map::UnlinkGridObject(WorldObject* obj)
+{
+    if (!obj->IsInWorld())
+        return;
+
+    if (obj->IsFarVisible())
+        RemoveWorldObjectFromFarVisibleMap(obj);
+
+    auto drop = [](auto* typed)
+    {
+        if (typed->IsInGrid())
+            typed->RemoveFromGrid();
+    };
+
+    if (Player* player = obj->ToPlayer())
+        drop(player);
+    else if (Creature* creature = obj->ToCreature())
+        drop(creature);
+    else if (GameObject* go = obj->ToGameObject())
+        drop(go);
+    else if (DynamicObject* dyn = obj->ToDynObject())
+        drop(dyn);
+}
+
+void Map::LinkGridObject(WorldObject* obj, Cell const& cell)
+{
+    if (!obj->IsInWorld())
+        return;
+
+    EnsureGridLoaded(cell);
+
+    if (Player* player = obj->ToPlayer())
+        AddToGrid(player, cell);
+    else if (Creature* creature = obj->ToCreature())
+        AddToGrid(creature, cell);
+    else if (GameObject* go = obj->ToGameObject())
+        AddToGrid(go, cell);
+    else if (DynamicObject* dyn = obj->ToDynObject())
+        AddToGrid(dyn, cell);
+}
+
+void Map::RunGridItem(uint32 gridId, bool linkRound)
+{
+    std::vector<GridOp>& ops = linkRound ? _gridLink[gridId] : _gridUnlink[gridId];
+    for (GridOp const& op : ops)
+    {
+        if (op.kind == DeferKind::GridLoad)
+        {
+            GridLoadDefer const& rec = *reinterpret_cast<GridLoadDefer const*>(op.payload);
+            Cell cell;
+            cell.data.All = rec.cell;
+            if (rec.objects)
+                EnsureGridLoaded(cell);
+            else
+                EnsureGridCreated(GridCoord(cell.GridX(), cell.GridY()));
+            continue;
+        }
+
+        RelinkDefer const& rec = *reinterpret_cast<RelinkDefer const*>(op.payload);
+        WorldObject* obj = GetWorldObjectForDefer(rec.guid);
+        if (!obj)
+            continue;
+
+        obj->SetPendingGrid(int32(gridId));
+        Cell newCell(obj->GetPositionX(), obj->GetPositionY());
+        if (!linkRound)
+            UnlinkGridObject(obj);
+        else if (op.sameGrid)
+        {
+            UnlinkGridObject(obj);
+            LinkGridObject(obj, newCell);
+        }
+        else
+            LinkGridObject(obj, newCell);
+        obj->SetPendingGrid(-1);
+    }
+    ops.clear();
 }
 
 void Map::RelinkObjectNow(WorldObject* obj, Cell const& oldCell, Cell const& newCell)
@@ -1644,6 +1791,66 @@ void Map::MoveAllDynamicObjectsInMoveList()
         AddToGrid(dynObj, new_cell);
     }
     _dynamicObjectsToMove.clear();
+}
+
+void Map::UnloadIdleGrids(uint32 diff)
+{
+    // Preload keeps every grid on purpose.
+    if (sWorld->getBoolConfig(CONFIG_PRELOAD_ALL_NON_INSTANCED_MAP_GRIDS))
+        return;
+
+    // Same delay the old grid-clean used: five minutes after the last player or transport left the neighbourhood.
+    constexpr uint32 IDLE_LIMIT_MS = 5 * MINUTE * IN_MILLISECONDS;
+
+    // `near` is a Windows macro, so the name has to be something else.
+    auto closeTo = [](MapGridType const& grid, float x, float y)
+    {
+        GridCoord const at = Acore::ComputeGridCoord(x, y);
+        int const dx = int(at.x_coord) - int(grid.GetX());
+        int const dy = int(at.y_coord) - int(grid.GetY());
+        return dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1;
+    };
+
+    for (GridRefMgr<MapGridType>::iterator i = GridRefMgr<MapGridType>::begin(); i != GridRefMgr<MapGridType>::end();)
+    {
+        MapGridType* grid = i->GetSource();
+        ++i;
+        if (!grid)
+            continue;
+
+        bool keep = false;
+        for (MapRefMgr::iterator itr = m_mapRefMgr.begin(); itr != m_mapRefMgr.end(); ++itr)
+        {
+            Player* player = itr->GetSource();
+            if (player && player->IsInWorld() && closeTo(*grid, player->GetPositionX(), player->GetPositionY()))
+            {
+                keep = true;
+                break;
+            }
+        }
+        if (!keep)
+        {
+            for (Transport* transport : _transports)
+            {
+                if (transport->IsInWorld() && closeTo(*grid, transport->GetPositionX(), transport->GetPositionY()))
+                {
+                    keep = true;
+                    break;
+                }
+            }
+        }
+
+        if (keep)
+        {
+            grid->ResetIdle();
+            continue;
+        }
+
+        if (grid->AddIdle(diff) < IDLE_LIMIT_MS)
+            continue;
+
+        UnloadGrid(*grid);
+    }
 }
 
 bool Map::UnloadGrid(MapGridType& grid)
@@ -3523,7 +3730,7 @@ void Map::ProcessCreatureRespawn(ObjectGuid::LowType spawnId)
     // Pool members are handled entirely by the pool system on this map's pool data
     if (uint32 poolId = sPoolMgr->IsPartOfAPool<Creature>(spawnId))
     {
-        sPoolMgr->UpdatePool<Creature>(GetPoolData(), poolId, spawnId);
+        UpdatePoolDeferred(TYPEID_UNIT, poolId, spawnId);
         RemoveCreatureRespawnTime(spawnId);
         return;
     }
@@ -3608,9 +3815,9 @@ void Map::ProcessCreatureRespawn(ObjectGuid::LowType spawnId)
     SpawnDefer rec;
     rec.spawnId = spawnId;
     rec.type = uint8(SPAWN_TYPE_CREATURE);
-    // ProcessRespawns runs from BeatEpilogue (S2), after the map-local defers were applied and the buffer was reset
-    // for the beat: a defer appended there would never be applied. Outside a task nothing runs concurrently.
-    if (BeatContext::InTask())
+    // The epilogue runs after the map-local drain. InBeat still appends; S2 keeps that tail for the next seal.
+    // Outside a beat nothing else will apply it, so construct now.
+    if (BeatContext::InBeat())
         AppendDefer(DeferKind::Spawn, rec);
     else
         ApplySpawn(rec);
@@ -3621,7 +3828,7 @@ void Map::ProcessGameObjectRespawn(ObjectGuid::LowType spawnId)
     // Pool members are handled entirely by the pool system on this map's pool data
     if (uint32 poolId = sPoolMgr->IsPartOfAPool<GameObject>(spawnId))
     {
-        sPoolMgr->UpdatePool<GameObject>(GetPoolData(), poolId, spawnId);
+        UpdatePoolDeferred(TYPEID_GAMEOBJECT, poolId, spawnId);
         RemoveGORespawnTime(spawnId);
         return;
     }
@@ -3669,7 +3876,7 @@ void Map::ProcessGameObjectRespawn(ObjectGuid::LowType spawnId)
     SpawnDefer rec;
     rec.spawnId = spawnId;
     rec.type = uint8(SPAWN_TYPE_GAMEOBJECT);
-    if (BeatContext::InTask())
+    if (BeatContext::InBeat())
         AppendDefer(DeferKind::Spawn, rec);
     else
         ApplySpawn(rec);

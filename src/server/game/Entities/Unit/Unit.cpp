@@ -542,6 +542,14 @@ void Unit::FillSlot(ObjectSlot& s)
     s.victimGuid = m_attacking ? m_attacking->GetGUID() : ObjectGuid::Empty;
     s.charmerOrOwnerGuid = GetCharmerOrOwnerGUID();
 
+    s.transformSpell = m_transform;
+    s.controlledByPlayer = m_ControlledByPlayer ? 1 : 0;
+    if (Creature const* creature = ToCreature())
+    {
+        s.lootRecipient = creature->GetLootRecipientGUID();
+        s.lootRecipientGroup = creature->GetLootRecipientGroupGUID();
+    }
+
     s.threatRedirectCount = 0;
     for (auto const& [guid, pct] : m_threatManager.GetRedirectInfo())
     {
@@ -13347,6 +13355,20 @@ void Unit::ApplyRecord(RecordHeader const& header, uint8 const* payload)
         case RecordKind::GameObjectUnlink:
             ApplyGameObjectUnlink(RecordPayload<GameObjectUnlinkRecord>(payload));
             break;
+        case RecordKind::FormationMove:
+        {
+            FormationMoveRecord const& rec = RecordPayload<FormationMoveRecord>(payload);
+            if (Creature* creature = ToCreature())
+            {
+                if (rec.op == FORMATION_MOVE_EXPIRE)
+                    creature->GetMotionMaster()->MovementExpiredOnSlot(MOTION_SLOT_IDLE, false);
+                else if (rec.op == FORMATION_MOVE_IDLE)
+                    creature->GetMotionMaster()->MoveIdle();
+                else if (Unit* leader = ObjectAccessor::GetUnit(*creature, rec.leader))
+                    creature->GetMotionMaster()->MoveFormation(leader, rec.dist, rec.angle, rec.point1, rec.point2);
+            }
+            break;
+        }
         default:
             if (!ApplyCommonRecord(header, payload))
                 LOG_DEBUG("maps.records", "{} dropped record {} from {}: no applier on this step",
@@ -17918,8 +17940,9 @@ void Unit::PatchValuesUpdate(ByteBuffer& valuesUpdateBuf, BuildValuesCachePosPoi
         {
             CreatureTemplate const* cinfo = creature->GetCreatureTemplate();
 
-            // this also applies for transform auras
-            if (SpellInfo const* transform = sSpellMgr->GetSpellInfo(getTransForm()))
+            // this also applies for transform auras. The slot is the foreign copy; the live member is the owner's.
+            uint32 const transformId = src.slot ? src.slot->transformSpell : getTransForm();
+            if (SpellInfo const* transform = sSpellMgr->GetSpellInfo(transformId))
                 for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
                     if (transform->Effects[i].IsAura(SPELL_AURA_TRANSFORM))
                         if (CreatureTemplate const* transformInfo = sObjectMgr->GetCreatureTemplate(transform->Effects[i].MiscValue))
@@ -17948,10 +17971,16 @@ void Unit::PatchValuesUpdate(ByteBuffer& valuesUpdateBuf, BuildValuesCachePosPoi
 
         if (creature)
         {
-            if (creature->hasLootRecipient())
+            ObjectGuid const recipient = src.slot ? src.slot->lootRecipient : creature->GetLootRecipientGUID();
+            uint32 const recipientGroup = src.slot ? src.slot->lootRecipientGroup : creature->GetLootRecipientGroupGUID();
+            if (recipient || recipientGroup)
             {
                 dynamicFlags |= UNIT_DYNFLAG_TAPPED;
-                if (creature->isTappedBy(target))
+                bool tappedByTarget = recipient == target->GetGUID();
+                if (!tappedByTarget && recipientGroup)
+                    if (Group const* group = target->GetGroup())
+                        tappedByTarget = group->GetGUID().GetCounter() == recipientGroup;
+                if (tappedByTarget)
                     dynamicFlags |= UNIT_DYNFLAG_TAPPED_BY_PLAYER;
             }
 
@@ -17971,7 +18000,8 @@ void Unit::PatchValuesUpdate(ByteBuffer& valuesUpdateBuf, BuildValuesCachePosPoi
     // UNIT_FIELD_BYTES_2
     if (posPointers.UnitFieldBytes2Pos >= 0)
     {
-        if (IsControlledByPlayer() && target != this && sWorld->getBoolConfig(CONFIG_ALLOW_TWO_SIDE_INTERACTION_GROUP) && inRaidWithTarget())
+        bool const controlled = src.slot ? src.slot->controlledByPlayer != 0 : IsControlledByPlayer();
+        if (controlled && target != this && sWorld->getBoolConfig(CONFIG_ALLOW_TWO_SIDE_INTERACTION_GROUP) && inRaidWithTarget())
         {
             FactionTemplateEntry const* ft1 = sFactionTemplateStore.LookupEntry(src.values[UNIT_FIELD_FACTIONTEMPLATE]);
             FactionTemplateEntry const* ft2 = target->GetFactionTemplateEntry();
@@ -17989,7 +18019,8 @@ void Unit::PatchValuesUpdate(ByteBuffer& valuesUpdateBuf, BuildValuesCachePosPoi
     // UNIT_FIELD_FACTIONTEMPLATE
     if (posPointers.UnitFieldFactionTemplatePos >= 0)
     {
-        if (IsControlledByPlayer() && target != this && sWorld->getBoolConfig(CONFIG_ALLOW_TWO_SIDE_INTERACTION_GROUP) && inRaidWithTarget())
+        bool const controlled = src.slot ? src.slot->controlledByPlayer != 0 : IsControlledByPlayer();
+        if (controlled && target != this && sWorld->getBoolConfig(CONFIG_ALLOW_TWO_SIDE_INTERACTION_GROUP) && inRaidWithTarget())
         {
             FactionTemplateEntry const* ft1 = sFactionTemplateStore.LookupEntry(src.values[UNIT_FIELD_FACTIONTEMPLATE]);
             FactionTemplateEntry const* ft2 = target->GetFactionTemplateEntry();
@@ -18002,13 +18033,13 @@ void Unit::PatchValuesUpdate(ByteBuffer& valuesUpdateBuf, BuildValuesCachePosPoi
         {
             valuesUpdateBuf.put(posPointers.UnitFieldFactionTemplatePos, uint32(target->GetFaction()));
         }
-        else if (target->IsGMSpectator() && IsControlledByPlayer())
+        else if (target->IsGMSpectator() && (src.slot ? src.slot->controlledByPlayer != 0 : IsControlledByPlayer()))
         {
             valuesUpdateBuf.put(posPointers.UnitFieldFactionTemplatePos, uint32(target->GetFaction()));
         }
     }
 
-    sScriptMgr->OnPatchValuesUpdate(this, valuesUpdateBuf, posPointers, target);
+    sScriptMgr->OnPatchValuesUpdate(src, valuesUpdateBuf, posPointers, target);
 }
 
 void Unit::BuildCooldownPacket(WorldPacket& data, uint8 flags, uint32 spellId, uint32 cooldown)

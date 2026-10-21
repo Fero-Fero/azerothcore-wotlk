@@ -17,6 +17,8 @@
 
 #include "CreatureGroups.h"
 #include "BeatContext.h"
+#include "UnitRecordLog.h"
+#include "UnitRecords.h"
 #include "UnitView.h"
 #include "Creature.h"
 #include "CreatureAI.h"
@@ -394,17 +396,27 @@ void CreatureGroup::FormationReset(bool dismiss, bool initMotionMaster)
     for (auto const& itr : m_members)
     {
         Creature* member = itr.first;
-        if (member && member != m_leader && member->IsAlive())
-        {
-            if (initMotionMaster)
-            {
-                if (dismiss)
-                    member->GetMotionMaster()->MovementExpiredOnSlot(MOTION_SLOT_IDLE, false);
-                else
-                    member->GetMotionMaster()->MoveIdle();
+        if (!member || member == m_leader)
+            continue;
 
-                LOG_DEBUG("entities.unit", "Set {} movement for member {}", dismiss ? "default" : "idle", member->GetGUID().ToString());
+        UnitView const view(member);
+        if (!view.IsAlive())
+            continue;
+
+        if (initMotionMaster)
+        {
+            if (member->IsForeignToTask() && BeatContext::owner)
+            {
+                FormationMoveRecord rec;
+                rec.op = dismiss ? FORMATION_MOVE_EXPIRE : FORMATION_MOVE_IDLE;
+                sRecordLogs->Append(BeatContext::owner->GetGUID(), member, RecordKind::FormationMove, rec);
             }
+            else if (dismiss)
+                member->GetMotionMaster()->MovementExpiredOnSlot(MOTION_SLOT_IDLE, false);
+            else
+                member->GetMotionMaster()->MoveIdle();
+
+            LOG_DEBUG("entities.unit", "Set {} movement for member {}", dismiss ? "default" : "idle", member->GetGUID().ToString());
         }
     }
     m_Formed = !dismiss;
@@ -419,16 +431,31 @@ void CreatureGroup::LeaderStartedMoving()
     {
         Creature* member = itr.first;
         FormationInfo const& pFormationInfo = itr.second;
-        if (member == m_leader || !member->IsAlive() || member->GetVictim() || !pFormationInfo.HasGroupFlag(std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_FOLLOW_LEADER)))
+        UnitView const view(member);
+        if (member == m_leader || !view.IsAlive() || member->GetVictim() || !pFormationInfo.HasGroupFlag(std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_FOLLOW_LEADER)))
             continue;
 
-        if (member->HasUnitState(UNIT_STATE_NOT_MOVE) || member->isPossessed() || member->HasUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED))
+        if (view.HasUnitState(UNIT_STATE_NOT_MOVE) || view.HasUnitState(UNIT_STATE_POSSESSED) || view.HasUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED))
             continue;
 
         float const followAngle = pFormationInfo.follow_angle;
         float const followDist = pFormationInfo.follow_dist;
 
-        if (!member->HasUnitState(UNIT_STATE_FOLLOW_MOVE))
+        if (view.HasUnitState(UNIT_STATE_FOLLOW_MOVE))
+            continue;
+
+        if (member->IsForeignToTask() && BeatContext::owner)
+        {
+            FormationMoveRecord rec;
+            rec.leader = m_leader->GetGUID();
+            rec.dist = followDist;
+            rec.angle = followAngle;
+            rec.point1 = pFormationInfo.point_1;
+            rec.point2 = pFormationInfo.point_2;
+            rec.op = FORMATION_MOVE_FOLLOW;
+            sRecordLogs->Append(BeatContext::owner->GetGUID(), member, RecordKind::FormationMove, rec);
+        }
+        else
             member->GetMotionMaster()->MoveFormation(m_leader, followDist, followAngle, pFormationInfo.point_1, pFormationInfo.point_2);
     }
 }

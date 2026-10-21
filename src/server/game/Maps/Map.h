@@ -45,6 +45,7 @@
 #include <memory>
 #include <set>
 #include <shared_mutex>
+#include <array>
 #include <unordered_map>
 
 class Unit;
@@ -214,7 +215,9 @@ public:
     template <typename T>
     void AppendDefer(DeferKind kind, T const& payload)
     {
-        _defers.Append(this, kind, payload);
+        // Relink and grid load run on the grid's own task. Everything else stays in the defer buffer.
+        if (!TryAppendGridOp(kind, &payload, sizeof(T)))
+            _defers.Append(this, kind, payload);
     }
 
     // Per-map kinds at the map's seal (S1b), global kinds in S2 after every map sealed. Returns the number of
@@ -250,6 +253,8 @@ public:
     void LoadAllGrids();
     void LoadGridsInRange(Position const& center, float radius);
     bool UnloadGrid(MapGridType& grid);
+    // After the beat, when no core is pushing work items. Not from a seal task: deleting a scheduled object there asserts in Unschedule.
+    void UnloadIdleGrids(uint32 diff);
     virtual void UnloadAll();
 
     std::shared_ptr<GridTerrainData> GetGridTerrainDataSharedPtr(GridCoord const& gridCoord);
@@ -689,6 +694,22 @@ private:
     // seal with the capacity kept, freed with the map. UnloadAll frees the objects of AddToMap defers never applied.
     DeferBufferSet _defers;
     void DropPendingAddToMapDefers();
+
+    // S1a: relink and grid-load ops appended by unit tasks, one vector per core. PartitionGridOps moves
+    // them into the per-grid rounds; only the coordinator does that, between phases.
+    bool TryAppendGridOp(DeferKind kind, void const* payload, uint16 size);
+    void PartitionGridOps();
+    void CollectGridIds(bool linkRound, std::vector<uint32>& out) const;
+    void RunGridItem(uint32 gridId, bool linkRound);
+    void UnlinkGridObject(WorldObject* obj);
+    void LinkGridObject(WorldObject* obj, Cell const& cell);
+    [[nodiscard]] uint32 LastGridNs(uint32 gridId) const;
+    void SetLastGridNs(uint32 gridId, uint32 ns);
+
+    std::array<std::vector<GridOp>, 64> _gridIncoming;
+    std::unordered_map<uint32, std::vector<GridOp>> _gridUnlink;
+    std::unordered_map<uint32, std::vector<GridOp>> _gridLink;
+    std::unordered_map<uint32, uint32> _lastGridNs;
 public:
     [[nodiscard]] DeferBufferSet const& Defers() const { return _defers; }
 private:

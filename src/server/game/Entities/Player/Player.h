@@ -2471,6 +2471,7 @@ public:
         bool scanForced = false;                      // skip the minimum-move-distance check
         bool gobjOnly = false;                        // map change: grid visit limited to game objects
         bool petLeftRange = false;                    // step 14: the pet went out of range in U2; removed in the next U1
+        std::atomic<uint32> queuedForBeat{0};         // beat that already queued this viewer's chunks
     };
 
     ViewWork& View() { return _view; }

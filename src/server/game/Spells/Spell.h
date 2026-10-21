@@ -347,6 +347,8 @@ public:
     [[nodiscard]] uint32 GetUnitTargetIndexForEffect(SpellEffIndex effIndex) const;
     // Every write to the caster that the land step wants goes through this record (plan §7.2).
     SpellLandedRecord& Feedback();
+    void SetLaunchScriptValue(int32 value) { m_launchScriptValue = value; }
+    [[nodiscard]] int32 GetLaunchScriptValue() const { return m_launchScriptValue; }
     // Every read of a caster field on the land step (plan §9). On this slice it wraps the live caster.
     [[nodiscard]] UnitView CasterView() const;
     // Step 08 §2: a periodic tick on another unit's task asked for this cast; the aura is known by ids only.
@@ -887,6 +889,7 @@ public:
     bool _landSide = false;                             // built from a SpellHitRecord on the target's task
     Unit* _landTarget = nullptr;                        // the task owner that is landing the hit
     SpellLandedRecord* _landFeedback = nullptr;         // caller-owned on the land side
+    int32 m_launchScriptValue = 0;                      // copied into SpellHitRecord::scriptValue at emission
     std::unique_ptr<SpellLandedRecord> _ownFeedback;    // inline path (self-hit at launch): applied at the end of the hit
     Spell* _launchSpell = nullptr;                      // inline landing only: the launch spell whose scripts are borrowed
     uint8 _landUnitTargetCount[MAX_SPELL_EFFECTS] = {}; // SpellHitRecord::unitTargetCount, for GetUnitTargetCountForEffect on the land side

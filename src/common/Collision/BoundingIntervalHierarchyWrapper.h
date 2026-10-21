@@ -71,65 +71,59 @@ class BIHWrap
     ObjArray m_objects;
     G3D::Table<T const*, uint32> m_obj2Idx;
     G3D::Set<T const*> m_objects_to_push;
-    // Raised by insert/remove (never concurrent with a reader), cleared by balance() once the rebuild is done.
-    // Readers rebuild lazily, and map update tasks read the same tree on several cores: the rebuild runs under
-    // m_balanceMutex and the counter drops only after it, so a reader that sees 0 sees a finished tree.
+    // Raised by insert/remove, cleared by rebuild() once the tree is built. Several cores query one map's
+    // tree at once: the mutex covers the rebuild and the walk. Releasing it between the two lets another
+    // core fastClear() the object array and rebuild the tree under the walker.
     std::atomic<int> unbalanced_times;
     std::mutex m_balanceMutex;
+
+    void rebuild()
+    {
+        if (unbalanced_times.load(std::memory_order_relaxed) == 0)
+            return;
+
+        m_objects.fastClear();
+        m_obj2Idx.getKeys(m_objects);
+        m_objects_to_push.getMembers(m_objects);
+
+        m_tree.build(m_objects, BoundsFunc::GetBounds2);
+
+        unbalanced_times.store(0, std::memory_order_release);
+    }
 
 public:
     BIHWrap() : unbalanced_times(0) { }
 
     void insert(T const& obj)
     {
+        std::lock_guard<std::mutex> lock(m_balanceMutex);
         ++unbalanced_times;
         m_objects_to_push.insert(&obj);
     }
 
     void remove(T const& obj)
     {
+        std::lock_guard<std::mutex> lock(m_balanceMutex);
         ++unbalanced_times;
         uint32 Idx = 0;
         T const* temp;
         if (m_obj2Idx.getRemove(&obj, temp, Idx))
-        {
             m_objects[Idx] = nullptr;
-        }
         else
-        {
             m_objects_to_push.remove(&obj);
-        }
     }
 
     void balance()
     {
-        if (unbalanced_times.load(std::memory_order_acquire) == 0)
-        {
-            return;
-        }
-
         std::lock_guard<std::mutex> lock(m_balanceMutex);
-
-        int const pending = unbalanced_times.load(std::memory_order_relaxed);
-        if (pending == 0)
-        {
-            return; // another reader rebuilt while this one waited for the lock
-        }
-
-        m_objects.fastClear();
-        m_obj2Idx.getKeys(m_objects);
-        m_objects_to_push.getMembers(m_objects);
-        //assert that m_obj2Idx has all the keys
-
-        m_tree.build(m_objects, BoundsFunc::GetBounds2);
-
-        unbalanced_times.fetch_sub(pending, std::memory_order_release);
+        rebuild();
     }
 
     template<typename RayCallback>
     void intersectRay(G3D::Ray const& ray, RayCallback& intersectCallback, float& maxDist, bool stopAtFirstHit)
     {
-        balance();
+        std::lock_guard<std::mutex> lock(m_balanceMutex);
+        rebuild();
         MDLCallback<RayCallback> temp_cb(intersectCallback, m_objects.getCArray(), m_objects.size());
         m_tree.intersectRay(ray, temp_cb, maxDist, stopAtFirstHit);
     }
@@ -137,7 +131,8 @@ public:
     template<typename IsectCallback>
     void intersectPoint(G3D::Vector3 const& point, IsectCallback& intersectCallback)
     {
-        balance();
+        std::lock_guard<std::mutex> lock(m_balanceMutex);
+        rebuild();
         MDLCallback<IsectCallback> callback(intersectCallback, m_objects.getCArray(), m_objects.size());
         m_tree.intersectPoint(point, callback);
     }

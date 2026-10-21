@@ -167,6 +167,7 @@ Spell::Spell(SpellHitRecord const& hit, Unit* target, WorldObject* casterHandle,
     m_autoRepeat = false;
     m_runesState = 0;
     m_powerCost = hit.powerCost;
+    m_launchScriptValue = hit.scriptValue;
     m_casttime = hit.castTime;
     m_originalTargetGUID = hit.originalTarget;
     m_timer = 0;
@@ -470,6 +471,7 @@ void Spell::BuildHitRecord(TargetInfo const& target, SpellHitRecord& out) const
     out.attackType = uint8(m_attackType);
     out.castTime = m_casttime;
     out.powerCost = m_powerCost;
+    out.scriptValue = m_launchScriptValue;
     out.originalTarget = m_originalTargetGUID;
     out.procAttacker = m_procAttacker;
     out.procVictim = m_procVictim;
@@ -691,6 +693,12 @@ void Unit::ApplySpellLanded(SpellLandedRecord const& landed)
             healthGain = SpellHealingBonusTaken(this, spellInfo, healthGain, HEAL);
 
             HealInfo healInfo(this, this, healthGain, spellInfo, spellInfo->GetSchoolMask());
+            HealBySpell(healInfo);
+        }
+
+        if (landed.directSelfHeal > 0 && IsAlive())
+        {
+            HealInfo healInfo(this, this, uint32(landed.directSelfHeal), spellInfo, spellInfo->GetSchoolMask());
             HealBySpell(healInfo);
         }
 

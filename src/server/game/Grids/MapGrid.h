@@ -102,6 +102,15 @@ public:
     std::shared_ptr<GridTerrainData> GetTerrainDataSharedPtr() { return _terrainData; }
     void SetTerrainData(std::shared_ptr<GridTerrainData> terrainData) { _terrainData = terrainData; }
 
+    void ResetIdle() { _idleMs = 0; }
+    // Time since a player or transport was last within a grid of this one. Used to unload it.
+    uint32 AddIdle(uint32 diff)
+    {
+        if (_idleMs > 0xFFFFFFFFu - diff)
+            return _idleMs = 0xFFFFFFFFu;
+        return _idleMs += diff;
+    }
+
     uint32 GetCreatedCellsCount()
     {
         uint32 count = 0;
@@ -143,6 +152,7 @@ private:
 
     uint16 _x;
     uint16 _y;
+    uint32 _idleMs{0};
 
     bool _objectDataLoaded;
     std::array<std::array<std::unique_ptr<GridCellType>, MAX_NUMBER_OF_CELLS>, MAX_NUMBER_OF_CELLS> _cells; // N * N array

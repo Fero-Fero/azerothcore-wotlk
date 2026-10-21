@@ -99,9 +99,9 @@ bool ScriptMgr::ShouldTrackValuesUpdatePosByIndex(Unit const* unit, uint8 update
     CALL_ENABLED_BOOLEAN_HOOKS_WITH_DEFAULT_FALSE(UnitScript, UNITHOOK_SHOULD_TRACK_VALUES_UPDATE_POS_BY_INDEX, script->ShouldTrackValuesUpdatePosByIndex(unit, updateType, index));
 }
 
-void ScriptMgr::OnPatchValuesUpdate(Unit const* unit, ByteBuffer& valuesUpdateBuf, BuildValuesCachePosPointers& posPointers, Player* target)
+void ScriptMgr::OnPatchValuesUpdate(UpdateValuesSource const& src, ByteBuffer& valuesUpdateBuf, BuildValuesCachePosPointers& posPointers, Player* target)
 {
-    CALL_ENABLED_HOOKS(UnitScript, UNITHOOK_ON_PATCH_VALUES_UPDATE, script->OnPatchValuesUpdate(unit, valuesUpdateBuf, posPointers, target));
+    CALL_ENABLED_HOOKS(UnitScript, UNITHOOK_ON_PATCH_VALUES_UPDATE, script->OnPatchValuesUpdate(src, valuesUpdateBuf, posPointers, target));
 }
 
 void ScriptMgr::OnUnitUpdate(Unit* unit, uint32 diff)

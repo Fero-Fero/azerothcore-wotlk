@@ -137,6 +137,12 @@ struct ObjectSlot
     uint8 threatRedirectCount = 0;     // ThreatManager::_redirectInfo, in order, capped
     SlotThreatRedirect threatRedirects[MAX_SLOT_THREAT_REDIRECTS];
 
+    // Viewer builds (step 13 leftovers). Live members of a foreign unit are not readable from U2.
+    uint32 transformSpell = 0;         // Unit::m_transform
+    uint8 controlledByPlayer = 0;      // Unit::m_ControlledByPlayer
+    ObjectGuid lootRecipient;          // Creature::m_lootRecipient
+    uint32 lootRecipientGroup = 0;     // Creature::m_lootRecipientGroup
+
     // Visibility inputs for a viewer's CanSeeOrDetect (step 10)
     SlotVisibility vis;
 
@@ -258,6 +264,7 @@ struct SlotReader
     [[nodiscard]] bool Flag(uint16 i, uint32 f) const { return (s.values[i] & f) != 0; }
 
     [[nodiscard]] bool HasAura(uint32 spellId, ObjectGuid caster = ObjectGuid::Empty) const;
+    [[nodiscard]] bool HasAuraEffect(uint32 spellId, uint8 effIndex) const;
     [[nodiscard]] SlotAura const* FindAura(uint32 spellId, ObjectGuid caster = ObjectGuid::Empty) const;
     // Sum of amount[i] over slot auras whose effect i applies the given aura type.
     [[nodiscard]] int32 TotalAuraModifier(AuraType type) const;

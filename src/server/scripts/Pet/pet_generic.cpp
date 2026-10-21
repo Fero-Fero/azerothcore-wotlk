@@ -24,6 +24,7 @@
 #include "ScriptedCreature.h"
 #include "ScriptedGossip.h"
 #include "SpellAuras.h"
+#include "SpellHitRecord.h"
 #include "SpellScript.h"
 #include "SpellScriptLoader.h"
 #include <unordered_map>
@@ -501,12 +502,13 @@ class spell_pet_gen_valkyr_guardian_smite : public SpellScript
 
     void RecalculateDamage()
     {
+        // The caster's own target entry is processed at launch, so a later hit cannot edit it. The share
+        // goes back on the caster's next task. Each foreign hit contributes; the old code overwrote one slot.
         if (GetHitUnit() != GetCaster())
         {
-            std::list<TargetInfo>* targetsInfo = GetSpell()->GetUniqueTargetInfo();
-            for (std::list<TargetInfo>::iterator ihit = targetsInfo->begin(); ihit != targetsInfo->end(); ++ihit)
-                if (ihit->targetGUID == GetCaster()->GetGUID())
-                    ihit->damage = -int32(GetHitDamage() * 0.25f);
+            int32 const share = int32(GetHitDamage() * 0.25f);
+            if (share > 0)
+                GetSpell()->Feedback().directSelfHeal += share;
         }
     }
 

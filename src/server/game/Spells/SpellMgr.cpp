@@ -3060,6 +3060,7 @@ void SpellMgr::LoadDeferredHitSpells()
     static uint32 const deferredHitSpells[] =
     {
         45927,  // Summon Friend - far target (cross-map player), today's farMask path
+        46584,  // Raise Dead - the corpse hit summons the ghoul on the caster; both must be live
     };
     for (uint32 spellId : deferredHitSpells)
         mDeferredHitSpells.insert(spellId);

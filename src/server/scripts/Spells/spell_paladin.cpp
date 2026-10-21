@@ -20,7 +20,9 @@
 #include "Player.h"
 #include "SpellAuraEffects.h"
 #include "SpellMgr.h"
+#include "SpellHitRecord.h"
 #include "SpellScript.h"
+#include "UnitView.h"
 #include "SpellScriptLoader.h"
 #include "UnitAI.h"
 /*
@@ -1086,7 +1088,10 @@ class spell_pal_lay_on_hands : public SpellScript
         // Xinef: Glyph of Divinity
         if (Unit* target = GetExplTargetUnit())
             if (target->HasActivePowerType(POWER_MANA))
+            {
                 _manaAmount = target->GetPower(POWER_MANA);
+                GetSpell()->SetLaunchScriptValue(_manaAmount);
+            }
 
         return SPELL_CAST_OK;
     }
@@ -1101,13 +1106,19 @@ class spell_pal_lay_on_hands : public SpellScript
             caster->CastSpell(caster, SPELL_PALADIN_AVENGING_WRATH_MARKER, true);
             caster->CastSpell(caster, SPELL_PALADIN_IMMUNE_SHIELD_MARKER, true);
         }
-        // Xinef: Glyph of Divinity
-        else if (target && caster->HasAura(SPELL_PALADIN_GLYPH_OF_DIVINITY) &&
-            GetSpellInfo()->Id != SPELL_PALADIN_LAY_ON_HANDS_R1 && _manaAmount > 0) // excluding first rank
+        // Glyph of Divinity. The mana snapshot is taken at check-cast and carried on the hit record, because
+        // the land script is a new instance. The energize is a caster write, so it goes through feedback.
+        else if (target && GetCasterView().HasAura(SPELL_PALADIN_GLYPH_OF_DIVINITY) &&
+            GetSpellInfo()->Id != SPELL_PALADIN_LAY_ON_HANDS_R1)
         {
-            _manaAmount = target->GetPower(POWER_MANA) - _manaAmount;
-            if (_manaAmount > 0)
-                caster->CastCustomSpell(54986 /*Energize*/, SPELLVALUE_BASE_POINT1, _manaAmount, caster, true);
+            int32 const before = _manaAmount ? _manaAmount : GetSpell()->GetLaunchScriptValue();
+            int32 const delta = int32(target->GetPower(POWER_MANA)) - before;
+            if (before > 0 && delta > 0)
+                if (FollowUpCast* follow = GetSpell()->Feedback().AddFollowUp(54986, caster->GetGUID(), TRIGGERED_FULL_MASK))
+                {
+                    follow->bp[1] = delta;
+                    follow->bpMask = 1u << 1;
+                }
         }
     }
 

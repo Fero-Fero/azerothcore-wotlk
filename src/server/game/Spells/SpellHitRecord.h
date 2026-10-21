@@ -115,6 +115,7 @@ struct SpellHitRecord
     uint8 attackType = 0;                   // m_attackType
     int32 castTime = 0;                     // m_casttime (procs: SPELL_AURA_MOD_CASTING_SPEED_NOT_STACK)
     int32 powerCost = 0;                    // m_powerCost
+    int32 scriptValue = 0;                  // Spell::SetLaunchScriptValue, read by the land script (Lay on Hands mana)
     ObjectGuid originalTarget;              // m_originalTargetGUID (Spell::GetOriginalTarget in procs)
     uint32 procAttacker = 0;                // after prepareDataForTriggerSystem
     uint32 procVictim = 0;
@@ -163,6 +164,7 @@ struct SpellLandedRecord
 
     // numbers (applied by caster)
     int32 healthLeechGain = 0;              // SPELL_EFFECT_HEALTH_LEECH, before the caster's done/taken bonus
+    int32 directSelfHeal = 0;               // exact self-heal, no bonus (Val'kyr guardian smite share)
     uint8 comboPointsRefund = 0;            // land-side evade on the primary target: give these back
     int8 comboPointGain = 0;                // AddComboPointGain from HIT_TARGET handlers
 
@@ -187,7 +189,7 @@ struct SpellLandedRecord
     // True when nothing in the record asks the caster to do anything.
     [[nodiscard]] bool IsEmpty() const
     {
-        return !missAfterLand && !lastDamagedTarget && !castItemCombatSpell && !healthLeechGain && !comboPointsRefund
+        return !missAfterLand && !lastDamagedTarget && !castItemCombatSpell && !healthLeechGain && !directSelfHeal && !comboPointsRefund
             && !comboPointGain && !atTargetAttacked && !assistCombat && !inheritCombatStates && !revealCaster
             && !setContestedPvP && !updatePvP && !casterAchievements && !aiSpellHitTarget && !cooldownMs && !followCount;
     }

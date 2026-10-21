@@ -245,6 +245,23 @@ struct GameEventActionDefer
     uint8 overwrite = 0;
 };
 
+// A relink or a grid load routed to one grid's task (S1a). Payloads are RelinkDefer or GridLoadDefer.
+struct GridOp
+{
+    DeferKind kind = DeferKind::Relink;
+    uint16 gridId = 0;
+    uint8 sameGrid = 0;                 // relink stays inside this grid: unlink and link both in the link round
+    uint8 size = 0;
+    uint8 payload[24]{};
+};
+
+struct KeptDefer
+{
+    Map* map = nullptr;
+    DeferKind kind = DeferKind::Relink;
+    std::vector<uint8> payload;
+};
+
 struct SpawnDefer
 {
     ObjectGuid::LowType spawnId = 0;
@@ -291,7 +308,12 @@ public:
     }
 
     void DrainInto(std::vector<DeferHeader const*>& out) const;
+    void CollectUnapplied(std::vector<KeptDefer>& out) const;
+    void AppendBytes(Map* map, DeferKind kind, void const* payload, std::size_t size) { AppendRaw(map, kind, payload, size); }
     void Reset();
+    // Bytes present when the map-local drain finished. Appends after that (the epilogue) must survive S2.
+    void MarkApplied() { _applied = _size; }
+    [[nodiscard]] std::size_t Applied() const { return _applied; }
 
     [[nodiscard]] std::size_t Size() const { return _size; }
     [[nodiscard]] std::size_t Capacity() const { return _bytes.size(); }
@@ -305,6 +327,7 @@ private:
 
     std::vector<uint8> _bytes;
     std::size_t _size = 0;
+    std::size_t _applied = 0;
     std::size_t _highWater = 0;
     std::size_t _block = 0;
     uint32 _sequence = 0;
@@ -331,6 +354,17 @@ public:
             if (buffer.Size())
                 buffer.DrainInto(out);
     }
+
+    void MarkApplied()
+    {
+        for (DeferBuffer& buffer : _buffers)
+            buffer.MarkApplied();
+    }
+
+    // Non-global defers appended after MarkApplied, copied out so Reset can drop the applied prefix.
+    void CollectUnapplied(std::vector<KeptDefer>& out) const;
+
+    void Restore(std::vector<KeptDefer> const& kept);
 
     void Reset()
     {

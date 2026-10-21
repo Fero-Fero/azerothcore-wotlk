@@ -16,6 +16,32 @@
  */
 
 #include "DatabaseWorkerPool.h"
+
+namespace Acore
+{
+namespace
+{
+bool (*g_syncQueryForbidden)() = nullptr;
+}
+
+void InstallSyncQueryGuard(bool (*guard)())
+{
+#ifdef ACORE_DEBUG
+    g_syncQueryForbidden = guard;
+#else
+    (void)guard;
+#endif
+}
+
+bool IsSyncQueryForbidden()
+{
+#ifdef ACORE_DEBUG
+    return g_syncQueryForbidden && g_syncQueryForbidden();
+#else
+    return false;
+#endif
+}
+}
 #include "AdhocStatement.h"
 #include "CharacterDatabase.h"
 #include "Errors.h"
@@ -494,7 +520,7 @@ T* DatabaseWorkerPool<T>::GetFreeConnection()
     }
 
     // A sync query reached from a unit task parks a core for the round trip (step 11): a crash in debug.
-    ASSERT(!_syncQueryForbidden || !_syncQueryForbidden(), "Synchronous query on a unit task path");
+    ASSERT(!Acore::IsSyncQueryForbidden(), "Synchronous query on a unit task path");
 #endif
 
     uint8 i = 0;

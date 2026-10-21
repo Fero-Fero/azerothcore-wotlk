@@ -159,6 +159,12 @@ SlotAura const* SlotReader::FindAura(uint32 spellId, ObjectGuid caster) const
     return nullptr;
 }
 
+bool SlotReader::HasAuraEffect(uint32 spellId, uint8 effIndex) const
+{
+    SlotAura const* aura = FindAura(spellId);
+    return aura && (aura->effectMask & (1u << effIndex));
+}
+
 bool SlotReader::HasAura(uint32 spellId, ObjectGuid caster) const
 {
     return FindAura(spellId, caster) != nullptr;

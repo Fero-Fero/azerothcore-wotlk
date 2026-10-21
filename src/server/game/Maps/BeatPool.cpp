@@ -427,7 +427,7 @@ void BeatPool::Unschedule(WorldObject* obj)
 
 void BeatPool::FreeAtSealSerial(WorldObject* obj)
 {
-    Current().freeList.push_back(obj);
+    Current().freeList.push_back({ obj, Beat() });
 }
 
 void BeatPool::ReturnSlotIndex(uint32 index)
@@ -758,6 +758,19 @@ void BeatPool::RunItem(WorkItem const& item, CoreState& me)
         case WorkItem::Crowd:
             CrowdBody(static_cast<Map*>(item.ptr), item.chunk, me);
             break;
+        case WorkItem::Grid:
+        {
+            Map* map = static_cast<Map*>(item.ptr);
+            uint64 const t0 = NowNs();
+            {
+                GridTaskScope scope(map, int32(item.chunk));
+                map->RunGridItem(item.chunk, _gridLinkRound);
+            }
+            uint64 const dt = NowNs() - t0;
+            me.tailGrid = std::max(me.tailGrid, dt);
+            map->SetLastGridNs(item.chunk, uint32(std::min<uint64>(dt, 0xFFFFFFFFu)));
+            break;
+        }
         default:
             break;
     }
@@ -768,8 +781,17 @@ void BeatPool::RunItem(WorkItem const& item, CoreState& me)
 
 void BeatPool::TaskBody(WorldObject* root, uint32 diff, CoreState& me)
 {
-    // The deque held it since last beat; it may have been grouped under another root, or left the world.
-    root->_scheduledBeat.store(0, std::memory_order_relaxed);
+    // A wake can queue this root for the next beat before its task runs, and the task then queues it
+    // again. Both items run, and each subtracts the same diff from swing timers.
+    uint32 const thisBeat = Beat();
+    if (root->_ranOnBeat == thisBeat)
+        return;
+    root->_ranOnBeat = thisBeat;
+
+    // Drop this beat's stamp only. Schedule() may already have reserved the next beat; wiping that and
+    // pushing again is what created the duplicate.
+    uint32 expectedBeat = thisBeat;
+    root->_scheduledBeat.compare_exchange_strong(expectedBeat, 0, std::memory_order_relaxed);
     if (!root->IsTaskRoot() || !root->IsInWorld())
         return;
 
@@ -876,6 +898,14 @@ void BeatPool::TaskBody(WorldObject* root, uint32 diff, CoreState& me)
 
 void BeatPool::UpdateOne(WorldObject* obj, WorldObject* root, uint32 diff)
 {
+    // A member that already ran as its own root this beat (or the other way around) must not take diff again.
+    if (obj != root)
+    {
+        if (obj->_ranOnBeat == Beat())
+            return;
+        obj->_ranOnBeat = Beat();
+    }
+
     TaskScope scope(obj, root);
 
     if (Player* player = obj->ToPlayer())
@@ -910,6 +940,13 @@ void BeatPool::UpdateOne(WorldObject* obj, WorldObject* root, uint32 diff)
 
 void BeatPool::QueueView(Player* player, CoreState& me)
 {
+    // A root task and a group task can both reach the same player in one beat. A second BeginViewPhase
+    // resets the chunk count under the first batch of items, so one chunk commits (and clears the delta)
+    // while another is still pushing into it.
+    uint32 const beat = Beat();
+    if (player->View().queuedForBeat.exchange(beat, std::memory_order_relaxed) == beat)
+        return;
+
     // A crowded viewer's values blocks are built in chunks on different cores: by visible-set size and by
     // last beat's view time against the heavy threshold, capped at the core count.
     uint32 const n = uint32(player->GetObjectVisibilityContainer().GetVisibleWorldObjectsMap()->size());
@@ -1022,13 +1059,23 @@ void BeatPool::SealSerial(uint32 diff)
     // Objects removed inside the beat are freed here, before any map they belonged to can go away.
     for (auto const& core : _cores)
     {
-        for (WorldObject* obj : core->freeList)
-            delete obj;
-        core->freeList.clear();
+        std::size_t kept = 0;
+        for (CoreState::QueuedFree const& entry : core->freeList)
+        {
+            if (entry.beat < Beat())
+                delete entry.obj;
+            else
+                core->freeList[kept++] = entry;
+        }
+        core->freeList.resize(kept);
     }
 
     // Instances that emptied: unload and free between any two tasks, never inside a phase.
     sMapMgr->DestroyExpiredInstances(diff);
+
+    // inBeat is already clear, so ~WorldObject may Unschedule. Doing this inside the seal task asserts.
+    for (Map* map : _maps)
+        map->UnloadIdleGrids(diff);
 
     // Slot indices of everything that left the world this beat: no record can address them any more.
     for (auto const& core : _cores)

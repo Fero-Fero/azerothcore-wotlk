@@ -39,6 +39,7 @@ enum class RecordKind : uint8
     Threat,                                           // 06: AddThreat against a foreign unit
     DamageDealt, HealDone, KillingBlow, KillCredit,   // 07 slice 5: attacker/healer/killer half of DealDamage/DealHeal/Kill
     ProcActor,                                        // 07 slice 5: actor half of ProcSkillsAndAuras
+    FormationMove,                                    // 13: leader asks a member to follow, idle, or drop follow
 
     Max
 };
@@ -147,6 +148,24 @@ struct GameObjectUnlinkRecord
 {
     ObjectGuid goGuid;
     uint32 spellId;
+};
+
+enum FormationMoveOp : uint8
+{
+    FORMATION_MOVE_FOLLOW = 0,
+    FORMATION_MOVE_IDLE   = 1,
+    FORMATION_MOVE_EXPIRE = 2
+};
+
+// Leader's task cannot write a member's motion master. Applied on the member.
+struct FormationMoveRecord
+{
+    ObjectGuid leader;
+    float dist = 0.0f;
+    float angle = 0.0f;
+    uint32 point1 = 0;
+    uint32 point2 = 0;
+    uint8 op = FORMATION_MOVE_FOLLOW;
 };
 
 // Step 10: a viewer entered / left this object's visible-players map (the target-side half of the link).
